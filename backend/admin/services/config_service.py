@@ -892,26 +892,17 @@ class ConfigService:
                     "message": f"{provider.upper()} API Key 未配置"
                 }
 
-            # 根据不同的 provider 检查格式
+            # API Key 是服务商定义的不透明凭据，不按前缀推断有效性。
+            # 实际鉴权与连通性由模型连接测试发起真实请求验证。
             if provider == "openai":
-                if not api_key.startswith("sk-"):
-                    return {
-                        "success": False,
-                        "message": "OpenAI API Key 格式不正确（应以 sk- 开头）"
-                    }
                 return {
                     "success": True,
-                    "message": "OpenAI API Key 格式正确"
+                    "message": "OpenAI API 配置完整；请使用“测试当前模型”验证实际鉴权与连通性"
                 }
             elif provider == "claude":
-                if not api_key.startswith("sk-ant-"):
-                    return {
-                        "success": False,
-                        "message": "Claude API Key 格式不正确（应以 sk-ant- 开头）"
-                    }
                 return {
                     "success": True,
-                    "message": "Claude API Key 格式正确"
+                    "message": "Claude API 配置完整；请使用“测试当前模型”验证实际鉴权与连通性"
                 }
             elif provider == "openai_compatible":
                 # OpenAI 兼容接口（智谱、通义千问等），只检查是否配置

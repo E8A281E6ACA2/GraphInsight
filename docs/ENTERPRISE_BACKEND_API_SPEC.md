@@ -142,15 +142,16 @@
 2. `POST /api/docqa/deep-research`
 3. `GET /api/docqa/health?probe_llm=true|false`
 4. `GET /api/v1/admin/config/ai-service/models`
-5. `POST /api/v1/admin/config/test/model`
-6. `POST /api/v1/admin/config/test/embedding`
-7. `POST /api/v1/admin/config/test/vector_store`
-8. `POST /api/v1/admin/config/test/document_parser`
-9. `GET /api/v1/admin/config/test/model/latest`
-10. `GET /api/v1/admin/monitor/qa`
-11. `GET /api/v1/admin/qa-traces`
-12. `GET /api/v1/admin/qa-traces/{trace_id_or_pk}`
-13. `POST /api/v1/admin/qa/retrieval-diagnostics`
+5. `POST /api/v1/admin/config/test/ai_service`
+6. `POST /api/v1/admin/config/test/model`
+7. `POST /api/v1/admin/config/test/embedding`
+8. `POST /api/v1/admin/config/test/vector_store`
+9. `POST /api/v1/admin/config/test/document_parser`
+10. `GET /api/v1/admin/config/test/model/latest`
+11. `GET /api/v1/admin/monitor/qa`
+12. `GET /api/v1/admin/qa-traces`
+13. `GET /api/v1/admin/qa-traces/{trace_id_or_pk}`
+14. `POST /api/v1/admin/qa/retrieval-diagnostics`
 
 当前统一后端实现中，Go 对外保留 `/api/docqa*` 与 `/api/nl2cypher*`，但上游目标分别切换为 Python 内部能力入口 `/api/internal/docqa*` 与 `/api/internal/nl2cypher*`。其中 `GET /api/nl2cypher/examples` 与 `GET /api/nl2cypher/status` 已改为 Go 原生提供；`GET /api/docqa/health` 由 Go 校验 `probe_llm` 查询参数后编排到 Python 内部健康诊断能力；`POST /api/nl2cypher`、`POST /api/docqa` 与 `POST /api/docqa/deep-research` 仍由 Go 编排到 Python capability plane 执行推理/问答，但请求体 JSON 及必填字段非空校验已前移到 Go 入口，并由 Go 写入业务审计日志。这样外部权限、基础契约与外部审计收口在 Go，Python 只保留能力执行、QA trace 和必要的运行时逻辑。
 
@@ -160,11 +161,11 @@
 2. `POST /api/docqa` 与 `POST /api/docqa/deep-research` 当前已支持可选请求字段 `reasoning_profile`
 3. `reasoning_profile` 统一取值：`fast`、`balanced`、`deep`
 4. 当前默认策略：`docqa=balanced`，`deep_research=deep`，`graph_extract=fast`，`graph_extract_complex=balanced`
-5. `GET /api/v1/admin/config/ai-service/models` 当前返回 `models[]`、`catalog[]` 与 `scenario_profiles`，用于承载模型目录元信息、场景默认档位和 token 上限提示；配置中心的问答模型和嵌入模型选择均复用该模型目录接口，嵌入模型默认传入 AI 服务网关地址，只有独立供应商时才需要单独配置 `embedding.base_url`。历史 `/config/openai/models` 已移除。
+5. `GET /api/v1/admin/config/ai-service/models` 当前返回 `models[]`、`catalog[]` 与 `scenario_profiles`，用于承载模型目录元信息、场景默认档位和 token 上限提示；配置中心通过 `purpose=chat|embedding` 区分问答与嵌入模型候选，嵌入目录只保留可识别的 embedding/BGE/E5/GTE/Jina 等向量模型及当前手工配置模型。嵌入模型默认传入 AI 服务网关地址，只有独立供应商时才需要单独配置 `embedding.base_url`。历史 `/config/openai/models` 已移除。
 6. `POST /api/docqa` 与 `POST /api/docqa/deep-research` 在请求未显式传入 `reasoning_profile` 时，当前会由 Go 外部入口按统一场景策略自动补齐默认档位后再编排到 Python internal capability
-7. `POST /api/v1/admin/config/test/model` 当前会在测试结果快照中记录 `model_probe` 场景采用的默认档位，但不会把该统一档位直接透传成供应商私有探测参数
-8. `POST /api/v1/admin/config/test/embedding` 当前使用 OpenAI-compatible `/embeddings` 探测嵌入模型连通性，`embedding.api_key/base_url` 为空时复用 `ai_service` 配置
-9. `POST /api/v1/admin/config/test/vector_store` 当前对 Milvus 做轻量 TCP 连通性探测，用于验证本地或远程向量库地址可达
+7. `POST /api/v1/admin/config/test/model` 当前会在测试结果快照中记录 `model_probe` 场景采用的默认档位，但不会把该统一档位直接透传成供应商私有探测参数；OpenAI-compatible 探测只发送标准必需的 `model/messages`，不强制附加 `temperature`、`max_tokens` 等可能被新模型拒绝的可选参数。上游返回非 2xx 时会提取并安全截断服务商错误信息
+8. `POST /api/v1/admin/config/test/embedding` 当前使用 OpenAI-compatible `/embeddings` 探测嵌入模型连通性，`embedding.api_key/base_url` 为空时复用 `ai_service` 配置；上游返回非 2xx 时会提取并截断服务商错误信息，HTTP 400 会明确提示核对模型是否支持 Embeddings API
+9. `POST /api/v1/admin/config/test/vector_store` 当前对 Milvus 做轻量 TCP 连通性探测，用于验证本地或远程向量库地址可达；即使向量检索功能开关关闭也会继续探测，避免把“功能未启用”误报为“Milvus 未启动”。配置读取使用运行进程的 `MILVUS_URI` 作为未落库时的默认地址
 10. `POST /api/v1/admin/config/test/document_parser` 当前读取 `document_parser` 配置分类；`provider=native` 返回内置解析器可用，`provider=mineru` 会探测 `{base_url}/health` 并返回 MinerU version/status、`file_field`、`parse_mode`、`endpoint_path` 等运行信息
 11. `POST /api/graph/build` 当前已支持可选请求字段 `reasoning_profile`、`complex_extraction` 与 `parser_provider`；未显式传入 `reasoning_profile` 时，Go 会按 `graph_extract / graph_extract_complex` 场景自动补齐默认档位，再交由 Python worker 执行；`parser_provider=mineru` 用于单次建图灰度调用 MinerU sidecar；建图会生成 `DocumentProfiler` 画像、动态抽取 schema 和自适应 extraction plan，并把 `document_type/domain/profile_version/extraction_strategy` 写入 Chunk 与向量 metadata；表格 chunk 在 balanced/deep 或复杂抽取任务下会使用 `structured_table_plus_llm`
 12. `GET /api/v1/admin/qa-traces` 列表项当前已返回轻量 `reasoning_profile` 字段，便于后台直接筛查运行档位
@@ -173,6 +174,7 @@
 15. `POST /api/docqa` 返回的 `citations[].snippet` 当前会根据本轮 question/answer 聚焦到更相关的证据窗口，避免前端展示固定 chunk 开头造成引用证据滞后
 16. `retrieval.rerank_enabled=true` 且配置了 `retrieval.rerank_model` 时，Python Retrieval Orchestrator 会在 keyword/vector/graph RRF 融合候选之后调用 OpenAI-compatible `/rerank` 二阶段重排；`rerank_base_url` 留空时复用 `ai_service.base_url`，API key 复用 `ai_service.api_key`，reranker 失败只回退原融合排序，不阻断问答
 17. 不对外返回原始思维链，只返回最终答案、引用和运行元信息
+18. `POST /api/v1/admin/config/test/ai_service` 只检查启用状态、API Key 是否配置及 OpenAI-compatible API 地址等必要配置；API Key 视为服务商定义的不透明凭据，不以 `sk-`、`sk-ant-` 或其他前缀推断有效性。实际鉴权与模型连通性由 `POST /api/v1/admin/config/test/model` 发起真实请求验证
 
 ## 6. 监控与审计
 
@@ -180,6 +182,8 @@
 2. `GET /api/v1/admin/monitor/health`
 3. `GET /api/v1/admin/logs`
 4. `GET /api/v1/admin/logs/{id}`
+
+`GET /api/v1/admin/monitor/health` 当前返回 PostgreSQL 控制面、Neo4j、Milvus、Python 能力层、AI 服务配置和系统资源检查。Milvus 使用当前管理配置或运行进程 `MILVUS_URI` 做 TCP 探测；向量检索未启用时仍返回实际连通状态，但 Milvus 不可达不会单独导致整体降级。Python 能力层通过 `{PYTHON_BACKEND_BASE_URL}/health` 探测，失败会使整体状态降级。AI 服务状态读取后台已保存配置，只表示凭据与模型已配置，不执行可能计费的模型请求。
 
 ## 7. 错误码建议
 

@@ -313,6 +313,7 @@ const ConfigPage: React.FC = () => {
   const [testingModel, setTestingModel] = useState(false);
   const [testingEmbedding, setTestingEmbedding] = useState(false);
   const [testingVectorStore, setTestingVectorStore] = useState(false);
+  const [vectorStoreTestResult, setVectorStoreTestResult] = useState<ConnectionTestResult | null>(null);
   const [testingDocumentParser, setTestingDocumentParser] = useState(false);
   
   // 使用受控表单值，避免刷新时重置
@@ -456,6 +457,9 @@ const ConfigPage: React.FC = () => {
   const handleFormChange = useCallback((field: keyof FormValues, value: string) => {
     setFormValues(prev => ({ ...prev, [field]: value }));
     setDirtyFields(prev => new Set(prev).add(field));
+    if (field.startsWith('vector_store_')) {
+      setVectorStoreTestResult(null);
+    }
   }, []);
 
   const handleSelectModel = useCallback((model: string) => {
@@ -772,6 +776,7 @@ const ConfigPage: React.FC = () => {
     try {
       await saveDirtyAiServiceFields();
       const result = await configApi.testConnection('vector_store');
+      setVectorStoreTestResult(result);
       if (result.success) {
         setMessage(result.message || 'Milvus 连通性测试成功');
       } else {
@@ -835,6 +840,7 @@ const ConfigPage: React.FC = () => {
         provider: target === 'embedding' ? formValues.embedding_provider || formValues.ai_service_provider : formValues.ai_service_provider,
         base_url: target === 'embedding' ? formValues.embedding_base_url || formValues.ai_service_base_url : formValues.ai_service_base_url,
         model: target === 'embedding' ? formValues.embedding_model : formValues.ai_service_model,
+        purpose: target === 'embedding' ? 'embedding' : 'chat',
       });
       const models = modelResponse.models || [];
       setAvailableModels(models);
@@ -1384,7 +1390,13 @@ const ConfigPage: React.FC = () => {
                         size="small"
                         color={formValues.vector_store_enabled === 'true' ? 'success' : 'default'}
                         variant={formValues.vector_store_enabled === 'true' ? 'filled' : 'outlined'}
-                        label={formValues.vector_store_enabled === 'true' ? '向量库已启用' : '向量库未启用'}
+                        label={formValues.vector_store_enabled === 'true' ? '向量检索已启用' : '向量检索已禁用'}
+                      />
+                      <Chip
+                        size="small"
+                        color={vectorStoreTestResult?.success ? 'success' : vectorStoreTestResult ? 'error' : 'default'}
+                        variant={vectorStoreTestResult ? 'filled' : 'outlined'}
+                        label={vectorStoreTestResult?.success ? 'Milvus 已连接' : vectorStoreTestResult ? 'Milvus 连接失败' : 'Milvus 未检测'}
                       />
                     </Stack>
                     <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap justifyContent={{ xs: 'flex-start', md: 'flex-end' }}>

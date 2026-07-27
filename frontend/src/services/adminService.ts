@@ -399,8 +399,8 @@ export const configApi = {
         cachedGetData<ConfigValueMap>('/api/v1/admin/config/ai-service/all', undefined, { ttlMs: 3000 }),
         cachedGetData<ConfigValueMap>('/api/v1/admin/config/nl2cypher/all', undefined, { ttlMs: 3000 }),
         cachedGetData<Record<string, ConfigItem>>('/api/v1/admin/config/retrieval', undefined, { ttlMs: 3000 }),
-        cachedGetData<Record<string, ConfigItem>>('/api/v1/admin/config/embedding', undefined, { ttlMs: 3000 }),
-        cachedGetData<Record<string, ConfigItem>>('/api/v1/admin/config/vector_store', undefined, { ttlMs: 3000 }),
+        cachedGetData<ConfigValueMap>('/api/v1/admin/config/embedding/all', undefined, { ttlMs: 3000 }),
+        cachedGetData<ConfigValueMap>('/api/v1/admin/config/vector-store/all', undefined, { ttlMs: 3000 }),
         cachedGetData<Record<string, ConfigItem>>('/api/v1/admin/config/document_parser', undefined, { ttlMs: 3000 }),
       ]);
 
@@ -429,8 +429,8 @@ export const configApi = {
         ai_service: convertToConfigItems(aiService || {}, 'ai_service'),
         nl2cypher: convertToConfigItems(nl2cypher || {}, 'nl2cypher'),
         retrieval: retrieval || {},
-        embedding: embedding || {},
-        vector_store: vectorStore || {},
+        embedding: convertToConfigItems(embedding || {}, 'embedding'),
+        vector_store: convertToConfigItems(vectorStore || {}, 'vector_store'),
         document_parser: documentParser || {},
       };
     } catch (error) {
@@ -501,6 +501,7 @@ export const configApi = {
     provider?: string;
     base_url?: string;
     model?: string;
+    purpose?: 'chat' | 'embedding';
   }): Promise<ModelCatalogResponse> {
     try {
       const data = await cachedGetData<ModelCatalogResponse | { models: string[] }>(

@@ -133,6 +133,22 @@ func buildAdminConfigReadNativeHandler(cfg config.Config, logger *slog.Logger, g
 				return
 			}
 			WriteJSON(w, http.StatusOK, "获取成功", buildAdminNL2CypherConfigSnapshot(values))
+		case "/api/v1/admin/config/embedding/all":
+			values, err := safeConfigValues(r.Context(), configStore, "embedding")
+			if err != nil {
+				logger.Error("get embedding configs failed", "error", err.Error())
+				WriteJSON(w, http.StatusServiceUnavailable, "获取配置失败", map[string]string{"error_code": "ADMIN_STORE_UNAVAILABLE"})
+				return
+			}
+			WriteJSON(w, http.StatusOK, "获取成功", buildAdminEmbeddingConfigSnapshot(cfg, values))
+		case "/api/v1/admin/config/vector-store/all":
+			values, err := safeConfigValues(r.Context(), configStore, "vector_store")
+			if err != nil {
+				logger.Error("get vector store configs failed", "error", err.Error())
+				WriteJSON(w, http.StatusServiceUnavailable, "获取配置失败", map[string]string{"error_code": "ADMIN_STORE_UNAVAILABLE"})
+				return
+			}
+			WriteJSON(w, http.StatusOK, "获取成功", buildAdminVectorStoreConfigSnapshot(values))
 		case "/api/v1/admin/config/ai-service/models":
 			values, err := safeConfigValues(r.Context(), configStore, "ai_service")
 			if err != nil {
@@ -445,6 +461,35 @@ func buildAdminNL2CypherConfigSnapshot(values map[string]string) map[string]inte
 	}
 }
 
+func buildAdminEmbeddingConfigSnapshot(cfg config.Config, values map[string]string) map[string]interface{} {
+	apiKey := firstNonEmptyString(values["api_key"], os.Getenv("EMBEDDING_API_KEY"), cfg.AIAPIKey)
+	return map[string]interface{}{
+		"enabled":            configBool(values, "enabled", envBool("EMBEDDING_ENABLED", true)),
+		"provider":           firstNonEmptyString(values["provider"], os.Getenv("EMBEDDING_PROVIDER"), cfg.AIProvider, "openai"),
+		"base_url":           firstNonEmptyString(values["base_url"], os.Getenv("EMBEDDING_BASE_URL")),
+		"api_key":            "",
+		"api_key_configured": strings.TrimSpace(apiKey) != "" && strings.TrimSpace(apiKey) != "your-api-key-here",
+		"api_key_preview":    maskSecretPreview(apiKey),
+		"model":              firstNonEmptyString(values["model"], os.Getenv("EMBEDDING_MODEL"), "text-embedding-3-small"),
+		"dimension":          configInt(values, "dimension", envInt("EMBEDDING_DIMENSION", 1536)),
+		"batch_size":         configInt(values, "batch_size", envInt("EMBEDDING_BATCH_SIZE", 32)),
+	}
+}
+
+func buildAdminVectorStoreConfigSnapshot(values map[string]string) map[string]interface{} {
+	token := firstNonEmptyString(values["token"], os.Getenv("MILVUS_TOKEN"))
+	return map[string]interface{}{
+		"enabled":          configBool(values, "enabled", envBool("VECTOR_STORE_ENABLED", false)),
+		"provider":         firstNonEmptyString(values["provider"], os.Getenv("VECTOR_STORE_PROVIDER"), "milvus"),
+		"uri":              firstNonEmptyString(values["uri"], os.Getenv("MILVUS_URI"), "http://127.0.0.1:19530"),
+		"db_name":          firstNonEmptyString(values["db_name"], os.Getenv("MILVUS_DB_NAME"), "default"),
+		"collection":       firstNonEmptyString(values["collection"], os.Getenv("MILVUS_COLLECTION"), "graphinsight_chunks"),
+		"token":            "",
+		"token_configured": strings.TrimSpace(token) != "",
+		"token_preview":    maskSecretPreview(token),
+	}
+}
+
 func buildAdminAvailableModels(cfg config.Config, currentOverride string, probedModels []string) []string {
 	models := mergeUniqueStrings(probedModels)
 	if len(models) == 0 {
@@ -476,6 +521,8 @@ func buildAdminModelCatalogResponse(ctx context.Context, cfg config.Config, valu
 		source = "configured"
 	}
 	models := buildAdminAvailableModels(cfg, currentModel, probedModels)
+	purpose := strings.ToLower(firstNonEmptyString(firstQueryValue(query, "purpose"), "chat"))
+	models = filterModelsForPurpose(models, purpose, currentModel)
 	catalog := make([]adminModelCatalogItem, 0, len(models))
 	for _, model := range models {
 		supportsReasoning, supportedProfiles := inferReasoningProfiles(model)
@@ -507,6 +554,31 @@ func buildAdminModelCatalogResponse(ctx context.Context, cfg config.Config, valu
 			"graph_extract_complex": firstNonEmptyString(values["graph_extract_complex_reasoning_profile"], os.Getenv("AI_SERVICE_GRAPH_EXTRACT_COMPLEX_REASONING_PROFILE"), "balanced"),
 		},
 	}
+}
+
+func filterModelsForPurpose(models []string, purpose string, currentModel string) []string {
+	filtered := make([]string, 0, len(models))
+	for _, model := range models {
+		isEmbedding := isLikelyEmbeddingModel(model)
+		if (purpose == "embedding" && isEmbedding) || (purpose != "embedding" && !isEmbedding) {
+			filtered = append(filtered, model)
+		}
+	}
+	if purpose == "embedding" && strings.TrimSpace(currentModel) != "" {
+		filtered = append([]string{currentModel}, filtered...)
+	}
+	return mergeUniqueStrings(filtered)
+}
+
+func isLikelyEmbeddingModel(model string) bool {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	markers := []string{"embedding", "embed", "bge-", "bge_", "-bge", "e5-", "e5_", "gte-", "gte_", "jina-embeddings", "text2vec", "multilingual-e5"}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func humanizeModelLabel(model string) string {

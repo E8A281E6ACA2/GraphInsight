@@ -509,6 +509,8 @@ export interface HealthStatus {
   timestamp: string;
   database: DatabaseStatus;
   neo4j: Neo4jStatus;
+  milvus?: DependencyStatus;
+  python_backend?: DependencyStatus;
   ai_service?: AIServiceStatus;
   openai?: OpenAIStatus;
   system?: SystemStats;
@@ -585,6 +587,14 @@ export interface LogStats {
   action_stats: Record<string, number>;
   user_stats: Record<string, number>;
   hourly_stats: Record<string, number>;
+}
+
+export interface DependencyStatus {
+  connected: boolean;
+  enabled: boolean;
+  base_url?: string;
+  message?: string;
+  error?: string;
 }
 
 // ============================================================

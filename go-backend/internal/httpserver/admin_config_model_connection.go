@@ -366,37 +366,15 @@ func buildAdminAIServiceConnectionTestNativeHandler(
 
 		switch provider {
 		case "openai":
-			apiKey := strings.TrimSpace(values["api_key"])
-			if apiKey == "" {
-				apiKey = strings.TrimSpace(cfg.AIAPIKey)
-			}
-			if !strings.HasPrefix(apiKey, "sk-") {
-				WriteJSON(w, http.StatusOK, "测试完成", map[string]interface{}{
-					"success": false,
-					"message": "OpenAI API Key 格式不正确（应以 sk- 开头）",
-				})
-				return
-			}
 			WriteJSON(w, http.StatusOK, "测试完成", map[string]interface{}{
 				"success": true,
-				"message": "OpenAI API Key 格式正确",
+				"message": "OpenAI API 配置完整；请使用“测试当前模型”验证实际鉴权与连通性",
 			})
 			return
 		case "claude":
-			apiKey := strings.TrimSpace(values["api_key"])
-			if apiKey == "" {
-				apiKey = strings.TrimSpace(cfg.AIAPIKey)
-			}
-			if !strings.HasPrefix(apiKey, "sk-ant-") {
-				WriteJSON(w, http.StatusOK, "测试完成", map[string]interface{}{
-					"success": false,
-					"message": "Claude API Key 格式不正确（应以 sk-ant- 开头）",
-				})
-				return
-			}
 			WriteJSON(w, http.StatusOK, "测试完成", map[string]interface{}{
 				"success": true,
-				"message": "Claude API Key 格式正确",
+				"message": "Claude API 配置完整；请使用“测试当前模型”验证实际鉴权与连通性",
 			})
 			return
 		case "openai_compatible":
@@ -579,16 +557,24 @@ func buildAdminEmbeddingConnectionTestNativeHandler(
 			})
 			return
 		}
+		providerMessage := readProviderErrorMessage(resp.Body)
+		failureMessage := fmt.Sprintf("Embedding 探测失败，HTTP %d", resp.StatusCode)
+		if providerMessage != "" {
+			failureMessage = fmt.Sprintf("%s：%s", failureMessage, providerMessage)
+		}
+		if resp.StatusCode == http.StatusBadRequest {
+			failureMessage += "；请确认所选模型支持 Embeddings API"
+		}
 
 		checks = append(checks, map[string]interface{}{
 			"name":       "probe",
 			"success":    false,
-			"message":    fmt.Sprintf("Embedding 探测失败，HTTP %d", resp.StatusCode),
+			"message":    failureMessage,
 			"latency_ms": requestMS,
 		})
 		finish(map[string]interface{}{
 			"success":  false,
-			"message":  fmt.Sprintf("Embedding 探测失败，HTTP %d", resp.StatusCode),
+			"message":  failureMessage,
 			"provider": provider,
 			"model":    model,
 			"base_url": defaultModelBaseURL(provider, baseURL),
@@ -644,17 +630,11 @@ func buildAdminVectorStoreConnectionTestNativeHandler(
 		}
 		checks = append(checks, map[string]interface{}{"name": "provider", "success": true, "message": "向量库类型: milvus"})
 
-		if !enabled {
-			checks = append(checks, map[string]interface{}{"name": "enabled", "success": false, "message": "向量库未启用"})
-			finish(map[string]interface{}{
-				"success":  false,
-				"message":  "向量库未启用",
-				"provider": provider,
-				"base_url": uri,
-			})
-			return
+		if enabled {
+			checks = append(checks, map[string]interface{}{"name": "enabled", "success": true, "message": "向量检索已启用"})
+		} else {
+			checks = append(checks, map[string]interface{}{"name": "enabled", "success": true, "message": "向量检索当前禁用；继续测试 Milvus 服务连通性"})
 		}
-		checks = append(checks, map[string]interface{}{"name": "enabled", "success": true, "message": "向量库已启用"})
 
 		target := milvusProbeTarget(uri)
 		if target == "" {
@@ -706,6 +686,35 @@ func buildAdminVectorStoreConnectionTestNativeHandler(
 			"collection": collection,
 		})
 	}))
+}
+
+func readProviderErrorMessage(reader io.Reader) string {
+	body, err := io.ReadAll(io.LimitReader(reader, 4096))
+	if err != nil || len(body) == 0 {
+		return ""
+	}
+	var payload map[string]interface{}
+	if json.Unmarshal(body, &payload) == nil {
+		if errorPayload, ok := payload["error"].(map[string]interface{}); ok {
+			if message, ok := errorPayload["message"].(string); ok {
+				return compactProviderMessage(message)
+			}
+		}
+		for _, key := range []string{"message", "detail", "error"} {
+			if message, ok := payload[key].(string); ok {
+				return compactProviderMessage(message)
+			}
+		}
+	}
+	return compactProviderMessage(string(body))
+}
+
+func compactProviderMessage(message string) string {
+	message = strings.Join(strings.Fields(message), " ")
+	if len(message) > 300 {
+		return message[:300] + "..."
+	}
+	return message
 }
 
 func buildAdminDocumentParserConnectionTestNativeHandler(
@@ -966,8 +975,6 @@ func buildAdminModelConnectionTestNativeHandler(
 			"messages": []map[string]string{
 				{"role": "user", "content": "Reply with ok."},
 			},
-			"max_tokens":  8,
-			"temperature": 0,
 		}
 		if provider == "claude" {
 			endpoint = buildClaudeMessagesURL(baseURL)
@@ -1055,16 +1062,24 @@ func buildAdminModelConnectionTestNativeHandler(
 			})
 			return
 		}
+		providerMessage := readProviderErrorMessage(resp.Body)
+		failureMessage := fmt.Sprintf("模型探测失败，HTTP %d", resp.StatusCode)
+		if providerMessage != "" {
+			failureMessage = fmt.Sprintf("%s：%s", failureMessage, providerMessage)
+		}
+		if resp.StatusCode == http.StatusBadRequest {
+			failureMessage += "；请核对模型名称及该网关的 Chat Completions 兼容性"
+		}
 
 		checks = append(checks, map[string]interface{}{
 			"name":       "probe",
 			"success":    false,
-			"message":    fmt.Sprintf("模型探测失败，HTTP %d", resp.StatusCode),
+			"message":    failureMessage,
 			"latency_ms": requestMS,
 		})
 		finish(map[string]interface{}{
 			"success":           false,
-			"message":           fmt.Sprintf("模型探测失败，HTTP %d", resp.StatusCode),
+			"message":           failureMessage,
 			"provider":          provider,
 			"model":             model,
 			"reasoning_profile": reasoningProfile,

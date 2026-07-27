@@ -485,7 +485,7 @@ func registerAdminControlPlaneRoutesWithContext(
 	mux.HandleFunc("/api/v1/admin/auth/authorize", buildAdminAuthAuthorizeNativeHandler(logger, cfg, asAdminAuthStore(adminStore)))
 
 	mux.HandleFunc("/api/v1/admin/monitor/stats", buildAdminMonitorStatsNativeHandler(logger, guard))
-	mux.HandleFunc("/api/v1/admin/monitor/health", buildAdminMonitorHealthNativeHandler(cfg, logger, graphSvc, graphInitErr, guard))
+	mux.HandleFunc("/api/v1/admin/monitor/health", buildAdminMonitorHealthNativeHandler(cfg, logger, graphSvc, graphInitErr, guard, asAdminConfigStore(adminStore)))
 	mux.HandleFunc("/api/v1/admin/monitor/performance", buildAdminMonitorPerformanceNativeHandler(apiMetrics, guard))
 	mux.HandleFunc("/api/v1/admin/monitor/metrics/unified", buildAdminMonitorUnifiedMetricsNativeHandler(logger, apiMetrics, guard, asAdminMonitorStore(adminStore)))
 	mux.HandleFunc("/api/v1/admin/monitor/qa", buildAdminMonitorQANativeHandler(logger, guard, asAdminMonitorStore(adminStore)))

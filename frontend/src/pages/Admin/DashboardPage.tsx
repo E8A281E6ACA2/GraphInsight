@@ -228,6 +228,13 @@ const DashboardPage: React.FC = () => {
                       color={getStatusColor(healthStatus.neo4j.connected ? 'connected' : 'disconnected')}
                       size="small"
                     />
+                    {healthStatus.milvus && (
+                      <Chip
+                        label={`Milvus: ${healthStatus.milvus.connected ? '已连接' : '断开'}${healthStatus.milvus.enabled ? '' : '（检索禁用）'}`}
+                        color={getStatusColor(healthStatus.milvus.connected ? 'connected' : 'disconnected')}
+                        size="small"
+                      />
+                    )}
                     {healthStatus.ai_service && (
                       <Chip
                         label={`AI服务: ${healthStatus.ai_service.connected ? '已配置' : '未配置'}`}

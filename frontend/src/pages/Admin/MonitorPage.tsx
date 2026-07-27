@@ -272,6 +272,43 @@ const MonitorPage: React.FC = () => {
                           )}
                         </CardContent>
                       </Card>
+                      {health.milvus && (
+                        <Card variant="outlined">
+                          <CardContent>
+                            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <Typography variant="h6">Milvus</Typography>
+                              <Chip
+                                label={health.milvus.connected ? '已连接' : '断开'}
+                                color={getStatusColor(health.milvus.connected ? 'connected' : 'disconnected')}
+                                size="small"
+                              />
+                            </Box>
+                            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                              {health.milvus.base_url || health.milvus.message}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              向量检索：{health.milvus.enabled ? '已启用' : '已禁用'}
+                            </Typography>
+                          </CardContent>
+                        </Card>
+                      )}
+                      {health.python_backend && (
+                        <Card variant="outlined">
+                          <CardContent>
+                            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <Typography variant="h6">内部能力服务</Typography>
+                              <Chip
+                                label={health.python_backend.connected ? '已连接' : '断开'}
+                                color={getStatusColor(health.python_backend.connected ? 'connected' : 'disconnected')}
+                                size="small"
+                              />
+                            </Box>
+                            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                              {health.python_backend.base_url || health.python_backend.message}
+                            </Typography>
+                          </CardContent>
+                        </Card>
+                      )}
 
                     {health.ai_service && (
                         <Card variant="outlined">

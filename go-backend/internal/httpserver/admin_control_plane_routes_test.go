@@ -304,6 +304,56 @@ func TestAdminMonitorHealthNativeRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 	}
 }
 
+func TestCollectAdminHealthStatusIncludesMilvusPythonAndStoredAIConfig(t *testing.T) {
+	t.Parallel()
+
+	pythonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			t.Fatalf("unexpected Python health path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"healthy"}`))
+	}))
+	t.Cleanup(pythonServer.Close)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("start Milvus test listener: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	health := collectAdminHealthStatus(context.Background(), config.Config{
+		PythonBackendBaseURL: pythonServer.URL,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)), &stubGraphService{}, nil, &fakeAdminConfigStore{
+		values: map[string]map[string]string{
+			"ai_service": {
+				"provider": "openai",
+				"model":    "stored-model",
+				"api_key":  "vg-stored-key",
+			},
+			"vector_store": {
+				"enabled": "true",
+				"uri":     "http://" + listener.Addr().String(),
+			},
+		},
+	})
+	if !health.Milvus.Connected || !health.Milvus.Enabled {
+		t.Fatalf("expected enabled and connected Milvus: %#v", health.Milvus)
+	}
+	if !health.PythonBackend.Connected {
+		t.Fatalf("expected connected Python backend: %#v", health.PythonBackend)
+	}
+	if !health.AIService.APIKeyConfigured || health.AIService.Model != "stored-model" {
+		t.Fatalf("expected stored AI config in health: %#v", health.AIService)
+	}
+}
+
 func TestAdminMonitorPerformanceNativeRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 	t.Parallel()
 
@@ -2195,7 +2245,7 @@ func TestAdminConfigAIServiceConnectionTestIsNative(t *testing.T) {
 			"ai_service": {
 				"provider": "openai",
 				"enabled":  "true",
-				"api_key":  "sk-test-native",
+				"api_key":  "vg-test-native",
 			},
 		},
 	})
@@ -2222,7 +2272,7 @@ func TestAdminConfigAIServiceConnectionTestIsNative(t *testing.T) {
 	if data["success"] != true {
 		t.Fatalf("expected success=true, got %#v", data)
 	}
-	if data["message"] != "OpenAI API Key 格式正确" {
+	if data["message"] != "OpenAI API 配置完整；请使用“测试当前模型”验证实际鉴权与连通性" {
 		t.Fatalf("unexpected message: %#v", data["message"])
 	}
 }
@@ -2315,7 +2365,7 @@ func TestAdminConfigVectorStoreConnectionTestIsNative(t *testing.T) {
 		values: map[string]map[string]string{
 			"vector_store": {
 				"provider":   "milvus",
-				"enabled":    "true",
+				"enabled":    "false",
 				"uri":        "http://" + listener.Addr().String(),
 				"db_name":    "default",
 				"collection": "graphinsight_chunks",
@@ -2345,6 +2395,15 @@ func TestAdminConfigVectorStoreConnectionTestIsNative(t *testing.T) {
 	}
 	if data["success"] != true || data["provider"] != "milvus" {
 		t.Fatalf("unexpected vector store test data: %#v", data)
+	}
+}
+
+func TestReadProviderErrorMessageExtractsOpenAICompatibleError(t *testing.T) {
+	t.Parallel()
+
+	message := readProviderErrorMessage(strings.NewReader(`{"error":{"message":"model does not support embeddings"}}`))
+	if message != "model does not support embeddings" {
+		t.Fatalf("unexpected provider error message: %q", message)
 	}
 }
 
@@ -2561,6 +2620,23 @@ func TestBuildAdminModelCatalogResponseInfersReasoningCapabilities(t *testing.T)
 	}
 }
 
+func TestFilterModelsForPurposeKeepsOnlyEmbeddingCandidates(t *testing.T) {
+	t.Parallel()
+
+	models := filterModelsForPurpose([]string{
+		"DeepSeek-V4-Flash",
+		"text-embedding-3-small",
+		"BAAI/bge-m3",
+		"qwen-plus",
+	}, "embedding", "text-embedding-3-small")
+	if len(models) != 2 {
+		t.Fatalf("expected two embedding models, got %#v", models)
+	}
+	if models[0] != "text-embedding-3-small" || models[1] != "BAAI/bge-m3" {
+		t.Fatalf("unexpected embedding models: %#v", models)
+	}
+}
+
 func TestAdminConfigModelConnectionTestStoresLatestSnapshot(t *testing.T) {
 	t.Parallel()
 	pythonWakeClient := newProxyClientForTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2572,6 +2648,16 @@ func TestAdminConfigModelConnectionTestStoresLatestSnapshot(t *testing.T) {
 		}
 		if r.Header.Get("Authorization") != "Bearer sk-test-model" {
 			t.Fatalf("unexpected auth header: %s", r.Header.Get("Authorization"))
+		}
+		var payload map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode model probe payload: %v", err)
+		}
+		if _, exists := payload["temperature"]; exists {
+			t.Fatalf("model connectivity probe must not force temperature: %#v", payload)
+		}
+		if _, exists := payload["max_tokens"]; exists {
+			t.Fatalf("model connectivity probe must not force provider-specific token fields: %#v", payload)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

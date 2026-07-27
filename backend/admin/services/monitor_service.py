@@ -238,41 +238,23 @@ class MonitorService:
                     error="API Key未配置"
                 )
 
-            # 根据不同的 provider 检查格式
+            # API Key 是不透明凭据；监控只报告是否配置，不能通过前缀推断鉴权结果。
             if provider == "openai":
-                if api_key.startswith("sk-"):
-                    return AIServiceStatus(
-                        connected=True,
-                        service_name="OpenAI",
-                        model=model,
-                        api_key_configured=True,
-                        error=None
-                    )
-                else:
-                    return AIServiceStatus(
-                        connected=False,
-                        service_name="OpenAI",
-                        model=model,
-                        api_key_configured=True,
-                        error="API Key格式不正确（应以 sk- 开头）"
-                    )
+                return AIServiceStatus(
+                    connected=True,
+                    service_name="OpenAI",
+                    model=model,
+                    api_key_configured=True,
+                    error=None
+                )
             elif provider == "claude":
-                if api_key.startswith("sk-ant-"):
-                    return AIServiceStatus(
-                        connected=True,
-                        service_name="Claude",
-                        model=model,
-                        api_key_configured=True,
-                        error=None
-                    )
-                else:
-                    return AIServiceStatus(
-                        connected=False,
-                        service_name="Claude",
-                        model=model,
-                        api_key_configured=True,
-                        error="API Key格式不正确（应以 sk-ant- 开头）"
-                    )
+                return AIServiceStatus(
+                    connected=True,
+                    service_name="Claude",
+                    model=model,
+                    api_key_configured=True,
+                    error=None
+                )
             else:
                 # 其他 provider，只检查是否配置
                 return AIServiceStatus(

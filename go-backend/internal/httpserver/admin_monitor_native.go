@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -60,14 +61,24 @@ type adminAIServiceStatus struct {
 	Error            string `json:"error,omitempty"`
 }
 
+type adminDependencyStatus struct {
+	Connected bool   `json:"connected"`
+	Enabled   bool   `json:"enabled"`
+	BaseURL   string `json:"base_url,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 type adminHealthStatus struct {
-	Status    string               `json:"status"`
-	Timestamp string               `json:"timestamp"`
-	Database  adminDatabaseStatus  `json:"database"`
-	Neo4j     adminNeo4jStatus     `json:"neo4j"`
-	AIService adminAIServiceStatus `json:"ai_service"`
-	System    adminSystemStats     `json:"system"`
-	Checks    map[string]bool      `json:"checks"`
+	Status        string                `json:"status"`
+	Timestamp     string                `json:"timestamp"`
+	Database      adminDatabaseStatus   `json:"database"`
+	Neo4j         adminNeo4jStatus      `json:"neo4j"`
+	Milvus        adminDependencyStatus `json:"milvus"`
+	PythonBackend adminDependencyStatus `json:"python_backend"`
+	AIService     adminAIServiceStatus  `json:"ai_service"`
+	System        adminSystemStats      `json:"system"`
+	Checks        map[string]bool       `json:"checks"`
 }
 
 type adminJobSLOMetrics struct {
@@ -220,6 +231,7 @@ func buildAdminMonitorHealthNativeHandler(
 	graphSvc graphService,
 	graphInitErr error,
 	guard businessPermissionGuard,
+	configStore adminConfigStore,
 ) http.HandlerFunc {
 	return withRouteOwner("go-native", guard.wrap("monitor:read", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -227,7 +239,7 @@ func buildAdminMonitorHealthNativeHandler(
 			return
 		}
 
-		health := collectAdminHealthStatus(r.Context(), cfg, logger, graphSvc, graphInitErr)
+		health := collectAdminHealthStatus(r.Context(), cfg, logger, graphSvc, graphInitErr, configStore)
 		WriteJSON(w, http.StatusOK, "获取成功", health)
 	}))
 }
@@ -395,6 +407,7 @@ func collectAdminHealthStatus(
 	logger *slog.Logger,
 	graphSvc graphService,
 	graphInitErr error,
+	configStore adminConfigStore,
 ) adminHealthStatus {
 	stats, statsErr := collectAdminSystemStats()
 	if statsErr != nil && logger != nil {
@@ -407,14 +420,32 @@ func collectAdminHealthStatus(
 		Message:   "Go control plane is running",
 	}
 	neo4j := collectAdminNeo4jStatus(ctx, cfg, graphSvc, graphInitErr)
-	aiService := collectAdminAIServiceStatus(cfg)
+	aiValues := map[string]string{}
+	vectorValues := map[string]string{}
+	if configStore != nil {
+		if values, err := safeConfigValues(ctx, configStore, "ai_service"); err == nil {
+			aiValues = values
+		} else if logger != nil {
+			logger.Warn("collect ai service health config failed", "error", err.Error())
+		}
+		if values, err := safeConfigValues(ctx, configStore, "vector_store"); err == nil {
+			vectorValues = values
+		} else if logger != nil {
+			logger.Warn("collect vector store health config failed", "error", err.Error())
+		}
+	}
+	aiService := collectAdminAIServiceStatus(cfg, aiValues)
+	milvus := collectAdminMilvusStatus(ctx, vectorValues)
+	pythonBackend := collectAdminPythonBackendStatus(ctx, cfg.PythonBackendBaseURL)
 
 	checks := map[string]bool{
-		"database":   database.Connected,
-		"neo4j":      neo4j.Connected,
-		"ai_service": aiService.Connected,
-		"disk_space": stats.DiskPercent < 90,
-		"memory":     stats.MemoryPercent < 90,
+		"database":       database.Connected,
+		"neo4j":          neo4j.Connected,
+		"milvus":         !milvus.Enabled || milvus.Connected,
+		"python_backend": pythonBackend.Connected,
+		"ai_service":     aiService.Connected,
+		"disk_space":     stats.DiskPercent < 90,
+		"memory":         stats.MemoryPercent < 90,
 	}
 
 	status := "healthy"
@@ -429,13 +460,15 @@ func collectAdminHealthStatus(
 	}
 
 	return adminHealthStatus{
-		Status:    status,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Database:  database,
-		Neo4j:     neo4j,
-		AIService: aiService,
-		System:    stats,
-		Checks:    checks,
+		Status:        status,
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
+		Database:      database,
+		Neo4j:         neo4j,
+		Milvus:        milvus,
+		PythonBackend: pythonBackend,
+		AIService:     aiService,
+		System:        stats,
+		Checks:        checks,
 	}
 }
 
@@ -594,10 +627,11 @@ func collectAdminNeo4jStatus(
 	return status
 }
 
-func collectAdminAIServiceStatus(cfg config.Config) adminAIServiceStatus {
-	provider := firstNonEmptyString(cfg.AIProvider, "openai")
-	model := strings.TrimSpace(cfg.AIModel)
-	apiKeyConfigured := strings.TrimSpace(cfg.AIAPIKey) != ""
+func collectAdminAIServiceStatus(cfg config.Config, values map[string]string) adminAIServiceStatus {
+	provider := firstNonEmptyString(values["provider"], cfg.AIProvider, "openai")
+	model := firstNonEmptyString(values["model"], cfg.AIModel)
+	apiKey := firstNonEmptyString(values["api_key"], cfg.AIAPIKey)
+	apiKeyConfigured := strings.TrimSpace(apiKey) != "" && strings.TrimSpace(apiKey) != "your-api-key-here"
 	status := adminAIServiceStatus{
 		Connected:        apiKeyConfigured,
 		ServiceName:      strings.ToUpper(provider),
@@ -607,6 +641,60 @@ func collectAdminAIServiceStatus(cfg config.Config) adminAIServiceStatus {
 	if !apiKeyConfigured {
 		status.Error = "API key not configured"
 	}
+	return status
+}
+
+func collectAdminMilvusStatus(ctx context.Context, values map[string]string) adminDependencyStatus {
+	enabled := configBool(values, "enabled", envBool("VECTOR_STORE_ENABLED", false))
+	uri := firstNonEmptyString(values["uri"], os.Getenv("MILVUS_URI"), "http://127.0.0.1:19530")
+	status := adminDependencyStatus{
+		Enabled: enabled,
+		BaseURL: uri,
+		Message: "Milvus unavailable",
+	}
+	target := milvusProbeTarget(uri)
+	if target == "" {
+		status.Error = "invalid Milvus URI"
+		return status
+	}
+	dialer := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", target)
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	_ = conn.Close()
+	status.Connected = true
+	status.Message = "Milvus connected"
+	return status
+}
+
+func collectAdminPythonBackendStatus(ctx context.Context, baseURL string) adminDependencyStatus {
+	baseURL = strings.TrimRight(firstNonEmptyString(baseURL, "http://127.0.0.1:8001"), "/")
+	status := adminDependencyStatus{
+		Enabled: true,
+		BaseURL: baseURL,
+		Message: "Python capability service unavailable",
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, baseURL+"/health", nil)
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		status.Error = fmt.Sprintf("health endpoint returned HTTP %d", resp.StatusCode)
+		return status
+	}
+	status.Connected = true
+	status.Message = "Python capability service connected"
 	return status
 }
 
