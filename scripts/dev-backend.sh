@@ -22,6 +22,9 @@ NEO4J_URI="${GRAPHINSIGHT_NEO4J_URI:-bolt://localhost:${NEO4J_BOLT_PORT}}"
 NEO4J_USER="${GRAPHINSIGHT_NEO4J_USER:-neo4j}"
 NEO4J_PASSWORD="${GRAPHINSIGHT_NEO4J_PASSWORD:-change-this-password}"
 NEO4J_DATABASE="${GRAPHINSIGHT_NEO4J_DATABASE:-neo4j}"
+MILVUS_PORT_EXPLICIT="${GRAPHINSIGHT_MILVUS_PORT+x}"
+MILVUS_METRICS_PORT_EXPLICIT="${GRAPHINSIGHT_MILVUS_METRICS_PORT+x}"
+MILVUS_URI_EXPLICIT="${MILVUS_URI+x}"
 MILVUS_PORT="${GRAPHINSIGHT_MILVUS_PORT:-19530}"
 MILVUS_METRICS_PORT="${GRAPHINSIGHT_MILVUS_METRICS_PORT:-9003}"
 MILVUS_URI="${MILVUS_URI:-http://127.0.0.1:${MILVUS_PORT}}"
@@ -255,9 +258,53 @@ wait_for_milvus() {
   return 1
 }
 
+published_compose_port() {
+  local container_port="$1"
+  docker compose -f "$ROOT_DIR/docker-compose.dev.yml" port milvus "$container_port" 2>/dev/null \
+    | head -n 1 \
+    | sed -E 's/^.*:([0-9]+)$/\1/'
+}
+
+resolve_milvus_ports() {
+  local published_port published_metrics_port candidate
+  published_port="$(published_compose_port 19530 || true)"
+  published_metrics_port="$(published_compose_port 9091 || true)"
+
+  if [[ -z "$MILVUS_PORT_EXPLICIT" && "$published_port" =~ ^[0-9]+$ ]]; then
+    MILVUS_PORT="$published_port"
+  elif [[ -z "$MILVUS_PORT_EXPLICIT" ]] && is_listening "$MILVUS_PORT"; then
+    for candidate in 19531 29530 39530; do
+      if ! is_listening "$candidate"; then
+        MILVUS_PORT="$candidate"
+        echo "[dev-backend] Milvus port 19530 is occupied; using $MILVUS_PORT"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "$MILVUS_METRICS_PORT_EXPLICIT" && "$published_metrics_port" =~ ^[0-9]+$ ]]; then
+    MILVUS_METRICS_PORT="$published_metrics_port"
+  elif [[ -z "$MILVUS_METRICS_PORT_EXPLICIT" ]] && is_listening "$MILVUS_METRICS_PORT"; then
+    for candidate in 9004 19003 29003; do
+      if ! is_listening "$candidate"; then
+        MILVUS_METRICS_PORT="$candidate"
+        echo "[dev-backend] Milvus metrics port 9003 is occupied; using $MILVUS_METRICS_PORT"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$MILVUS_URI_EXPLICIT" ]]; then
+    MILVUS_URI="http://127.0.0.1:${MILVUS_PORT}"
+  fi
+
+  export GRAPHINSIGHT_MILVUS_PORT="$MILVUS_PORT"
+  export GRAPHINSIGHT_MILVUS_METRICS_PORT="$MILVUS_METRICS_PORT"
+}
+
 ensure_milvus() {
-  if is_listening "$MILVUS_PORT"; then
-    echo "[dev-backend] Milvus port $MILVUS_PORT is already listening"
+  if is_listening "$MILVUS_PORT" && \
+    curl -fsS --max-time 2 "http://127.0.0.1:${MILVUS_METRICS_PORT}/healthz" >/dev/null 2>&1; then
+    echo "[dev-backend] Milvus is already healthy: $MILVUS_URI"
     return
   fi
 
@@ -476,6 +523,7 @@ EOF
 case "$command" in
   up)
     resolve_runtime_ports
+    resolve_milvus_ports
     ensure_postgres
     ensure_neo4j
     ensure_milvus
@@ -495,6 +543,7 @@ case "$command" in
     ;;
   status)
     resolve_runtime_ports
+    resolve_milvus_ports
     write_runtime_env
     print_status
     ;;
