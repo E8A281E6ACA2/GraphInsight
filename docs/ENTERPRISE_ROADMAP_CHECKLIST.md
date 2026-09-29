@@ -80,6 +80,16 @@
 3. 执行代码版本级回滚演练并写入发布记录。
 4. 继续推进高价值控制面细节 Go 原生化，但不再恢复 Python public business/admin surface。
 
+## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）
+
+- [x] 后端新增业务面 KB 目录 `GET /api/knowledge-bases`（`knowledge_bases_business.go`）：仅认证 + `AuthorizedKBIDs(subject, "graph:read")` 计算集合，再由 `adminstore.ListAuthorizedKnowledgeBases` 按集合取 active KB 行；无授权→空集合，不放大。
+- [x] `handlers.go` 已在 `registerNativeGraphRoutes` 旁挂载 `/api/knowledge-bases`；新增 `knowledge_bases_business_test.go` 覆盖 global/仅 project 集合/未认证/过期/授权服务不可用/空集合/405 七类用例，`go test ./...` 全绿（Docker golang:1.24.13-bookworm）。
+- [x] 前端新增 `KnowledgeBaseSelector`（workspace TopBar）+ `kbService.ts` 目录拉取；`graphStore` 新增 `activeKbId`（持久化 + 切库重置视图）；`api` 拦截器为所有 `/api/*` 注入 `X-KB-ID`；`docQa.ts`/`graphService.ts` 在 body 显式携带 `kb_id`；DocQA/Cypher 无 `activeKbId` 时本地拦截不发请求。
+- [x] E2E `business-docqa-flow.spec.ts` 已改为先进入 workspace 并选定一个测试 `kb_id`（浏览器注入 + request 上下文 `X-KB-ID`），确保带作用域发起。
+- [x] 真实统一活栈验收通过（2026-09-29，M4 关闭）：`npm run e2e`（Playwright）5 passed / 3 skipped / PW_EXIT=0，业务全链路 upload→build→ask→trace→delete（3.8m）通过，3 个 skip 为需真实密码的 UI 登录用例；Go 套件（Docker golang:1.24.13-bookworm）`BUILD/VET/gofmt/TEST` 全 0，8 包全 ok；`run_unified_boundary_guards.py` total=14 failed=0；`check_m4r1_scope_guards_unit.py` passed=15 failed=0；活栈 `check_dual_kb_blackbox.py` passed=15 failed=0、`check_kb_scope_isolation.py` passed=54 failed=0；`check_migration_cleanup_guards.py` 通过（含新增 KB strict 静态回归守卫）。
+- [x] 复跑前提（2026-09-29 复核确认全量复跑同计数，并记录三条前置条件）：① 管理库须存在至少一个 active KB，缺数据时先跑 `backend/scripts/seed_e2e_local_stack.py` 播种（KB 目录为空会导致业务 E2E 在 resolveTestKbId 直接失败）；② Go 网关与 Python 能力层（8001）必须同时在线——Go `/health` 中 `python_backend.connected=true` 仅代表代理客户端初始化成功、不探测上游，不能当作 Python 存活证据；Python worker 未起时 `build_graph` 任务会停留 pending 并使 E2E 超时；③ 3 个 skip 用例需要真实 admin 密码，token 注入用例已覆盖认证路径。另：Windows 检出为 CRLF（core.autocrlf），容器内 `gofmt -l` 会对全量 Go 文件伪报，以 LF 规范化检出为准（入库已由 `.gitattributes` 统一 LF）。
+- [x] M4 结论口径更新：KB 作用域 strict 已正式启用（契约 §2.11 D4 满足：双 KB 黑盒全通过 + 全部调用方显式携带 kb_id 且缺 scope 负向测试在位）。代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜底，strict 为唯一形态，并由 `check_migration_cleanup_guards.py` 静态守卫防削弱。
+
 ## 最新联调记录（2026-06-08）
 
 - [x] 修复 Go 统一响应信封细节：成功响应在 `data=nil` 时仍显式返回 `data: null`，前端统一解析不再因缺少 `data` 字段报错；已通过 `go test ./internal/httpserver ./internal/config` 回归。

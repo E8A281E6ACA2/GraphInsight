@@ -57,6 +57,42 @@
 3. `PATCH /api/v1/admin/knowledge-bases/{kb_id}`
 4. `DELETE /api/v1/admin/knowledge-bases/{kb_id}`
 
+#### 3.1.1 业务面知识库目录（M4-R1 步骤 3）
+
+`GET /api/knowledge-bases`
+
+面向 workspace 前端的"当前用户可访问知识库"目录，为 KB 选择器提供数据源。与 admin 面
+`/api/v1/admin/knowledge-bases`（要求显式 tenant/project 父作用域）不同，本端点按调用者身份
+反查授权集合：
+
+1. 门控：要求携带合法 JWT（未认证 `401 INVALID_TOKEN`/`TOKEN_EXPIRED`）；进入目录的可访问性以
+   `graph:read` 授权集合为准，而非 `guard.wrap`（空作用域下项目级绑定会在第一阶段 `CheckPermission`
+   被拒），因此目录端点走"仅认证 + `AuthorizedKBIDs(subject, "graph:read")` 计算集合"。
+2. 集合解析复用作用域内核：global 绑定→全部 active；tenant/project 绑定→目录反查该父作用域下的
+   真实 KB；kb 绑定→显式集合；无任何 `graph:read` 绑定→空集合（不放大授权）。
+3. 只返回 `status='active'` 的 KB（archived/deleting 不进入可选列表）；不接受调用方传入的
+   tenant/project/kb 过滤参数。
+
+统一信封响应：
+
+```json
+{
+  "code": 200,
+  "message": "ok",
+  "data": {
+    "items": [
+      { "kb_id": "...", "name": "...", "tenant_id": "...", "project_id": "...", "status": "active" }
+    ]
+  },
+  "timestamp": "...",
+  "trace_id": "..."
+}
+```
+
+前端拿到目录后由用户选择激活库（`graphStore.activeKbId`）；`api` 拦截器随即为所有 `/api/*` 业务调用
+注入 `X-KB-ID`，DocQA/图谱展开额外在 body 显式携带 `kb_id`。未选择知识库时，前端本地拦截、后端返回
+`KB_SCOPE_REQUIRED`，不存在无作用域降级。
+
 ### 3.2 文档
 
 1. `GET /api/documents`
