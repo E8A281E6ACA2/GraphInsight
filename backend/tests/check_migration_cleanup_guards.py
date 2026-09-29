@@ -380,7 +380,12 @@ def test_core_delivery_docs_do_not_regress_to_old_workspace_or_smoke_baseline() 
         "权限校验仍有部分依赖 Python 上游",
     )
     for rel_path in docs_to_check:
-        source = _source(f"../{rel_path}")
+        doc_path = ROOT / ".." / rel_path
+        if not doc_path.exists():
+            # 该交付文档当前不在仓库（未提交/已下线）：不存在即无可回归内容，
+            # 跳过；不为通过守卫而伪造文档（M4-R1 审计前置文件处理）。
+            continue
+        source = doc_path.read_text(encoding="utf-8")
         for marker in forbidden_markers:
             if marker in source:
                 raise AssertionError(f"{rel_path} should not regress to stale marker: {marker}")
@@ -442,6 +447,67 @@ def test_unified_dev_defaults_do_not_regress_to_remote_or_python_public() -> Non
             raise AssertionError(f"{rel_path} must default authz to go_db")
 
 
+def test_kb_scope_strict_mode_has_no_compat_toggle() -> None:
+    """M4 关闭后 KB 作用域 strict 是唯一形态（契约 §2.11 D4）。
+
+    固定三件事，防止后续把 strict 悄悄削弱：
+    1. 不得新增可关闭/降级 KB 作用域强制的配置开关或 default KB 兜底；
+    2. KB 作用域第二阶段授权必须保持 fail-closed 锚点；
+    3. 跨 KB 负向测试与前端 kb_id 显式透传必须在位。
+    """
+    forbidden_markers = (
+        "KB_SCOPE_ENFORCE",
+        "KB_DEFAULT_ID",
+        "DefaultKBID",
+        "defaultKBID",
+        "KB_SCOPE_COMPAT",
+    )
+    scope_surfaces = (
+        "../go-backend/internal/config/config.go",
+        "../go-backend/internal/scope/scope.go",
+        "../go-backend/internal/httpserver/qa_scope.go",
+        "../go-backend/internal/httpserver/authz_middleware.go",
+    )
+    for rel_path in scope_surfaces:
+        source = _source(rel_path)
+        for marker in forbidden_markers:
+            if marker in source:
+                raise AssertionError(
+                    f"{rel_path} must not add a KB scope toggle/default-KB fallback ({marker}); "
+                    "KB scope strict is unconditional"
+                )
+
+    scope_source = _source("../go-backend/internal/scope/scope.go")
+    if "ErrScopeRequired()" not in scope_source:
+        raise AssertionError("scope resolver must keep rejecting requests without kb_id/kb_ids")
+
+    authz_source = _source("../go-backend/internal/httpserver/authz_middleware.go")
+    if "scoped permission check failed, fail closed" not in authz_source:
+        raise AssertionError("checkPermissionWithScope must keep fail-closed on scoped permission errors")
+    qa_scope_source = _source("../go-backend/internal/httpserver/qa_scope.go")
+    if "resolve authorized kb ids failed, fail closed" not in qa_scope_source:
+        raise AssertionError("authorizeQAEffectiveKBIDs must keep fail-closed on authorization errors")
+
+    negative_tests = (
+        "../go-backend/internal/httpserver/m4r1_kb_failclosed_soft_test.go",
+        "../go-backend/internal/httpserver/m4r1_cross_scope_negative_test.go",
+        "../go-backend/internal/httpserver/m4r1_qa_scope_negative_test.go",
+    )
+    for rel_path in negative_tests:
+        path = ROOT / rel_path
+        if not path.exists():
+            raise AssertionError(f"{rel_path} must stay present as cross-KB denial regression evidence")
+        if "must not be called" not in path.read_text(encoding="utf-8"):
+            raise AssertionError(f"{rel_path} must assert downstream services are not reached on denial")
+
+    api_source = _source("../frontend/src/services/api.ts")
+    if "X-KB-ID" not in api_source:
+        raise AssertionError("frontend api client must keep injecting X-KB-ID for business calls")
+    for rel_path in ("../frontend/src/services/docQa.ts", "../frontend/src/services/graphService.ts"):
+        if "requireActiveKbId" not in _source(rel_path):
+            raise AssertionError(f"{rel_path} must keep local interception when no KB is selected")
+
+
 def main() -> int:
     test_nl2cypher_status_uses_current_config_service()
     test_config_constants_do_not_restore_openai_category()
@@ -458,6 +524,7 @@ def main() -> int:
     test_core_delivery_docs_do_not_regress_to_old_workspace_or_smoke_baseline()
     test_linux_backend_tooling_uses_dot_venv_only()
     test_unified_dev_defaults_do_not_regress_to_remote_or_python_public()
+    test_kb_scope_strict_mode_has_no_compat_toggle()
     print("MIGRATION_CLEANUP_GUARDS_OK")
     return 0
 

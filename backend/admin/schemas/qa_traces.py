@@ -15,6 +15,10 @@ class QATraceCreate(BaseModel):
     status: str = Field(default="success", max_length=20)
     question: str
     operator_id: Optional[int] = None
+    # M4：trace 记录作用域（列自 M1 迁移起存在）
+    tenant_id: Optional[str] = Field(default=None, max_length=100)
+    project_id: Optional[str] = Field(default=None, max_length=100)
+    kb_id: Optional[str] = Field(default=None, max_length=100)
     model: Optional[str] = None
     top_k: Optional[int] = None
     latency_ms: Optional[int] = None

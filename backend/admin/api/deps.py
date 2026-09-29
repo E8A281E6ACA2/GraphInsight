@@ -17,6 +17,7 @@ from ..models import AdminUser
 from ..schemas.logs import LogCreate
 from ..services import auth_service, authz_service
 from core import AuthenticationException, get_logger
+from services.scope_contract import resolve_search_target  # noqa: F401 - 契约 §2.4 严格解析入口
 
 logger = get_logger()
 
@@ -136,6 +137,36 @@ def resolve_request_scope(request: Request) -> Dict[str, Optional[str]]:
         "project_id": pick("x-project-id", "project_id"),
         "kb_id": pick("x-kb-id", "kb_id"),
     }
+
+
+def _split_scope_list(raw: Optional[str]) -> Optional[list]:
+    """逗号分隔的多值 scope 头（如 x-kb-ids: kb-a,kb-b）。"""
+    if raw is None:
+        return None
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    return items or None
+
+
+def resolve_strict_search_target(request: Request, body: Optional[dict] = None) -> "SearchTarget":
+    """契约 §2.4 的严格作用域解析（M1 提供，M2-M4 知识库端点接入）。
+
+    header/query/body 同时携带同一 scope 且归一后不一致 → KB_CROSS_SCOPE；
+    kb 作用域完全缺失 → KB_SCOPE_REQUIRED（无 default 兜底）；
+    格式非法 → SCOPE_INVALID。返回 services.scope_contract.SearchTarget。
+    """
+    header = {
+        "tenant_id": request.headers.get("x-tenant-id"),
+        "project_id": request.headers.get("x-project-id"),
+        "kb_id": request.headers.get("x-kb-id"),
+        "kb_ids": _split_scope_list(request.headers.get("x-kb-ids")),
+    }
+    query = {
+        "tenant_id": request.query_params.get("tenant_id"),
+        "project_id": request.query_params.get("project_id"),
+        "kb_id": request.query_params.get("kb_id"),
+        "kb_ids": _split_scope_list(request.query_params.get("kb_ids")),
+    }
+    return resolve_search_target(header=header, query=query, body=body)
 
 
 def _write_authz_log(

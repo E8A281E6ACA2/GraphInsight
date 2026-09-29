@@ -122,11 +122,28 @@ def get_retrieval_runtime_config() -> Dict[str, Any]:
 def get_embedding_runtime_config() -> Dict[str, Any]:
     ai_config = get_ai_runtime_config()
     loaded = _load_category("embedding")
+    # 嵌入模型可以和问答模型不是同一家供应商，所以优先级为：
+    # 配置中心 DB > 嵌入专属 env（EMBEDDING_PROVIDER/BASE_URL/API_KEY）> 复用 ai_service/LLM。
     return {
         "enabled": _to_bool(loaded.get("enabled"), settings.embedding_enabled),
-        "provider": _first_non_empty(loaded.get("provider"), ai_config.get("provider"), "openai"),
-        "base_url": _first_non_empty(loaded.get("base_url"), ai_config.get("base_url"), settings.llm_base_url),
-        "api_key": _first_non_empty(loaded.get("api_key"), ai_config.get("api_key"), settings.llm_api_key),
+        "provider": _first_non_empty(
+            loaded.get("provider"),
+            os.getenv("EMBEDDING_PROVIDER"),
+            ai_config.get("provider"),
+            "openai",
+        ),
+        "base_url": _first_non_empty(
+            loaded.get("base_url"),
+            os.getenv("EMBEDDING_BASE_URL"),
+            ai_config.get("base_url"),
+            settings.llm_base_url,
+        ),
+        "api_key": _first_non_empty(
+            loaded.get("api_key"),
+            os.getenv("EMBEDDING_API_KEY"),
+            ai_config.get("api_key"),
+            settings.llm_api_key,
+        ),
         "model": _first_non_empty(loaded.get("model"), settings.embedding_model),
         "dimension": _to_int(loaded.get("dimension"), settings.embedding_dimension),
         "batch_size": _to_int(loaded.get("batch_size"), settings.embedding_batch_size),

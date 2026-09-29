@@ -16,12 +16,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from services.job_runtime import execute_job
+from services.scope_contract import normalize_scope_id
 from ..crud import log_crud
 from ..database import SessionLocal
-from ..models import AdminJob, AdminLog
+from ..models import AdminJob, AdminLog, KnowledgeBase
 from ..schemas.jobs import JobCreateRequest, JobItem, JobQuery
 from ..schemas.logs import LogCreate
 from core import BusinessException, NotFoundException, ValidationException, get_logger
+from core.exceptions import ErrorCode, KnowledgeScopeError
 
 logger = get_logger()
 
@@ -35,6 +37,9 @@ ALLOWED_RETRY_FROM = {JOB_STATUS_FAILED, JOB_STATUS_CANCELLED}
 ALLOWED_CANCEL_FROM = {JOB_STATUS_PENDING, JOB_STATUS_RUNNING}
 SUPPORTED_JOB_TYPES = {"build_graph", "clear_kb", "reindex"}
 RUNNABLE_JOB_TYPES = {"build_graph", "clear_kb", "reindex"}
+# 知识数据类任务：创建时必须携带 kb_id 且 KB 必须存在且为 active；
+# reindex 只重建 Neo4j 全文索引（基础设施操作），kb_id 可选。
+KB_SCOPED_JOB_TYPES = {"build_graph", "clear_kb"}
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -122,6 +127,56 @@ class JobService:
         suffix = uuid.uuid4().hex[:8]
         return f"py-job-worker:{host}:{pid}:{suffix}"
 
+    def _validate_kb_usable(self, db: Session, kb_id: str) -> None:
+        """任务创建时的 KB 校验：必须存在（KB_NOT_FOUND/404）且为 active（KB_ARCHIVED/409）。"""
+        row = db.query(KnowledgeBase).filter(KnowledgeBase.id == kb_id).first()
+        if row is None:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_NOT_FOUND,
+                message=f"知识库不存在: {kb_id}",
+                details={"kb_id": kb_id},
+            )
+        status = str(row.status or "").strip().lower()
+        if status != "active":
+            raise KnowledgeScopeError(
+                ErrorCode.KB_ARCHIVED,
+                message=f"知识库当前状态禁止创建该任务: {status}",
+                details={"kb_id": kb_id, "status": status},
+            )
+
+    def _resolve_job_scope(
+        self,
+        db: Session,
+        *,
+        job_type: str,
+        request: JobCreateRequest,
+    ) -> tuple[Dict[str, str], Dict[str, Any]]:
+        """解析并冻结任务作用域：payload 优先，缺失时回填请求字段。
+
+        返回 (normalized_scope, frozen_payload)。知识数据类任务缺 kb_id → KB_SCOPE_REQUIRED；
+        kb_id 存在时校验 KB 存在且 active。
+        """
+        payload = dict(request.payload or {})
+        scope: Dict[str, str] = {}
+        for field in ("kb_id", "tenant_id", "project_id"):
+            raw = payload.get(field) or getattr(request, field)
+            scope[field] = normalize_scope_id(field, raw) or ""
+
+        if job_type in KB_SCOPED_JOB_TYPES and not scope["kb_id"]:
+            raise ValidationException(
+                "任务缺少 kb_id 作用域",
+                error_code=ErrorCode.KB_SCOPE_REQUIRED,
+                details={"job_type": job_type},
+            )
+        if scope["kb_id"]:
+            self._validate_kb_usable(db, scope["kb_id"])
+
+        # 冻结作用域进 payload：worker 只消费 payload 中固化的 scope（手册 §13.2）
+        for field, value in scope.items():
+            if value:
+                payload[field] = value
+        return scope, payload
+
     def create_job(
         self,
         db: Session,
@@ -134,13 +189,14 @@ class JobService:
         try:
             if job_type not in SUPPORTED_JOB_TYPES:
                 raise ValidationException(f"不支持的任务类型: {job_type}")
+            scope, payload = self._resolve_job_scope(db, job_type=job_type, request=request)
             job = AdminJob(
                 job_type=job_type,
                 status=JOB_STATUS_PENDING,
-                tenant_id=request.tenant_id,
-                project_id=request.project_id,
-                kb_id=request.kb_id,
-                payload=_to_json_text(request.payload),
+                tenant_id=scope["tenant_id"] or None,
+                project_id=scope["project_id"] or None,
+                kb_id=scope["kb_id"] or None,
+                payload=_to_json_text(payload),
                 retry_count=0,
                 max_retries=request.max_retries,
                 requested_by=requested_by,
@@ -157,10 +213,14 @@ class JobService:
                     "job_type": job.job_type,
                     "status": job.status,
                     "max_retries": job.max_retries,
+                    "kb_id": job.kb_id,
+                    "tenant_id": job.tenant_id,
+                    "project_id": job.project_id,
                 },
             )
             return _to_item(job)
-        except ValidationException:
+        except (ValidationException, KnowledgeScopeError):
+            db.rollback()
             raise
         except Exception as exc:
             db.rollback()
