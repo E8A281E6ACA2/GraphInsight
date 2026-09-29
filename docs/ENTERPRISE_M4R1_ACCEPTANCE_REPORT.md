@@ -10,7 +10,7 @@
 
 strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜底，fail-closed 为唯一形态；第一阶段通用 RBAC soft 语义（store 不可用/错误/拒绝软放行、local_jwt_soft）按设计保留，不受第二阶段 KB 授权影响。该口径由 `backend/tests/check_migration_cleanup_guards.py::test_kb_scope_strict_mode_has_no_compat_toggle` 静态守卫防削弱。
 
-## 2. 提交清单（本地 main，领先 origin/main 13 个提交，待 push）
+## 2. 提交清单（本地 main，领先 origin/main 14 个提交，待 push）
 
 | 提交 | 说明 |
 |---|---|
@@ -26,7 +26,8 @@ strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜�
 | `78b1f28` | fix(httpserver): 封堵 KB 作用域授权剩余放行例外（含身份头剥离、拒绝审计、异常场景测试） |
 | `6705e25` | fix(tests): 统一边界守卫子进程输出按 UTF-8 捕获 |
 | `e4eccd8` | chore(repo): 忽略 Python 能力层 8001 运行态输出文件 |
-| 本次提交 | docs(enterprise): 记录复审整改轮与本轮复跑证据 |
+| `3df2bd5` | docs(enterprise): 记录复审整改轮与复跑证据 |
+| 本次提交 | docs(enterprise): 补记身份头剥离后的统一活栈与 E2E 复跑结果 |
 
 ## 3. 阻断项逐项证据
 
@@ -104,7 +105,25 @@ strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜�
 
 注：不带 `-X utf8` 直接跑 `check_kb_migrations_smoke.py` 时，父进程在 GBK 控制台打印 `✓` 会 `UnicodeEncodeError`；这是运行命令前提（见 §5），子进程捕获已修复，不在本轮改动面内。
 
+#### 7.4.1 统一活栈复跑（身份头剥离改动后）
+
+前提：`go-backend/bin/api-linux` 用含 7.1 改动的源码重新交叉编译后 `docker restart graphinsight-go-gateway`；`/health` 显示 `enforce_business_api:true`、`rbac_authz_mode:go_db`；Python 能力层 :8001 在线；PostgreSQL :5434 / Neo4j :7687 / Milvus :19531 可达。
+
+| 验证 | 结果 |
+|---|---|
+| `check_dual_kb_blackbox.py` | passed=15 failed=0 skipped=0 |
+| `check_kb_scope_isolation.py` | passed=54 failed=0 |
+| `GET /api/graph/schema?kb_id=<active KB>` + 合法 JWT | 200 |
+| 同上，KB 不存在 | 404 `KB_NOT_FOUND` |
+| 同上，缺 `kb_id` | 400 `KB_SCOPE_REQUIRED` |
+| header `X-KB-ID` 与 query `kb_id` 不一致 | 400 `KB_CROSS_SCOPE` |
+| 无 token 但伪造 `x-auth-user-name` / `x-auth-user-id` | 401 `UNAUTHORIZED`（7.1 剥离生效，绕过面已实测封堵） |
+| `POST /api/docqa` + JWT + `kb_id` | HTTP 200，`code 200`、answer 非空 |
+| Playwright E2E（`E2E_BROWSER_CHANNEL=chrome`，前端 4173 → 网关 18082） | 5 passed / 3 skipped / EXIT=0（3.8m），与基线一致；业务全链路 upload→build→ask→trace→delete 单条 3.6m 通过 |
+
+E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好回跳），认证路径由 token 注入用例覆盖；与上一轮基线完全同集合，非新增回归。
+
 ### 7.5 待办
 
-- Playwright E2E 与双 KB 黑盒/scope isolation 在 7.1 身份头剥离改动后尚未复跑，push 前需补齐。
-- push 与 `git rev-parse HEAD` / `git ls-remote origin refs/heads/main` 一致性核验仍需在有 GitHub 出口的环境执行。
+- push 与 `git rev-parse HEAD` / `git ls-remote origin refs/heads/main` 一致性核验仍需在有 GitHub 出口的环境执行（本机 443 直连超时、1080 代理 handshake 失败）。
+- 独立待办（与本轮整改无关）：`backend/scripts/seed_e2e_local_stack.py` 在本地活栈播种时打印 "admin user updated" 但新密码哈希实际未落库（`bcrypt.checkpw` 为 False），本轮靠手工 `UPDATE admin_users SET password_hash=...` 解除阻塞，需单独排查提交路径。
