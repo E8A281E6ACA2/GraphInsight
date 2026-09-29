@@ -1,5 +1,12 @@
 """
-文档解析并入库 Neo4j 的服务
+文档解析并入库 Neo4j 的服务（M3：知识库作用域隔离）
+
+作用域不变量（docs/KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md §2）：
+- build_graph 输入为显式 doc_ids（来自 knowledge_base_documents 注册表），禁止目录扫描；
+- 所有 Neo4j 写入/删除携带 kb_id（Document/Chunk 另带 tenant_id/project_id）；
+- Entity MERGE 键为 {entity_key, kb_id}，entity_key = scope_contract.entity_key(...)；
+- delete/clear 必须显式携带 kb_id，缺少即 KB_SCOPE_REQUIRED，不触碰数据库；
+- 解析产物目录为 parsed_documents/{kb_id}/{doc_id}/。
 """
 from __future__ import annotations
 
@@ -14,18 +21,43 @@ from typing import Any, Dict, List, Optional
 
 from config import get_settings
 from core import get_logger
+from core.exceptions import ErrorCode, KnowledgeScopeError
 from services.document_parser import DocumentParserManager, ParsedDocument
 from services.knowledge_discovery.chunking import StructuredChunk, StructuredChunker
 from services.knowledge_discovery.extraction import build_extraction_schema, evidence_validator, extraction_planner
 from services.knowledge_discovery.normalization import normalize_entity_name, normalize_entity_values
 from services.knowledge_discovery.profiling import document_profiler
-from services.neo4j_service import get_neo4j_service
-from services.llm_entity_extractor import llm_entity_extractor
-from services.llm_relation_extractor import llm_relation_extractor
-from services.retrieval_orchestrator import retrieval_orchestrator
+from services.scope_contract import entity_key as scope_entity_key
+from services.scope_contract import normalize_scope_id
 
 logger = get_logger()
 settings = get_settings()
+
+# 抽取管线目前只产出实体名称，不产出类型；统一使用稳定默认类型参与 entity_key 计算。
+# 同名实体跨 KB 仍不会合并（entity_key 材料含 kb_id），见契约 §2.2。
+DEFAULT_ENTITY_TYPE = "entity"
+
+
+def __getattr__(name: str):
+    """惰性解析旧模块级符号，保持既有 patch 目标可用，同时模块导入期不依赖 neo4j/openai。"""
+    if name == "llm_entity_extractor":
+        from services import llm_entity_extractor as module
+
+        return module
+    if name == "llm_relation_extractor":
+        from services import llm_relation_extractor as module
+
+        return module
+    if name == "retrieval_orchestrator":
+        from services.retrieval_orchestrator import retrieval_orchestrator as instance
+
+        return instance
+    if name == "get_neo4j_service":
+        from services.neo4j_service import get_neo4j_service as getter
+
+        return getter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 SUPPORTED_EXTS = {
     ".txt",
@@ -189,56 +221,135 @@ class DocumentGraphService:
     def __init__(self) -> None:
         self.neo4j = None
 
-    def ensure_schema(self) -> None:
+    def _neo4j(self):
+        """惰性获取 Neo4j 服务（模块导入期不依赖 neo4j driver）。"""
         if self.neo4j is None:
+            from services.neo4j_service import get_neo4j_service
+
             self.neo4j = get_neo4j_service()
-        self.neo4j.ensure_connected()
-        with self.neo4j.session() as session:
+        return self.neo4j
+
+    def ensure_schema(self) -> None:
+        neo4j = self._neo4j()
+        neo4j.ensure_connected()
+        with neo4j.session() as session:
             self._ensure_schema(session)
 
     def build_graph(
         self,
-        force: bool = False,
+        *,
+        kb_id: str,
         doc_ids: Optional[List[str]] = None,
+        force: bool = False,
         reasoning_profile: Optional[str] = None,
         complex_extraction: bool = False,
         parser_provider: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> Dict[str, object]:
-        if self.neo4j is None:
-            self.neo4j = get_neo4j_service()
-        self.neo4j.ensure_connected()
-        doc_dir = Path(settings.document_storage_path).resolve()
-        if not doc_dir.exists():
-            doc_dir.mkdir(parents=True, exist_ok=True)
+        """按注册表显式 doc_ids 建图；不扫描目录，永不跨 KB 写入。
 
-        documents = self._collect_documents(doc_dir, doc_ids=doc_ids)
-        if not documents:
-            fallback_dir = (Path(__file__).resolve().parents[1] / "documents").resolve()
-            if fallback_dir != doc_dir and fallback_dir.exists():
-                fallback_docs = self._collect_documents(fallback_dir, doc_ids=doc_ids)
-                if fallback_docs:
-                    logger.warning(
-                        "文档目录切换为后端目录",
-                        context={
-                            "from": str(doc_dir),
-                            "to": str(fallback_dir),
-                            "count": len(fallback_docs),
-                        },
-                    )
-                    doc_dir = fallback_dir
-                    documents = fallback_docs
+        - kb_id / doc_ids 缺失 → KB_SCOPE_REQUIRED（在任何数据库访问之前拒绝）；
+        - 每个 doc 的作用域（kb/tenant/project）来自其注册表行；
+          与 payload kb_id/tenant_id/project_id 不一致 → 跳过并报告；
+        - force 仅表示忽略"未变更跳过"对目标 doc 重建投影，不做全局清空。
+        """
+        normalized_kb = normalize_scope_id("kb_id", kb_id)
+        if not normalized_kb:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="build_graph 必须显式携带 kb_id",
+            )
+        clean_doc_ids: List[str] = []
+        for item in doc_ids or []:
+            value = str(item or "").strip()
+            if value and value not in clean_doc_ids:
+                clean_doc_ids.append(value)
+        if not clean_doc_ids:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="build_graph 需要显式 doc_ids，禁止目录扫描",
+                details={"kb_id": normalized_kb},
+            )
+        normalized_tenant = normalize_scope_id("tenant_id", tenant_id) if tenant_id else ""
+        normalized_project = normalize_scope_id("project_id", project_id) if project_id else ""
 
-        if not documents:
-            logger.warning("未发现可解析文档", context={"dir": str(doc_dir)})
-            return {"documents": 0, "chunks": 0, "entities": 0}
+        # 注册表解析：doc_id -> registry row（Go 上传时写入，Python 数据面只读消费）
+        from services import document_registry
+
+        kb_row = document_registry.get_knowledge_base(normalized_kb)
+        if kb_row is None:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_NOT_FOUND,
+                message=f"知识库不存在: {normalized_kb}",
+                details={"kb_id": normalized_kb},
+            )
+        if str(kb_row.status or "").strip().lower() == "archived":
+            raise KnowledgeScopeError(
+                ErrorCode.KB_ARCHIVED,
+                message="知识库已归档，禁止建图写入",
+                details={"kb_id": normalized_kb},
+            )
+        rows = document_registry.get_documents(clean_doc_ids)
+
+        jobs: List[Dict[str, Any]] = []
+        skipped_cross_scope: List[Dict[str, str]] = []
+        failures: List[Dict[str, str]] = []
+        for doc_id in clean_doc_ids:
+            row = rows.get(doc_id)
+            if row is None:
+                failures.append({"file": doc_id, "reason": "doc_not_found_in_registry"})
+                continue
+            row_kb = str(row.kb_id or "").strip().lower()
+            if row_kb != normalized_kb:
+                # 与 payload kb_id 不一致：跳过并报告，绝不跨库写入
+                skipped_cross_scope.append({"doc_id": doc_id, "kb_id": row_kb})
+                continue
+            scope = document_registry.document_scope(row)
+            if normalized_tenant and scope["tenant_id"] and normalized_tenant != scope["tenant_id"]:
+                skipped_cross_scope.append({"doc_id": doc_id, "field": "tenant_id"})
+                continue
+            if normalized_project and scope["project_id"] and normalized_project != scope["project_id"]:
+                skipped_cross_scope.append({"doc_id": doc_id, "field": "project_id"})
+                continue
+            try:
+                file_path = document_registry.resolve_document_file_path(row, kb_row)
+            except KnowledgeScopeError as exc:
+                failures.append({"file": doc_id, "reason": exc.error_code})
+                continue
+            if not file_path.exists():
+                failures.append({"file": str(getattr(row, "name", "") or doc_id), "reason": "source_file_missing"})
+                continue
+            jobs.append({"doc_id": doc_id, "file": file_path, "scope": scope})
+
+        if not jobs:
+            logger.warning(
+                "注册表中无可建图文档",
+                context={"kb_id": normalized_kb, "requested": len(clean_doc_ids)},
+            )
+            return {
+                "documents": 0,
+                "chunks": 0,
+                "entities": 0,
+                "total_documents": 0,
+                "skipped_documents": 0,
+                "failures": failures,
+                "skipped_cross_scope": skipped_cross_scope,
+                "scope": "kb_scoped",
+                "kb_id": normalized_kb,
+                "target_doc_ids": clean_doc_ids,
+                "reasoning_profile": reasoning_profile or "",
+                "complex_extraction": complex_extraction,
+                "parser_provider": parser_provider or "",
+            }
 
         logger.info(
             "开始解析文档",
             context={
-                "dir": str(doc_dir),
-                "count": len(documents),
+                "kb_id": normalized_kb,
+                "count": len(jobs),
                 "force": force,
-                "doc_ids_count": len(doc_ids or []),
+                "doc_ids_count": len(clean_doc_ids),
                 "reasoning_profile": reasoning_profile or "",
                 "complex_extraction": complex_extraction,
                 "parser_provider": parser_provider or "",
@@ -246,16 +357,14 @@ class DocumentGraphService:
         )
 
         apoc_available = False
-        with self.neo4j.session() as session:
+        neo4j = self._neo4j()
+        neo4j.ensure_connected()
+        with neo4j.session() as session:
             self._ensure_schema(session)
             if settings.llm_relation_dynamic_type:
                 apoc_available = self._check_apoc_available(session)
-            if force and not doc_ids:
-                cleanup = self._clear_graph_data(session)
-                self._clear_parsed_document_artifacts()
-                logger.info("强制重建前清理旧文档图谱", context=cleanup)
 
-        total_documents = len(documents)
+        total_documents = len(jobs)
         doc_count = 0
         chunk_count = 0
         entity_count = 0
@@ -263,15 +372,22 @@ class DocumentGraphService:
         vector_indexed = 0
         vector_failures: List[str] = []
         skipped_documents = 0
+        processed_doc_ids: List[str] = []
+        doc_tenant_id = ""
+        doc_project_id = ""
         entity_names: set[str] = set()
-        failures: List[Dict[str, str]] = []
         parse_warnings: List[Dict[str, str]] = []
         use_dynamic_relations = settings.llm_relation_dynamic_type and apoc_available
         dynamic_relation_failed_logged = False
         parser_manager = DocumentParserManager()
         structured_chunker = StructuredChunker()
 
-        for doc in documents:
+        for job in jobs:
+            doc = job["file"]
+            doc_id = job["doc_id"]
+            doc_kb_id = job["scope"]["kb_id"]
+            doc_tenant_id = job["scope"]["tenant_id"]
+            doc_project_id = job["scope"]["project_id"]
             try:
                 parsed = parser_manager.parse(doc, provider_override=parser_provider)
                 text = parsed.text
@@ -286,7 +402,6 @@ class DocumentGraphService:
                     )
                     continue
 
-                doc_id = self._make_doc_id(doc)
                 content_hash = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
                 structured_chunks = structured_chunker.chunk(parsed, doc_id=doc_id)
@@ -358,6 +473,20 @@ class DocumentGraphService:
                         ),
                     )
                     entity_names.update(entities)
+                    entity_nodes = [
+                        {
+                            "name": name,
+                            "entity_key": scope_entity_key(doc_kb_id, name, DEFAULT_ENTITY_TYPE),
+                        }
+                        for name in entities
+                    ]
+                    for rel in relations:
+                        rel["source_key"] = scope_entity_key(
+                            doc_kb_id, str(rel.get("source") or ""), DEFAULT_ENTITY_TYPE
+                        )
+                        rel["target_key"] = scope_entity_key(
+                            doc_kb_id, str(rel.get("target") or ""), DEFAULT_ENTITY_TYPE
+                        )
                     chunk_payload.append(
                         {
                             "chunk_id": f"{doc_id}-{idx:03d}",
@@ -381,12 +510,14 @@ class DocumentGraphService:
                             "table_columns": structured_chunk.table_columns,
                             "table_rows_json": json.dumps(structured_chunk.table_rows, ensure_ascii=False)[:4096],
                             "entities": entities,
+                            "entity_nodes": entity_nodes,
                             "relations": relations,
                         }
                     )
                 parsed_artifact_path = self._write_parsed_document_artifacts(
                     doc=doc,
                     doc_id=doc_id,
+                    kb_id=doc_kb_id,
                     parsed=parsed,
                     content_hash=content_hash,
                     chunks=chunk_payload,
@@ -396,13 +527,13 @@ class DocumentGraphService:
                     extraction_plan=extraction_plan.to_dict(),
                 )
 
-                with self.neo4j.session() as session:
+                with neo4j.session() as session:
                     existing = session.run(
                         """
-                        MATCH (d:Document {doc_id: $doc_id})
+                        MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id})
                         RETURN d.hash AS hash, d.parser_provider AS parser_provider
                         """,
-                        {"doc_id": doc_id},
+                        {"doc_id": doc_id, "kb_id": doc_kb_id},
                     ).single()
                     if (
                         existing
@@ -412,7 +543,7 @@ class DocumentGraphService:
                     ):
                         session.run(
                             """
-                            MATCH (d:Document {doc_id: $doc_id})
+                            MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id})
                             SET d.parser_version = $parser_version,
                                 d.parse_mode = $parse_mode,
                                 d.parsed_artifact_path = $parsed_artifact_path,
@@ -423,6 +554,7 @@ class DocumentGraphService:
                             """,
                             {
                                 "doc_id": doc_id,
+                                "kb_id": doc_kb_id,
                                 "parser_version": parsed.parser_version,
                                 "parse_mode": parsed.parse_mode,
                                 "parsed_artifact_path": str(parsed_artifact_path),
@@ -433,13 +565,17 @@ class DocumentGraphService:
                             },
                         )
                         skipped_documents += 1
-                        logger.info("文档未变更，跳过", context={"doc": doc.name})
+                        logger.info("文档未变更，跳过", context={"doc": doc.name, "kb_id": doc_kb_id})
                         continue
 
                     session.run(
                         """
-                        MERGE (d:Document {doc_id: $doc_id})
+                        MERGE (d:Document {doc_id: $doc_id, kb_id: $kb_id})
+                        ON CREATE SET d.created_at = timestamp()
                         SET d.name = $name,
+                            d.tenant_id = $tenant_id,
+                            d.project_id = $project_id,
+                            d.kb_id = $kb_id,
                             d.path = $path,
                             d.ext = $ext,
                             d.size = $size,
@@ -457,6 +593,9 @@ class DocumentGraphService:
                         """,
                         {
                             "doc_id": doc_id,
+                            "kb_id": doc_kb_id,
+                            "tenant_id": doc_tenant_id,
+                            "project_id": doc_project_id,
                             "name": doc.name,
                             "path": str(doc),
                             "ext": doc.suffix.lower(),
@@ -475,30 +614,33 @@ class DocumentGraphService:
 
                     session.run(
                         """
-                        MATCH (d:Document {doc_id: $doc_id})-[:HAS_CHUNK]->(c:Chunk)
+                        MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id})-[:HAS_CHUNK]->(c:Chunk)
                         DETACH DELETE c
                         """,
-                        {"doc_id": doc_id},
+                        {"doc_id": doc_id, "kb_id": doc_kb_id},
                     )
 
                     session.run(
                         """
                         MATCH (:Entity)-[r]->(:Entity)
-                        WHERE r.doc_id = $doc_id
+                        WHERE r.doc_id = $doc_id AND r.kb_id = $kb_id
                         DELETE r
                         """,
-                        {"doc_id": doc_id},
+                        {"doc_id": doc_id, "kb_id": doc_kb_id},
                     )
-                    self._cleanup_orphan_entities(session)
+                    self._cleanup_orphan_entities(session, doc_kb_id)
 
                     for batch in self._batch(chunk_payload, 50):
                         session.run(
                             """
                             UNWIND $chunks AS c
-                            MERGE (ch:Chunk {chunk_id: c.chunk_id})
+                            MERGE (ch:Chunk {chunk_id: c.chunk_id, kb_id: $kb_id})
                             SET ch.text = c.text,
                                 ch.index = c.index,
                                 ch.doc_id = $doc_id,
+                                ch.kb_id = $kb_id,
+                                ch.tenant_id = $tenant_id,
+                                ch.project_id = $project_id,
                                 ch.parser_provider = c.parser_provider,
                                 ch.parser_version = c.parser_version,
                                 ch.parse_mode = c.parse_mode,
@@ -522,16 +664,25 @@ class DocumentGraphService:
                                 ch.table_rows_json = c.table_rows_json,
                                 ch.source = 'document_ingest'
                             WITH ch, c
-                            MATCH (d:Document {doc_id: $doc_id})
+                            MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id})
                             MERGE (d)-[:HAS_CHUNK]->(ch)
                             WITH ch, c
-                            UNWIND c.entities AS entityName
-                            MERGE (e:Entity {name: entityName})
-                            ON CREATE SET e.source = 'document_ingest'
+                            UNWIND c.entity_nodes AS ent
+                            MERGE (e:Entity {entity_key: ent.entity_key, kb_id: $kb_id})
+                            ON CREATE SET e.name = ent.name,
+                                e.entity_type = $entity_type,
+                                e.tenant_id = $tenant_id,
+                                e.project_id = $project_id,
+                                e.source = 'document_ingest'
+                            SET e.name = ent.name
                             MERGE (ch)-[:MENTIONS]->(e)
                             """,
                             {
                                 "doc_id": doc_id,
+                                "kb_id": doc_kb_id,
+                                "tenant_id": doc_tenant_id,
+                                "project_id": doc_project_id,
+                                "entity_type": DEFAULT_ENTITY_TYPE,
                                 "chunks": batch,
                             },
                         )
@@ -551,16 +702,29 @@ class DocumentGraphService:
                                       AND rel.target IS NOT NULL
                                       AND rel.label IS NOT NULL
                                       AND rel.rel_type IS NOT NULL
-                                    MERGE (s:Entity {name: rel.source})
-                                    ON CREATE SET s.source = 'document_ingest'
-                                    MERGE (t:Entity {name: rel.target})
-                                    ON CREATE SET t.source = 'document_ingest'
+                                      AND rel.source_key IS NOT NULL
+                                      AND rel.target_key IS NOT NULL
+                                    MERGE (s:Entity {entity_key: rel.source_key, kb_id: $kb_id})
+                                    ON CREATE SET s.name = rel.source,
+                                        s.entity_type = $entity_type,
+                                        s.tenant_id = $tenant_id,
+                                        s.project_id = $project_id,
+                                        s.source = 'document_ingest'
+                                    MERGE (t:Entity {entity_key: rel.target_key, kb_id: $kb_id})
+                                    ON CREATE SET t.name = rel.target,
+                                        t.entity_type = $entity_type,
+                                        t.tenant_id = $tenant_id,
+                                        t.project_id = $project_id,
+                                        t.source = 'document_ingest'
                                     CALL apoc.create.relationship(
                                       s,
                                       rel.rel_type,
                                       {
                                         label: rel.label,
                                         doc_id: $doc_id,
+                                        kb_id: $kb_id,
+                                        tenant_id: $tenant_id,
+                                        project_id: $project_id,
                                         chunk_id: c.chunk_id,
                                         source: 'document_ingest',
                                         confidence: rel.confidence,
@@ -573,6 +737,10 @@ class DocumentGraphService:
                                     """,
                                     {
                                         "doc_id": doc_id,
+                                        "kb_id": doc_kb_id,
+                                        "tenant_id": doc_tenant_id,
+                                        "project_id": doc_project_id,
+                                        "entity_type": DEFAULT_ENTITY_TYPE,
                                         "chunks": batch,
                                     },
                                 )
@@ -594,28 +762,51 @@ class DocumentGraphService:
                                 WHERE rel.source IS NOT NULL
                                   AND rel.target IS NOT NULL
                                   AND rel.label IS NOT NULL
-                                MERGE (s:Entity {name: rel.source})
-                                ON CREATE SET s.source = 'document_ingest'
-                                MERGE (t:Entity {name: rel.target})
-                                ON CREATE SET t.source = 'document_ingest'
-                                MERGE (s)-[r:RELATION {label: rel.label, doc_id: $doc_id, chunk_id: c.chunk_id}]->(t)
-                                SET r.source = 'document_ingest',
+                                MERGE (s:Entity {entity_key: rel.source_key, kb_id: $kb_id})
+                                ON CREATE SET s.name = rel.source,
+                                    s.entity_type = $entity_type,
+                                    s.tenant_id = $tenant_id,
+                                    s.project_id = $project_id,
+                                    s.source = 'document_ingest'
+                                MERGE (t:Entity {entity_key: rel.target_key, kb_id: $kb_id})
+                                ON CREATE SET t.name = rel.target,
+                                    t.entity_type = $entity_type,
+                                    t.tenant_id = $tenant_id,
+                                    t.project_id = $project_id,
+                                    t.source = 'document_ingest'
+                                MERGE (s)-[r:RELATION {label: rel.label, doc_id: $doc_id, chunk_id: c.chunk_id, kb_id: $kb_id}]->(t)
+                                SET r.tenant_id = $tenant_id,
+                                    r.project_id = $project_id,
+                                    r.source = 'document_ingest',
                                     r.confidence = coalesce(rel.confidence, r.confidence),
                                     r.evidence = coalesce(rel.evidence, r.evidence),
                                     r.relation_type = coalesce(rel.relation_type, r.relation_type)
                                 """,
                                 {
                                     "doc_id": doc_id,
+                                    "kb_id": doc_kb_id,
+                                    "tenant_id": doc_tenant_id,
+                                    "project_id": doc_project_id,
+                                    "entity_type": DEFAULT_ENTITY_TYPE,
                                     "chunks": batch,
                                 },
                             )
 
-                doc_count += 1
-                chunk_count += len(chunk_payload)
-                relation_count += sum(len(item.get("relations", [])) for item in chunk_payload)
-                vector_result = retrieval_orchestrator.index_chunks(chunk_payload)
+                from services.retrieval_orchestrator import retrieval_orchestrator
+
+                vector_result = retrieval_orchestrator.index_chunks(
+                    chunk_payload,
+                    kb_id=doc_kb_id,
+                    tenant_id=doc_tenant_id,
+                    project_id=doc_project_id,
+                )
                 vector_indexed += int(vector_result.get("indexed") or 0)
                 vector_failures.extend([str(item) for item in (vector_result.get("failures") or [])])
+
+                doc_count += 1
+                processed_doc_ids.append(doc_id)
+                chunk_count += len(chunk_payload)
+                relation_count += sum(len(item.get("relations", [])) for item in chunk_payload)
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "文档建图失败",
@@ -635,36 +826,57 @@ class DocumentGraphService:
             "total_documents": total_documents,
             "skipped_documents": skipped_documents,
             "failures": failures,
+            "skipped_cross_scope": skipped_cross_scope,
             "parse_warnings": parse_warnings[:20],
-            "scope": "selected_documents" if doc_ids else "all_documents",
-            "target_doc_ids": doc_ids or [],
+            "scope": "kb_scoped",
+            "kb_id": normalized_kb,
+            "tenant_id": doc_tenant_id,
+            "project_id": doc_project_id,
+            "target_doc_ids": clean_doc_ids,
+            "processed_doc_ids": processed_doc_ids,
             "reasoning_profile": reasoning_profile or "",
             "complex_extraction": complex_extraction,
             "parser_provider": parser_provider or "",
         }
 
-    def delete_document_graph(self, doc_id: str) -> Dict[str, int]:
-        if self.neo4j is None:
-            self.neo4j = get_neo4j_service()
+    def _require_kb_scope(self, kb_id: Optional[str]) -> str:
+        """delete/clear 类操作的 kb 强制点：缺失/非法时在任何 DB 访问之前拒绝。"""
+        normalized = normalize_scope_id("kb_id", kb_id)
+        if not normalized:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="该操作必须显式携带 kb_id，禁止全局清理",
+            )
+        return normalized
 
-        self.neo4j.ensure_connected()
-        with self.neo4j.session() as session:
-            relation_count = self._count_document_relations_for_doc(session, doc_id)
+    def delete_document_graph(self, doc_id: str, kb_id: str) -> Dict[str, int]:
+        clean_kb = self._require_kb_scope(kb_id)
+        clean_doc = str(doc_id or "").strip()
+        if not clean_doc:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="delete_document_graph 必须显式携带 doc_id",
+                details={"kb_id": clean_kb},
+            )
+        neo4j = self._neo4j()
+        neo4j.ensure_connected()
+        with neo4j.session() as session:
+            relation_count = self._count_document_relations_for_doc(session, clean_doc, clean_kb)
             if relation_count:
                 session.run(
                     """
                     MATCH (:Entity)-[r]->(:Entity)
-                    WHERE r.doc_id = $doc_id
+                    WHERE r.doc_id = $doc_id AND r.kb_id = $kb_id
                     DELETE r
                     """,
-                    {"doc_id": doc_id},
+                    {"doc_id": clean_doc, "kb_id": clean_kb},
                 )
 
             chunk_count = int(
                 (
                     session.run(
-                        "MATCH (c:Chunk {doc_id: $doc_id}) RETURN count(c) AS c",
-                        {"doc_id": doc_id},
+                        "MATCH (c:Chunk {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(c) AS c",
+                        {"doc_id": clean_doc, "kb_id": clean_kb},
                     ).single()
                     or {}
                 ).get("c")
@@ -672,15 +884,15 @@ class DocumentGraphService:
             )
             if chunk_count:
                 session.run(
-                    "MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c",
-                    {"doc_id": doc_id},
+                    "MATCH (c:Chunk {doc_id: $doc_id, kb_id: $kb_id}) DETACH DELETE c",
+                    {"doc_id": clean_doc, "kb_id": clean_kb},
                 )
 
             doc_count = int(
                 (
                     session.run(
-                        "MATCH (d:Document {doc_id: $doc_id}) RETURN count(d) AS c",
-                        {"doc_id": doc_id},
+                        "MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(d) AS c",
+                        {"doc_id": clean_doc, "kb_id": clean_kb},
                     ).single()
                     or {}
                 ).get("c")
@@ -688,43 +900,56 @@ class DocumentGraphService:
             )
             if doc_count:
                 session.run(
-                    "MATCH (d:Document {doc_id: $doc_id}) DETACH DELETE d",
-                    {"doc_id": doc_id},
+                    "MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id}) DETACH DELETE d",
+                    {"doc_id": clean_doc, "kb_id": clean_kb},
                 )
 
-            orphan_entities = self._cleanup_orphan_entities(session)
-        retrieval_orchestrator.delete_doc(doc_id)
-        self._delete_parsed_document_artifacts(doc_id)
+            orphan_entities = self._cleanup_orphan_entities(session, clean_kb)
+        from services.retrieval_orchestrator import retrieval_orchestrator
+
+        retrieval_orchestrator.delete_doc(clean_doc, clean_kb)
+        self._delete_parsed_document_artifacts(clean_doc, clean_kb)
 
         return {
             "documents": doc_count,
             "chunks": chunk_count,
             "relations": relation_count,
             "orphan_entities": orphan_entities,
+            "kb_id": clean_kb,
         }
 
-    def clear_document_graph(self) -> Dict[str, int]:
-        if self.neo4j is None:
-            self.neo4j = get_neo4j_service()
-        self.neo4j.ensure_connected()
-        with self.neo4j.session() as session:
-            stats = self._clear_graph_data(session)
-        retrieval_orchestrator.clear()
-        self._clear_parsed_document_artifacts()
+    def clear_document_graph(self, kb_id: str) -> Dict[str, int]:
+        """清空单个知识库的图谱/向量/解析产物；kb_id 必填，无全局清理路径。"""
+        clean_kb = self._require_kb_scope(kb_id)
+        neo4j = self._neo4j()
+        neo4j.ensure_connected()
+        with neo4j.session() as session:
+            stats = self._clear_graph_data(session, clean_kb)
+        from services.retrieval_orchestrator import retrieval_orchestrator
+
+        retrieval_orchestrator.clear([clean_kb])
+        self._clear_parsed_document_artifacts(clean_kb)
+        stats["kb_id"] = clean_kb
         return stats
 
-    def preview_delete_document_graph(self, doc_id: str) -> Dict[str, int]:
-        if self.neo4j is None:
-            self.neo4j = get_neo4j_service()
-
-        self.neo4j.ensure_connected()
-        with self.neo4j.session() as session:
-            relation_count = self._count_document_relations_for_doc(session, doc_id)
+    def preview_delete_document_graph(self, doc_id: str, kb_id: str) -> Dict[str, int]:
+        clean_kb = self._require_kb_scope(kb_id)
+        clean_doc = str(doc_id or "").strip()
+        if not clean_doc:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="preview_delete_document_graph 必须显式携带 doc_id",
+                details={"kb_id": clean_kb},
+            )
+        neo4j = self._neo4j()
+        neo4j.ensure_connected()
+        with neo4j.session() as session:
+            relation_count = self._count_document_relations_for_doc(session, clean_doc, clean_kb)
             chunk_count = int(
                 (
                     session.run(
-                        "MATCH (c:Chunk {doc_id: $doc_id}) RETURN count(c) AS c",
-                        {"doc_id": doc_id},
+                        "MATCH (c:Chunk {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(c) AS c",
+                        {"doc_id": clean_doc, "kb_id": clean_kb},
                     ).single()
                     or {}
                 ).get("c")
@@ -733,8 +958,8 @@ class DocumentGraphService:
             doc_count = int(
                 (
                     session.run(
-                        "MATCH (d:Document {doc_id: $doc_id}) RETURN count(d) AS c",
-                        {"doc_id": doc_id},
+                        "MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(d) AS c",
+                        {"doc_id": clean_doc, "kb_id": clean_kb},
                     ).single()
                     or {}
                 ).get("c")
@@ -746,37 +971,43 @@ class DocumentGraphService:
             "chunks": chunk_count,
             "relations": relation_count,
             "orphan_entities": 0,
+            "kb_id": clean_kb,
         }
 
-    def preview_clear_document_graph(self) -> Dict[str, int]:
-        if self.neo4j is None:
-            self.neo4j = get_neo4j_service()
-        self.neo4j.ensure_connected()
-        with self.neo4j.session() as session:
-            totals = self._get_graph_totals(session)
+    def preview_clear_document_graph(self, kb_id: str) -> Dict[str, int]:
+        clean_kb = self._require_kb_scope(kb_id)
+        neo4j = self._neo4j()
+        neo4j.ensure_connected()
+        with neo4j.session() as session:
+            totals = self._get_graph_totals(session, clean_kb)
         return {
             "documents": totals["documents"],
             "chunks": totals["chunks"],
             "relations": totals["relations"],
             "orphan_entities": 0,
+            "kb_id": clean_kb,
         }
 
-    def get_graph_totals(self) -> Dict[str, int]:
-        if self.neo4j is None:
-            self.neo4j = get_neo4j_service()
-        self.neo4j.ensure_connected()
-        with self.neo4j.session() as session:
-            return self._get_graph_totals(session)
+    def get_graph_totals(self, kb_id: str) -> Dict[str, int]:
+        clean_kb = self._require_kb_scope(kb_id)
+        neo4j = self._neo4j()
+        neo4j.ensure_connected()
+        with neo4j.session() as session:
+            return self._get_graph_totals(session, clean_kb)
 
-    def _clear_graph_data(self, session) -> Dict[str, int]:
-        relation_count = self._count_document_relations(session)
+    def _clear_graph_data(self, session, kb_id: str) -> Dict[str, int]:
+        """清空指定 kb_id 的知识图谱数据（Document/Chunk/Relation + 孤儿实体）。"""
+        clean_kb = self._require_kb_scope(kb_id)
+        relation_count = self._count_document_relations(session, clean_kb)
         if relation_count:
             session.run(
                 """
                 MATCH (:Entity)-[r]->(:Entity)
-                WHERE r.source = 'document_ingest' OR r.doc_id IS NOT NULL
+                WHERE r.kb_id = $kb_id
+                  AND (r.source = 'document_ingest' OR r.doc_id IS NOT NULL)
                 DELETE r
-                """
+                """,
+                {"kb_id": clean_kb},
             )
 
         chunk_count = int(
@@ -784,9 +1015,11 @@ class DocumentGraphService:
                 session.run(
                     """
                     MATCH (c:Chunk)
-                    WHERE c.source = 'document_ingest' OR c.doc_id IS NOT NULL
+                    WHERE c.kb_id = $kb_id
+                      AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
                     RETURN count(c) AS c
-                    """
+                    """,
+                    {"kb_id": clean_kb},
                 ).single()
                 or {}
             ).get("c")
@@ -796,24 +1029,38 @@ class DocumentGraphService:
             session.run(
                 """
                 MATCH (c:Chunk)
-                WHERE c.source = 'document_ingest' OR c.doc_id IS NOT NULL
+                WHERE c.kb_id = $kb_id
+                  AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
                 DETACH DELETE c
-                """
+                """,
+                {"kb_id": clean_kb},
             )
 
         doc_count = int(
             (
                 session.run(
-                    "MATCH (d:Document {source: 'document_ingest'}) RETURN count(d) AS c"
+                    """
+                    MATCH (d:Document)
+                    WHERE d.kb_id = $kb_id AND d.source = 'document_ingest'
+                    RETURN count(d) AS c
+                    """,
+                    {"kb_id": clean_kb},
                 ).single()
                 or {}
             ).get("c")
             or 0
         )
         if doc_count:
-            session.run("MATCH (d:Document {source: 'document_ingest'}) DETACH DELETE d")
+            session.run(
+                """
+                MATCH (d:Document)
+                WHERE d.kb_id = $kb_id AND d.source = 'document_ingest'
+                DETACH DELETE d
+                """,
+                {"kb_id": clean_kb},
+            )
 
-        orphan_entities = self._cleanup_orphan_entities(session)
+        orphan_entities = self._cleanup_orphan_entities(session, clean_kb)
         return {
             "documents": doc_count,
             "chunks": chunk_count,
@@ -821,16 +1068,19 @@ class DocumentGraphService:
             "orphan_entities": orphan_entities,
         }
 
-    def _get_graph_totals(self, session) -> Dict[str, int]:
-        relation_count = self._count_document_relations(session)
+    def _get_graph_totals(self, session, kb_id: str) -> Dict[str, int]:
+        clean_kb = self._require_kb_scope(kb_id)
+        relation_count = self._count_document_relations(session, clean_kb)
         chunk_count = int(
             (
                 session.run(
                     """
                     MATCH (c:Chunk)
-                    WHERE c.source = 'document_ingest' OR c.doc_id IS NOT NULL
+                    WHERE c.kb_id = $kb_id
+                      AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
                     RETURN count(c) AS c
-                    """
+                    """,
+                    {"kb_id": clean_kb},
                 ).single()
                 or {}
             ).get("c")
@@ -839,7 +1089,12 @@ class DocumentGraphService:
         doc_count = int(
             (
                 session.run(
-                    "MATCH (d:Document {source: 'document_ingest'}) RETURN count(d) AS c"
+                    """
+                    MATCH (d:Document)
+                    WHERE d.kb_id = $kb_id AND d.source = 'document_ingest'
+                    RETURN count(d) AS c
+                    """,
+                    {"kb_id": clean_kb},
                 ).single()
                 or {}
             ).get("c")
@@ -848,7 +1103,12 @@ class DocumentGraphService:
         entity_count = int(
             (
                 session.run(
-                    "MATCH (e:Entity {source: 'document_ingest'}) RETURN count(e) AS c"
+                    """
+                    MATCH (e:Entity)
+                    WHERE e.kb_id = $kb_id AND e.source = 'document_ingest'
+                    RETURN count(e) AS c
+                    """,
+                    {"kb_id": clean_kb},
                 ).single()
                 or {}
             ).get("c")
@@ -865,66 +1125,81 @@ class DocumentGraphService:
     def _scalar_count(session, cypher: str, parameters: Optional[Dict[str, object]] = None) -> int:
         return int(((session.run(cypher, parameters or {}).single() or {}).get("c")) or 0)
 
-    def _count_document_relations_for_doc(self, session, doc_id: str) -> int:
+    def _count_document_relations_for_doc(self, session, doc_id: str, kb_id: str) -> int:
+        clean_kb = self._require_kb_scope(kb_id)
         return (
             self._scalar_count(
                 session,
-                "MATCH (:Document {doc_id: $doc_id})-[r:HAS_CHUNK]->(:Chunk) RETURN count(r) AS c",
-                {"doc_id": doc_id},
+                "MATCH (:Document {doc_id: $doc_id, kb_id: $kb_id})-[r:HAS_CHUNK]->(:Chunk) RETURN count(r) AS c",
+                {"doc_id": doc_id, "kb_id": clean_kb},
             )
             + self._scalar_count(
                 session,
-                "MATCH (:Chunk {doc_id: $doc_id})-[r:MENTIONS]->(:Entity) RETURN count(r) AS c",
-                {"doc_id": doc_id},
+                "MATCH (:Chunk {doc_id: $doc_id, kb_id: $kb_id})-[r:MENTIONS]->(:Entity) RETURN count(r) AS c",
+                {"doc_id": doc_id, "kb_id": clean_kb},
             )
             + self._scalar_count(
                 session,
                 """
                 MATCH (:Entity)-[r]->(:Entity)
-                WHERE r.doc_id = $doc_id
+                WHERE r.doc_id = $doc_id AND r.kb_id = $kb_id
                 RETURN count(r) AS c
                 """,
-                {"doc_id": doc_id},
+                {"doc_id": doc_id, "kb_id": clean_kb},
             )
         )
 
-    def _count_document_relations(self, session) -> int:
+    def _count_document_relations(self, session, kb_id: str) -> int:
+        clean_kb = self._require_kb_scope(kb_id)
         return (
             self._scalar_count(
                 session,
                 """
-                MATCH (:Document {source: 'document_ingest'})-[r:HAS_CHUNK]->(:Chunk)
+                MATCH (:Document)-[r:HAS_CHUNK]->(:Chunk)
+                WHERE r.kb_id = $kb_id
                 RETURN count(r) AS c
                 """,
+                {"kb_id": clean_kb},
             )
             + self._scalar_count(
                 session,
                 """
                 MATCH (c:Chunk)-[r:MENTIONS]->(:Entity)
-                WHERE c.source = 'document_ingest' OR c.doc_id IS NOT NULL
+                WHERE c.kb_id = $kb_id
                 RETURN count(r) AS c
                 """,
+                {"kb_id": clean_kb},
             )
             + self._scalar_count(
                 session,
                 """
                 MATCH (:Entity)-[r]->(:Entity)
-                WHERE r.source = 'document_ingest' OR r.doc_id IS NOT NULL
+                WHERE r.kb_id = $kb_id
+                  AND (r.source = 'document_ingest' OR r.doc_id IS NOT NULL)
                 RETURN count(r) AS c
                 """,
+                {"kb_id": clean_kb},
             )
         )
 
     @staticmethod
-    def _cleanup_orphan_entities(session) -> int:
+    def _cleanup_orphan_entities(session, kb_id: str) -> int:
+        """清理指定 kb_id 内不再被任何关系引用的实体（孤儿清理按 kb 作用域执行）。"""
+        clean_kb = normalize_scope_id("kb_id", kb_id)
+        if not clean_kb:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="孤儿实体清理必须显式携带 kb_id",
+            )
         count = int(
             (
                 session.run(
                     """
-                    MATCH (e:Entity {source: 'document_ingest'})
+                    MATCH (e:Entity {kb_id: $kb_id, source: 'document_ingest'})
                     WHERE NOT (e)--()
                     RETURN count(e) AS c
-                    """
+                    """,
+                    {"kb_id": clean_kb},
                 ).single()
                 or {}
             ).get("c")
@@ -933,30 +1208,20 @@ class DocumentGraphService:
         if count:
             session.run(
                 """
-                MATCH (e:Entity {source: 'document_ingest'})
+                MATCH (e:Entity {kb_id: $kb_id, source: 'document_ingest'})
                 WHERE NOT (e)--()
                 DELETE e
-                """
+                """,
+                {"kb_id": clean_kb},
             )
         return count
-
-    def _collect_documents(self, doc_dir: Path, doc_ids: Optional[List[str]] = None) -> List[Path]:
-        allowed_ids = {str(item).strip() for item in (doc_ids or []) if str(item).strip()}
-        files: List[Path] = []
-        for path in doc_dir.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() in SUPPORTED_EXTS:
-                if allowed_ids and self._make_doc_id(path) not in allowed_ids:
-                    continue
-                files.append(path)
-        return files
 
     def _write_parsed_document_artifacts(
         self,
         *,
         doc: Path,
         doc_id: str,
+        kb_id: str,
         parsed: ParsedDocument,
         content_hash: str,
         chunks: List[Dict[str, Any]],
@@ -965,7 +1230,9 @@ class DocumentGraphService:
         extraction_schema: Optional[Dict[str, Any]] = None,
         extraction_plan: Optional[Dict[str, Any]] = None,
     ) -> Path:
-        root = Path(settings.parsed_document_storage_path).resolve()
+        """解析产物布局（手册 §9）：parsed_documents/{kb_id}/{doc_id}/。"""
+        clean_kb = self._require_kb_scope(kb_id)
+        root = (Path(settings.parsed_document_storage_path).resolve() / clean_kb).resolve()
         target_dir = root / doc_id
         tmp_dir = root / f".{doc_id}.tmp"
         root.mkdir(parents=True, exist_ok=True)
@@ -991,7 +1258,7 @@ class DocumentGraphService:
                 safe_item = {
                     key: value
                     for key, value in item.items()
-                    if key not in {"entities", "relations"}
+                    if key not in {"entities", "entity_nodes", "relations"}
                 }
                 file_obj.write(json.dumps(safe_item, ensure_ascii=False) + "\n")
 
@@ -1020,6 +1287,7 @@ class DocumentGraphService:
 
         manifest = {
             "doc_id": doc_id,
+            "kb_id": clean_kb,
             "file_name": doc.name,
             "source_file": str(doc),
             "source_ext": doc.suffix.lower(),
@@ -1072,20 +1340,35 @@ class DocumentGraphService:
         return raw_path
 
     @staticmethod
-    def _delete_parsed_document_artifacts(doc_id: str) -> None:
+    def _delete_parsed_document_artifacts(doc_id: str, kb_id: str) -> None:
         clean_doc_id = str(doc_id or "").strip()
         if not clean_doc_id:
             return
-        target_dir = Path(settings.parsed_document_storage_path).resolve() / clean_doc_id
+        clean_kb = normalize_scope_id("kb_id", kb_id)
+        if not clean_kb:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="删除解析产物必须显式携带 kb_id",
+            )
+        target_dir = (
+            Path(settings.parsed_document_storage_path).resolve() / clean_kb / clean_doc_id
+        )
         if target_dir.exists():
             shutil.rmtree(target_dir)
 
     @staticmethod
-    def _clear_parsed_document_artifacts() -> None:
-        root = Path(settings.parsed_document_storage_path).resolve()
-        if not root.exists():
+    def _clear_parsed_document_artifacts(kb_id: str) -> None:
+        """仅清理指定 kb_id 的解析产物目录；README 等根目录文件保留。"""
+        clean_kb = normalize_scope_id("kb_id", kb_id)
+        if not clean_kb:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="清理解析产物必须显式携带 kb_id",
+            )
+        kb_root = Path(settings.parsed_document_storage_path).resolve() / clean_kb
+        if not kb_root.exists():
             return
-        for path in root.iterdir():
+        for path in kb_root.iterdir():
             if path.name == "README.md":
                 continue
             if path.is_dir():
@@ -1276,6 +1559,8 @@ class DocumentGraphService:
         use_llm: bool = True,
         document_profile: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
+        from services.llm_entity_extractor import llm_entity_extractor  # 惰性导入（openai 依赖）
+
         llm_entities = (
             llm_entity_extractor.extract(
                 text,
@@ -1400,6 +1685,8 @@ class DocumentGraphService:
     ) -> List[Dict[str, object]]:
         if len(entities) < 2:
             return []
+        from services.llm_relation_extractor import llm_relation_extractor  # 惰性导入（openai 依赖）
+
         llm_relations = (
             llm_relation_extractor.extract(
                 text,
@@ -1750,10 +2037,8 @@ class DocumentGraphService:
             )
             return False
 
-    def _make_doc_id(self, path: Path) -> str:
-        return hashlib.sha1(str(path).encode("utf-8", errors="ignore")).hexdigest()[:12]
-
     def _ensure_schema(self, session) -> None:
+        """约束：Entity 唯一键从全局 name 改为 (entity_key, kb_id) 复合唯一（契约 §2.2）。"""
         try:
             session.run(
                 "CREATE CONSTRAINT document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.doc_id IS UNIQUE"
@@ -1762,10 +2047,16 @@ class DocumentGraphService:
                 "CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE"
             )
             session.run(
-                "CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE"
+                "CREATE CONSTRAINT entity_scope_key IF NOT EXISTS FOR (e:Entity) REQUIRE (e.entity_key, e.kb_id) IS UNIQUE"
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("创建约束失败", context={"error": str(exc)})
+
+        # 旧全局 name 唯一约束会阻止多 KB 同名实体共存；全新初始化下必须移除。
+        try:
+            session.run("DROP CONSTRAINT entity_name IF EXISTS")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("移除旧 entity_name 唯一约束失败", context={"error": str(exc)})
 
         try:
             session.run(
@@ -1776,8 +2067,12 @@ class DocumentGraphService:
 
         for cypher in (
             "CREATE INDEX document_source IF NOT EXISTS FOR (d:Document) ON (d.source)",
+            "CREATE INDEX document_kb_id IF NOT EXISTS FOR (d:Document) ON (d.kb_id)",
             "CREATE INDEX chunk_doc_id IF NOT EXISTS FOR (c:Chunk) ON (c.doc_id)",
+            "CREATE INDEX chunk_kb_id IF NOT EXISTS FOR (c:Chunk) ON (c.kb_id)",
+            "CREATE INDEX chunk_kb_doc IF NOT EXISTS FOR (c:Chunk) ON (c.kb_id, c.doc_id)",
             "CREATE INDEX chunk_source IF NOT EXISTS FOR (c:Chunk) ON (c.source)",
+            "CREATE INDEX entity_kb_id IF NOT EXISTS FOR (e:Entity) ON (e.kb_id)",
             "CREATE INDEX entity_source IF NOT EXISTS FOR (e:Entity) ON (e.source)",
         ):
             try:

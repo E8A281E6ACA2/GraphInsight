@@ -184,6 +184,7 @@ def _check_parsed_document_artifacts() -> None:
         artifact_dir = service._write_parsed_document_artifacts(
             doc=source,
             doc_id="doc-1",
+            kb_id="kb-1",
             parsed=parsed,
             content_hash="hash-1",
             chunks=[
@@ -219,18 +220,19 @@ def _check_parsed_document_artifacts() -> None:
         _assert("entities" not in chunk_line, chunk_line)
         _assert("relations" not in chunk_line, chunk_line)
 
-        service._delete_parsed_document_artifacts("doc-1")
+        service._delete_parsed_document_artifacts("doc-1", "kb-1")
         _assert(not artifact_dir.exists(), "delete should remove parsed artifact directory")
 
         another_dir = service._write_parsed_document_artifacts(
             doc=source,
             doc_id="doc-2",
+            kb_id="kb-1",
             parsed=parsed,
             content_hash="hash-2",
             chunks=[],
         )
         _assert(another_dir.exists(), "second artifact directory should exist")
-        service._clear_parsed_document_artifacts()
+        service._clear_parsed_document_artifacts("kb-1")
         _assert(not another_dir.exists(), "clear should remove parsed artifact directories")
 
 
@@ -465,7 +467,7 @@ def _check_schema_aware_relations_and_evidence_validation() -> None:
 
     service = DocumentGraphService()
     with patch(
-        "services.document_graph_service.llm_relation_extractor.extract",
+        "services.llm_relation_extractor.llm_relation_extractor.extract",
         return_value=[
             {
                 "source": "125g/L氟环唑SC",

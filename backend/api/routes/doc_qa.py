@@ -12,10 +12,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from core import error_response, get_logger, success_response
+from core.exceptions import KnowledgeScopeError
 from core.observability import get_qa_observability
 from services.doc_qa_service import doc_qa_service
 from services.model_runtime_policy import normalize_reasoning_profile
 from services.qa_trace_runtime import record_qa_trace
+from services.scope_contract import SearchTarget
 
 logger = get_logger()
 qa_metrics = get_qa_observability()
@@ -39,6 +41,11 @@ class CitationItem(BaseModel):
     retrieval_score: Optional[float] = None
     confidence: Optional[float] = None
     confidence_level: Optional[str] = None
+    # M4：citation 携带作用域与证据定位（契约 §12.1/§16 M4）
+    kb_id: Optional[str] = None
+    doc_id: Optional[str] = None
+    chunk_id: Optional[str] = None
+    content_revision: Optional[int] = None
 
 
 class ConversationTurn(BaseModel):
@@ -52,6 +59,10 @@ class DocQARequest(BaseModel):
     require_citation: bool = Field(True)
     reasoning_profile: str | None = Field(default=None, pattern="^(fast|balanced|deep)$")
     conversation_history: List[ConversationTurn] = Field(default_factory=list, max_length=8)
+    # M4：显式作用域；internal 入口还会与 header/query 联合校验（契约 §3.2）
+    kb_id: str | None = None
+    kb_ids: List[str] | None = None
+    document_ids: List[str] | None = None
 
 
 class DocQAResponse(BaseModel):
@@ -64,6 +75,9 @@ class DeepResearchRequest(BaseModel):
     top_k: int = Field(8, ge=3, le=20, description="每个子问题的检索片段上限")
     max_sub_questions: int = Field(4, ge=2, le=8, description="子问题拆解上限")
     reasoning_profile: str | None = Field(default=None, pattern="^(fast|balanced|deep)$")
+    # M4：显式作用域
+    kb_id: str | None = None
+    kb_ids: List[str] | None = None
 
 
 class DeepResearchResponse(BaseModel):
@@ -94,6 +108,8 @@ def _build_citations(result: Dict[str, Any]) -> List[CitationItem]:
     citations = []
     for item in result.get("citations", []):
         try:
+            chunk_id = str(item.get("chunk_id") or item.get("id") or "")
+            content_revision = item.get("content_revision")
             citations.append(
                 CitationItem(
                     id=str(item.get("id") or ""),
@@ -104,6 +120,10 @@ def _build_citations(result: Dict[str, Any]) -> List[CitationItem]:
                     retrieval_score=item.get("retrieval_score"),
                     confidence=item.get("confidence"),
                     confidence_level=item.get("confidence_level"),
+                    kb_id=item.get("kb_id"),
+                    doc_id=item.get("doc_id"),
+                    chunk_id=chunk_id or None,
+                    content_revision=int(content_revision) if content_revision is not None else None,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -117,6 +137,7 @@ def handle_doc_qa(
     request: Request,
     db: Session,
     operator_id: Optional[int],
+    scope: SearchTarget,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     try:
@@ -125,13 +146,18 @@ def handle_doc_qa(
             payload.top_k,
             reasoning_profile=payload.reasoning_profile,
             conversation_history=[item.model_dump() for item in payload.conversation_history],
+            kb_ids=scope.kb_ids,
+            document_ids=scope.document_ids,
         )
         if isinstance(result.get("trace"), dict):
             generation = result["trace"].setdefault("generation", {})
             generation["reasoning_profile"] = _resolve_reasoning_profile(payload.reasoning_profile, "docqa")
         citations = _build_citations(result)
         response = DocQAResponse(answer=result.get("answer", ""), citations=citations)
-        logger.info("文档问答请求", context={"question": payload.question, "citations": len(citations)})
+        logger.info(
+            "文档问答请求",
+            context={"question": payload.question, "citations": len(citations), "kb_ids": scope.kb_ids},
+        )
         qa_metrics.record_qa(
             qa_type="docqa",
             success=True,
@@ -147,8 +173,39 @@ def handle_doc_qa(
             top_k=payload.top_k,
             started_at=started_at,
             result=result,
+            scope=scope,
         )
         return success_response(data=response.model_dump(), message="ok")
+    except KnowledgeScopeError as exc:
+        logger.warning(
+            "文档问答作用域被拒绝",
+            context={"error_code": exc.error_code, "kb_ids": scope.kb_ids},
+        )
+        qa_metrics.record_qa(
+            qa_type="docqa",
+            success=False,
+            citation_count=0,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            error=exc.error_code,
+        )
+        record_qa_trace(
+            db,
+            request=request,
+            operator_id=operator_id,
+            qa_type="docqa",
+            question=payload.question,
+            top_k=payload.top_k,
+            started_at=started_at,
+            status="failed",
+            error=exc.message,
+            scope=scope,
+        )
+        return error_response(
+            message=exc.message,
+            code=exc.status_code,
+            error_code=exc.error_code,
+            details=exc.details,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("文档问答失败", context={"error": str(exc)})
         qa_metrics.record_qa(
@@ -168,6 +225,7 @@ def handle_doc_qa(
             started_at=started_at,
             status="failed",
             error=str(exc),
+            scope=scope,
         )
         return error_response(message="问答失败", code=500)
 
@@ -178,6 +236,7 @@ def handle_deep_research(
     request: Request,
     db: Session,
     operator_id: Optional[int],
+    scope: SearchTarget,
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     try:
@@ -186,6 +245,8 @@ def handle_deep_research(
             top_k=payload.top_k,
             max_sub_questions=payload.max_sub_questions,
             reasoning_profile=payload.reasoning_profile,
+            kb_ids=scope.kb_ids,
+            document_ids=scope.document_ids,
         )
         if isinstance(result.get("trace"), dict):
             generation = result["trace"].setdefault("generation", {})
@@ -207,6 +268,7 @@ def handle_deep_research(
                 "question": payload.question,
                 "sub_questions": len(response.sub_questions),
                 "citations": len(citations),
+                "kb_ids": scope.kb_ids,
             },
         )
         qa_metrics.record_qa(
@@ -224,8 +286,39 @@ def handle_deep_research(
             top_k=payload.top_k,
             started_at=started_at,
             result=result,
+            scope=scope,
         )
         return success_response(data=response.model_dump(), message="ok")
+    except KnowledgeScopeError as exc:
+        logger.warning(
+            "深度调研作用域被拒绝",
+            context={"error_code": exc.error_code, "kb_ids": scope.kb_ids},
+        )
+        qa_metrics.record_qa(
+            qa_type="deep_research",
+            success=False,
+            citation_count=0,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            error=exc.error_code,
+        )
+        record_qa_trace(
+            db,
+            request=request,
+            operator_id=operator_id,
+            qa_type="deep_research",
+            question=payload.question,
+            top_k=payload.top_k,
+            started_at=started_at,
+            status="failed",
+            error=exc.message,
+            scope=scope,
+        )
+        return error_response(
+            message=exc.message,
+            code=exc.status_code,
+            error_code=exc.error_code,
+            details=exc.details,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.error("文档深度调研失败", context={"error": str(exc)})
         qa_metrics.record_qa(
@@ -245,6 +338,7 @@ def handle_deep_research(
             started_at=started_at,
             status="failed",
             error=str(exc),
+            scope=scope,
         )
         return error_response(message="深度调研失败", code=500)
 

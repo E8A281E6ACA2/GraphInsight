@@ -5,22 +5,31 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-from neo4j import Query
-
 from config import get_settings
 from core import get_logger
 from services.document_graph_service import DocumentGraphService
 from services.model_runtime_policy import apply_reasoning_profile, normalize_reasoning_profile
 from services.openai_client_factory import build_openai_client
-from services.neo4j_service import get_neo4j_service
 from services.retrieval_orchestrator import retrieval_orchestrator
 from services.runtime_config import get_ai_runtime_config
 
 logger = get_logger()
 settings = get_settings()
 
+try:  # neo4j 驱动缺失时（单元测试环境）仍可加载本模块；调用诊断方法时才需要真实驱动
+    from neo4j import Query
+except Exception:  # pragma: no cover - 环境相关
+    Query = None  # type: ignore[assignment]
+
 DOCQA_DIAG_CONNECT_TIMEOUT_SECONDS = 3.0
 DOCQA_DIAG_QUERY_TIMEOUT_SECONDS = 4.0
+
+
+def _neo4j_service():
+    """懒加载 Neo4j 服务，避免模块加载即导入 neo4j 驱动。"""
+    from services.neo4j_service import get_neo4j_service
+
+    return get_neo4j_service()
 
 
 class DocQAService:
@@ -73,11 +82,20 @@ class DocQAService:
         top_k: int,
         reasoning_profile: Optional[str] = None,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
+        *,
+        kb_ids: List[str],
+        document_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        """文档问答（M4）：kb_ids 必填，检索只使用作用域内的证据。"""
         self._refresh_runtime_config()
         history = self._normalize_conversation_history(conversation_history)
         retrieval_query = self._contextual_retrieval_query(question, history)
-        retrieval_result = retrieval_orchestrator.retrieve(retrieval_query, top_k)
+        retrieval_result = retrieval_orchestrator.retrieve(
+            retrieval_query,
+            top_k,
+            kb_ids=kb_ids,
+            document_ids=document_ids,
+        )
         citations = retrieval_result["items"]
         active_profile = normalize_reasoning_profile(reasoning_profile, "balanced")
         trace = {
@@ -85,6 +103,7 @@ class DocQAService:
                 "query": question,
                 "contextual_query": retrieval_query,
                 "top_k": top_k,
+                "scope": {"kb_ids": list(kb_ids), "document_ids": list(document_ids or [])},
                 "count": len(citations),
                 "conversation_turns": len(history),
                 "chunks": self._snapshot_citations(citations),
@@ -195,8 +214,11 @@ class DocQAService:
         top_k: int = 8,
         max_sub_questions: int = 4,
         reasoning_profile: Optional[str] = None,
+        *,
+        kb_ids: List[str],
+        document_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """深度调研：问题拆解 + 多轮检索 + 结构化报告。"""
+        """深度调研：问题拆解 + 多轮检索 + 结构化报告（M4：检索按 kb_ids 过滤）。"""
         self._refresh_runtime_config()
         normalized_question = (question or "").strip()
         if not normalized_question:
@@ -231,7 +253,12 @@ class DocQAService:
         total_retrieved = 0
 
         for sub_q in sub_questions:
-            retrieval_result = retrieval_orchestrator.retrieve(sub_q, top_k)
+            retrieval_result = retrieval_orchestrator.retrieve(
+                sub_q,
+                top_k,
+                kb_ids=kb_ids,
+                document_ids=document_ids,
+            )
             hits = retrieval_result["items"]
             total_retrieved += len(hits)
             used_ids: List[str] = []
@@ -281,6 +308,7 @@ class DocQAService:
                 "retrieval": {
                     "query": normalized_question,
                     "top_k": top_k,
+                    "scope": {"kb_ids": list(kb_ids), "document_ids": list(document_ids or [])},
                     "sub_questions": sub_questions,
                     "coverage": per_question_hits,
                     "count": 0,
@@ -336,6 +364,7 @@ class DocQAService:
             "retrieval": {
                 "query": normalized_question,
                 "top_k": top_k,
+                "scope": {"kb_ids": list(kb_ids), "document_ids": list(document_ids or [])},
                 "sub_questions": sub_questions,
                 "coverage": per_question_hits,
                 "count": len(citations),
@@ -501,7 +530,7 @@ class DocQAService:
 
     def diagnose(self, probe_llm: bool = False) -> Dict[str, Any]:
         self._refresh_runtime_config()
-        service = get_neo4j_service()
+        service = _neo4j_service()
         result: Dict[str, Any] = {
             "llm_enabled": self.enabled,
             "llm_model": self.model,
@@ -1005,9 +1034,11 @@ class DocQAService:
             snapshot.append(
                 {
                     "id": str(item.get("id") or ""),
+                    "kb_id": item.get("kb_id"),
+                    "doc_id": item.get("doc_id"),
+                    "content_revision": item.get("content_revision"),
                     "title": str(item.get("title") or ""),
                     "location": item.get("location"),
-                    "doc_id": item.get("doc_id"),
                     "entity_names": item.get("entity_names") or [],
                     "retrieval_score": item.get("retrieval_score"),
                     "retrieval_sources": item.get("retrieval_sources") or [],
@@ -1035,7 +1066,7 @@ class DocQAService:
             )
 
     def _retrieve_chunks(self, question: str, top_k: int) -> List[Dict[str, Any]]:
-        service = get_neo4j_service()
+        service = _neo4j_service()
         query = question.strip()
         if not query:
             return []

@@ -57,13 +57,22 @@ def main() -> int:
     )
     _assert(diag_denied.status_code == 403, f"expected 403 for orchestrator-only diagnostics, got {diag_denied.status_code}")
 
+    # 缺少 kb 作用域 -> KB_SCOPE_REQUIRED(400)：契约 §2.4 作用域强制点，
+    # 即使带合法控制面头，Python 数据面也要求显式 kb 作用域。
+    diag_missing_scope = client.post(
+        "/api/internal/docqa/retrieval-diagnostics",
+        json={"question": "hybrid search", "top_k": 3, "modes": ["keyword"]},
+        headers={"X-Go-Proxy": "graphinsight-go"},
+    )
+    _assert(diag_missing_scope.status_code == 400, f"expected 400 for scopeless diagnostics, got {diag_missing_scope.status_code}")
+
     with patch(
         "api.routes.doc_qa_internal.retrieval_orchestrator.diagnose",
         return_value={"query": "hybrid search", "runs": {"keyword": {"items": []}}},
     ) as diagnose:
         diag_allowed = client.post(
             "/api/internal/docqa/retrieval-diagnostics",
-            json={"question": "hybrid search", "top_k": 3, "modes": ["keyword"]},
+            json={"question": "hybrid search", "top_k": 3, "modes": ["keyword"], "kb_id": "kb-1"},
             headers={"X-Go-Proxy": "graphinsight-go"},
         )
     _assert(diag_allowed.status_code == 200, f"expected 200 for control-plane diagnostics, got {diag_allowed.status_code}")

@@ -242,6 +242,9 @@ def _check_build_graph_job_passes_reasoning_profile() -> None:
             payload={
                 "source": "documents",
                 "force": False,
+                "kb_id": "kb-1",
+                "tenant_id": "tenant-1",
+                "project_id": "project-1",
                 "doc_ids": ["doc-1"],
                 "reasoning_profile": "balanced",
                 "complex_extraction": True,

@@ -11,6 +11,7 @@ from api.internal_access import (
     is_go_control_plane_request,
     operator_id_from_headers,
     require_go_capability_request,
+    resolve_request_scope,
 )
 from api.routes.doc_qa import (
     DeepResearchRequest,
@@ -34,6 +35,9 @@ class RetrievalDiagnosticsRequest(BaseModel):
         min_length=1,
         max_length=4,
     )
+    # M4：诊断同样只允许在显式作用域内执行
+    kb_id: str | None = None
+    kb_ids: List[str] | None = None
 
 
 @internal_router.post("/internal/docqa", summary="内部文档问答能力入口")
@@ -45,11 +49,14 @@ async def internal_doc_qa(
     denied = require_go_capability_request(request)
     if denied is not None:
         return denied
+    # 作用域强制点（契约 §2.4）：header/query/body 联合解析，缺失即 KB_SCOPE_REQUIRED
+    scope = resolve_request_scope(request, payload)
     return handle_doc_qa(
         payload=payload,
         request=request,
         db=db,
         operator_id=operator_id_from_headers(request),
+        scope=scope,
     )
 
 
@@ -62,11 +69,13 @@ async def internal_doc_qa_deep_research(
     denied = require_go_capability_request(request)
     if denied is not None:
         return denied
+    scope = resolve_request_scope(request, payload)
     return handle_deep_research(
         payload=payload,
         request=request,
         db=db,
         operator_id=operator_id_from_headers(request),
+        scope=scope,
     )
 
 
@@ -92,9 +101,12 @@ async def internal_doc_qa_retrieval_diagnostics(
             code=status.HTTP_403_FORBIDDEN,
             error_code="FORBIDDEN",
         )
+    scope = resolve_request_scope(request, payload)
     data = retrieval_orchestrator.diagnose(
         question=payload.question,
         top_k=payload.top_k,
         modes=payload.modes,
+        kb_ids=scope.kb_ids,
+        document_ids=scope.document_ids,
     )
     return success_response(data=data, message="ok")

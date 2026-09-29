@@ -19,6 +19,7 @@ def _assert(condition: bool, message: str) -> None:
 def _fake_item(chunk_id: str, score: float, text: str | None = None) -> dict:
     return {
         "id": chunk_id,
+        "kb_id": "kb-1",
         "title": "Doc",
         "location": "Chunk 0",
         "text": text or f"text {chunk_id}",
@@ -43,7 +44,7 @@ def _check_keyword_mode() -> None:
             "rerank_enabled": False,
         },
     ), patch.object(service, "_keyword_search", return_value=[_fake_item("c1", 0.8)]) as keyword_search:
-        result = service.retrieve("hello", 2)
+        result = service.retrieve("hello", 2, kb_ids=["kb-1"])
 
     _assert(keyword_search.called, "keyword search should be called")
     _assert(result["items"][0]["id"] == "c1", f"unexpected retrieval result: {result}")
@@ -72,7 +73,7 @@ def _check_hybrid_fusion_prefers_multi_source_hit() -> None:
         "_vector_search",
         return_value={"items": [_fake_item("vector-only", 0.9), _fake_item("shared", 0.6)], "trace": {"raw_count": 2}},
     ):
-        result = service.retrieve("hello", 3)
+        result = service.retrieve("hello", 3, kb_ids=["kb-1"])
 
     ids = [item["id"] for item in result["items"]]
     _assert(ids[0] == "shared", f"shared hit should win fusion, got {ids}")
@@ -111,7 +112,7 @@ def _check_reranker_applies_after_fusion() -> None:
             "trace": {"enabled": True, "applied": True, "reranked_count": 2},
         },
     ) as rerank:
-        result = service.retrieve("hello", 2)
+        result = service.retrieve("hello", 2, kb_ids=["kb-1"])
 
     _assert(rerank.called, "reranker should run when rerank_enabled=true")
     _assert([item["id"] for item in result["items"]] == ["vector-hit", "keyword-hit"], result)
@@ -140,7 +141,7 @@ def _check_vector_disabled_fallback() -> None:
         "_keyword_search",
         return_value=[_fake_item("fallback", 0.5)],
     ) as keyword_search:
-        result = service.retrieve("hello", 2)
+        result = service.retrieve("hello", 2, kb_ids=["kb-1"])
 
     _assert(keyword_search.called, "keyword fallback should run when vector has no hits")
     _assert(result["items"][0]["id"] == "fallback", result)
@@ -169,7 +170,7 @@ def _check_hybrid_skips_duplicate_keyword_fallback() -> None:
         "_vector_search",
         return_value={"items": [], "trace": {"skip_reason": "vector_store_disabled"}},
     ):
-        result = service.retrieve("hello", 2)
+        result = service.retrieve("hello", 2, kb_ids=["kb-1"])
 
     _assert(keyword_search.call_count == 1, f"hybrid should not repeat keyword fallback, got {keyword_search.call_count}")
     fallback_trace = result["trace"]["sources"]["keyword_fallback"]
@@ -181,7 +182,7 @@ def _check_index_chunks_skips_when_disabled() -> None:
 
     service = RetrievalOrchestrator()
     with patch("services.retrieval_orchestrator.vector_store.is_enabled", return_value=False):
-        result = service.index_chunks([{"chunk_id": "c1", "text": "hello"}])
+        result = service.index_chunks([{"chunk_id": "c1", "text": "hello"}], kb_id="kb-1")
 
     _assert(result["indexed"] == 0, result)
     _assert(result["reason"] == "vector_store_disabled", result)
@@ -228,7 +229,8 @@ def _check_index_chunks_carries_parser_metadata() -> None:
                     "document_type": "academic_paper",
                     "domain": "agricultural_plant_protection",
                 }
-            ]
+            ],
+            kb_id="kb-1",
         )
 
     _assert(result["indexed"] == 1, result)
@@ -263,7 +265,7 @@ def _check_diagnostics_runs_requested_modes() -> None:
         "health",
         return_value={"retrieval": {"mode": "keyword"}},
     ):
-        result = service.diagnose("hello", 2, modes=["keyword", "vector", "bad", "vector"])
+        result = service.diagnose("hello", 2, modes=["keyword", "vector", "bad", "vector"], kb_ids=["kb-1"])
 
     _assert(result["modes"] == ["keyword", "vector"], result)
     _assert(set(result["runs"].keys()) == {"keyword", "vector"}, result)
@@ -303,7 +305,7 @@ def _check_diagnostics_summary_recommends_vector_setup() -> None:
         "health",
         return_value={"retrieval": {"mode": "keyword"}},
     ):
-        result = service.diagnose("hello", 2, modes=["vector", "hybrid", "graph_hybrid"])
+        result = service.diagnose("hello", 2, modes=["vector", "hybrid", "graph_hybrid"], kb_ids=["kb-1"])
 
     recommendations = result["summary"]["recommendations"]
     _assert("enable_vector_store" in recommendations, result)
@@ -357,8 +359,8 @@ def _check_keyword_search_handles_lucene_special_chars() -> None:
 
     fake_session = FakeSession()
     service = RetrievalOrchestrator()
-    with patch("services.retrieval_orchestrator.get_neo4j_service", return_value=FakeService(fake_session)):
-        items = service._keyword_search("125 g/L 氟环唑 SC 防效最高 /", 2)
+    with patch("services.retrieval_orchestrator._neo4j_service", return_value=FakeService(fake_session)):
+        items = service._keyword_search("125 g/L 氟环唑 SC 防效最高 /", 2, ["kb-1"])
 
     _assert(items and items[0]["id"] == "fallback", items)
     _assert("/" not in fake_session.queries[0]["q"], fake_session.queries)

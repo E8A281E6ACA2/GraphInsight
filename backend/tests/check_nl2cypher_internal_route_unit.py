@@ -34,14 +34,34 @@ def main() -> int:
 
     blank = client.post(
         "/api/internal/nl2cypher",
-        headers={"X-Go-Orchestrator": "graphinsight-go", "X-Trace-Id": "trace-internal-nl2cypher-blank"},
+        headers={
+            "X-Go-Orchestrator": "graphinsight-go",
+            "X-Trace-Id": "trace-internal-nl2cypher-blank",
+            "X-KB-Id": "kb-1",
+        },
         json={"natural_language": "   "},
     )
     _assert(blank.status_code == 400, f"expected 400 for blank natural language, got {blank.status_code}")
 
+    # 缺少 kb 作用域 -> KB_SCOPE_REQUIRED(400)：契约 §2.4 作用域强制点，
+    # Go 已授权但 Python 数据面不把"来自 Go"当作授权证明。
+    missing_scope = client.post(
+        "/api/internal/nl2cypher",
+        headers={
+            "X-Go-Orchestrator": "graphinsight-go",
+            "X-Trace-Id": "trace-internal-nl2cypher-no-scope",
+        },
+        json={"natural_language": "查找所有文档"},
+    )
+    _assert(missing_scope.status_code == 400, f"expected 400 without kb scope, got {missing_scope.status_code}")
+
     allowed = client.post(
         "/api/internal/nl2cypher",
-        headers={"X-Go-Orchestrator": "graphinsight-go", "X-Trace-Id": "trace-internal-nl2cypher"},
+        headers={
+            "X-Go-Orchestrator": "graphinsight-go",
+            "X-Trace-Id": "trace-internal-nl2cypher",
+            "X-KB-Id": "kb-1",
+        },
         json={"natural_language": "查找所有文档"},
     )
     _assert(allowed.status_code in {200, 500, 503}, f"unexpected status with Go orchestrator header: {allowed.status_code}")

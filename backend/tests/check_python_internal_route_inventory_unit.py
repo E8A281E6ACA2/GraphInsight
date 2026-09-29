@@ -32,6 +32,7 @@ EXPECTED_INTERNAL_PATHS = {
     "/api/internal/docqa/health",
     "/api/internal/docqa/retrieval-diagnostics",
     "/api/internal/nl2cypher",
+    "/api/internal/vector/delete-doc",
     "/api/internal/jobs/wake",
 }
 

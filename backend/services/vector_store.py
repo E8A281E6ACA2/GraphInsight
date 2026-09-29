@@ -1,14 +1,27 @@
-"""Milvus vector store adapter for document chunks."""
+"""Milvus vector store adapter for document chunks (M3: kb-scoped)."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from core import get_logger
+from core.exceptions import ErrorCode, KnowledgeScopeError
 from services.runtime_config import get_embedding_runtime_config, get_vector_store_runtime_config
+from services.scope_contract import milvus_kb_filter, normalize_scope_id
 
 
 logger = get_logger()
+
+
+def require_scope_filter(filter_expr: Optional[str]) -> str:
+    """空 filter 一律拒绝（契约 §3.4/§11.2：不允许无作用域的向量检索）。"""
+    cleaned = str(filter_expr or "").strip()
+    if not cleaned:
+        raise KnowledgeScopeError(
+            ErrorCode.KB_SCOPE_REQUIRED,
+            message="Milvus 检索必须携带非空作用域过滤表达式",
+        )
+    return cleaned
 
 
 @dataclass
@@ -21,6 +34,9 @@ class VectorChunk:
     entities: List[str] = field(default_factory=list)
     content_hash: str = ""
     embedding_model: str = ""
+    kb_id: str = ""
+    tenant_id: str = ""
+    project_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -40,7 +56,17 @@ class MilvusVectorStore:
     def config(self) -> Dict[str, Any]:
         cfg = get_vector_store_runtime_config()
         cfg["provider"] = str(cfg.get("provider") or "milvus").strip().lower()
-        cfg["collection"] = str(cfg.get("collection") or "graphinsight_chunks").strip()
+        # 契约 §11.1 / 决策 D3：旧全局单库 collection（无 kb_id schema）不再复用，
+        # 默认切换到带 kb_id/tenant_id/project_id 的新 collection。
+        collection = str(cfg.get("collection") or "").strip()
+        if not collection or collection == "graphinsight_chunks":
+            if collection:
+                logger.warning(
+                    "检测到旧版全局 Milvus collection，已切换为 kb 隔离的新 collection",
+                    context={"legacy": collection, "collection": "graphinsight_chunks_v2"},
+                )
+            collection = "graphinsight_chunks_v2"
+        cfg["collection"] = collection
         cfg["metric_type"] = str(cfg.get("metric_type") or "COSINE").strip().upper()
         cfg["index_type"] = str(cfg.get("index_type") or "IVF_FLAT").strip().upper()
         cfg["search_nprobe"] = max(1, int(cfg.get("search_nprobe") or 16))
@@ -79,16 +105,22 @@ class MilvusVectorStore:
         if client.has_collection(collection):
             existing_dimension = self._collection_vector_dimension(client, collection)
             if existing_dimension and existing_dimension != vector_dimension:
-                logger.warning(
-                    "Milvus collection 维度与当前 embedding 不一致，已重建",
-                    context={
-                        "collection": collection,
-                        "existing_dimension": existing_dimension,
-                        "current_dimension": vector_dimension,
-                    },
+                # 阻断修复（契约 §11.4）：向量是 projection，但 collection 里可能仍有唯一可用
+                # 索引；维度/Schema 冲突绝不允许静默 drop 重建，必须人工迁移。
+                raise RuntimeError(
+                    f"Milvus collection {collection} 的向量维度 ({existing_dimension}) "
+                    f"与当前 embedding 维度 ({vector_dimension}) 不一致。"
+                    "为避免静默销毁已有向量数据，系统不会自动 drop/重建 collection。"
+                    "请执行人工迁移：新建带正确维度的 collection（按 embedding generation 区分，"
+                    "如 graphinsight_chunks_v2_<dim>），将 vector_store.collection 配置切换过去，"
+                    "再按 kb 重建向量（reindex），确认计数后停用旧 collection。"
                 )
-                client.drop_collection(collection)
-                self._collection_ready = False
+            if not self._collection_has_kb_fields(client, collection):
+                # 旧 schema 没有 kb_id 字段，无法做 KB 隔离：拒绝写入，要求换新 collection。
+                raise RuntimeError(
+                    f"Milvus collection {collection} 缺少 kb_id/tenant_id/project_id 字段，"
+                    "无法执行知识库作用域隔离；请配置新的 collection（如 graphinsight_chunks_v2）"
+                )
 
         if not client.has_collection(collection):
             try:
@@ -99,6 +131,9 @@ class MilvusVectorStore:
             schema = client.create_schema(auto_id=False, enable_dynamic_field=True)
             schema.add_field(field_name="chunk_id", datatype=DataType.VARCHAR, is_primary=True, max_length=128)
             schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=128)
+            schema.add_field(field_name="kb_id", datatype=DataType.VARCHAR, max_length=100)
+            schema.add_field(field_name="tenant_id", datatype=DataType.VARCHAR, max_length=100)
+            schema.add_field(field_name="project_id", datatype=DataType.VARCHAR, max_length=100)
             schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=4096)
             schema.add_field(field_name="title", datatype=DataType.VARCHAR, max_length=512)
             schema.add_field(field_name="location", datatype=DataType.VARCHAR, max_length=128)
@@ -152,46 +187,68 @@ class MilvusVectorStore:
                     "entities_json": json.dumps(chunk.entities or [], ensure_ascii=False)[:2048],
                     "vector": vector,
                     **(chunk.metadata or {}),
+                    # 作用域以 VectorChunk 显式字段为准，元数据不能覆盖
+                    "kb_id": chunk.kb_id,
+                    "tenant_id": chunk.tenant_id,
+                    "project_id": chunk.project_id,
                 }
             )
         client.upsert(collection_name=collection, data=rows)
         return len(rows)
 
-    def delete_doc(self, doc_id: str) -> None:
+    def delete_doc(self, doc_id: str, kb_id: str) -> None:
+        clean_kb = normalize_scope_id("kb_id", kb_id)
+        if not clean_kb:
+            raise KnowledgeScopeError(
+                ErrorCode.KB_SCOPE_REQUIRED,
+                message="删除文档向量必须显式携带 kb_id",
+            )
         if not self.is_enabled() or not doc_id:
             return
         client = self._get_client()
         collection = self.config()["collection"]
         if not client.has_collection(collection):
             return
+        filter_expr = (
+            f'{milvus_kb_filter([clean_kb])} '
+            f'and doc_id == "{self._escape_filter_value(str(doc_id))}"'
+        )
         client.delete(
             collection_name=collection,
-            filter=f'doc_id == "{self._escape_filter_value(doc_id)}"',
+            filter=filter_expr,
         )
 
-    def clear(self) -> None:
+    def clear(self, kb_ids: List[str]) -> None:
+        """按 kb 作用域删除向量；禁止 drop collection / 全库清空（手册 §11.4）。"""
+        filter_expr = milvus_kb_filter(kb_ids)
         if not self.is_enabled():
             return
         client = self._get_client()
         collection = self.config()["collection"]
         if client.has_collection(collection):
-            client.drop_collection(collection)
-            self._collection_ready = False
+            client.delete(
+                collection_name=collection,
+                filter=filter_expr,
+            )
 
     def search(self, vector: List[float], limit: int, filter_expr: str = "") -> List[VectorSearchHit]:
         if not self.is_enabled() or not vector:
             return []
-        self.ensure_collection()
+        require_scope_filter(filter_expr)
+        # 用本次查询向量的实际维度做一致性校验：配置维度可能滞后于 embedding
+        # 生成切换（M4-R1），以真实请求维度为准，避免误报也避免漏报。
+        self.ensure_collection(dimension=len(vector) or None)
         cfg = self.config()
         result = self._get_client().search(
             collection_name=cfg["collection"],
             data=[vector],
             anns_field="vector",
             limit=max(1, int(limit or 10)),
-            filter=filter_expr or "",
+            filter=require_scope_filter(filter_expr),
             output_fields=[
                 "chunk_id",
                 "doc_id",
+                "kb_id",
                 "text",
                 "title",
                 "location",
@@ -267,6 +324,22 @@ class MilvusVectorStore:
             except Exception:
                 return None
         return None
+
+    @staticmethod
+    def _collection_has_kb_fields(client, collection: str) -> bool:
+        try:
+            description = client.describe_collection(collection)
+        except Exception:
+            return False
+        fields = description.get("fields") if isinstance(description, dict) else None
+        if not isinstance(fields, list):
+            return False
+        names = {
+            field.get("name")
+            for field in fields
+            if isinstance(field, dict)
+        }
+        return "kb_id" in names
 
     @staticmethod
     def _escape_filter_value(value: str) -> str:
