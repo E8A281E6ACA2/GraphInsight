@@ -104,3 +104,6 @@ docs/study/
 .claude/
 .codex/
 study/
+
+# Go cross-compiled runtime binaries (rebuilt via scripts)
+go-backend/bin/
