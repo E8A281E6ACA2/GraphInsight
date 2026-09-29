@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"graphinsight/go-backend/internal/authz"
 	"graphinsight/go-backend/internal/config"
+	"graphinsight/go-backend/internal/scope"
 )
 
 type Client struct {
@@ -771,4 +773,221 @@ func normalizeScope(scope map[string]string) map[string]string {
 		"project_id": scopeValue(scope, "project_id", "x-project-id"),
 		"kb_id":      scopeValue(scope, "kb_id", "x-kb-id"),
 	}
+}
+
+// kbParentScope 是 tenant/project 作用域绑定解析出的父作用域（M4-R1 FIX #1）。
+type kbParentScope struct {
+	TenantID  string
+	ProjectID string
+}
+
+// AuthorizedKBIDs 解析 subject（username/email）在 admin_user_role_bindings 中的
+// 授权 KB 集合（契约 §2.4 user_authorized_kb_ids 的服务端解析，M4 问答/检索隔离使用）。
+//
+// 语义：
+//   - kb 作用域绑定（scope_type='kb'）→ 显式 kb_ids（格式非法的绑定按拒绝处理，跳过）；
+//   - 持有授予 permissions 中任一权限码的 GLOBAL 作用域绑定 → allKBs=true（全量哨兵）；
+//   - tenant/project 作用域绑定 → 通过 knowledge_bases 目录表反查该父作用域下的真实
+//     KB 集合（M4-R1 FIX #1：禁止把 tenant/project 绑定放大为全部 KB；目录中不存在
+//     的 KB 不进入授权集合，交集为空由调用方按 KB_ACCESS_DENIED 处理）；
+//   - 用户无任何绑定：failOpenWhenUnbound 开启时放行为 allKBs（与 CheckPermission 的
+//     legacy_allow_no_binding 语义一致），否则返回空集合（交集为空 → 拒绝）。
+//   - RBAC 未启用 → allKBs=true（与 CheckPermission 的 rbac_disabled 放行语义一致）。
+//
+// 返回的 kbIDs 已按 scope 契约归一化（trim + 小写）。
+func (c *Client) AuthorizedKBIDs(ctx context.Context, subject string, permissions ...string) ([]string, bool, error) {
+	if c == nil || c.db == nil {
+		return nil, false, errors.New("admin store is not initialized")
+	}
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return nil, false, authz.ErrUnauthorized
+	}
+	user, err := c.findActiveUser(ctx, subject)
+	if err != nil {
+		return nil, false, err
+	}
+	if !c.rbacEnabled {
+		return nil, true, nil
+	}
+	bindings, err := c.userPermissionBindings(ctx, user.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	kbIDs, allKBs, parentScopes := authorizedKBsFromBindings(bindings, permissionCodeSet(permissions), c.failOpenWhenUnbound)
+	if allKBs || len(parentScopes) == 0 {
+		return kbIDs, allKBs, nil
+	}
+	resolved, err := c.knowledgeBaseIDsForParentScopes(ctx, parentScopes)
+	if err != nil {
+		return nil, false, err
+	}
+	merged := append(kbIDs, resolved...)
+	return normalizedKBIDSet(merged), false, nil
+}
+
+// authorizedKBsFromBindings 是 AuthorizedKBIDs 的纯函数内核（可单测）：
+// 按作用域类型归并绑定，返回 (显式 kb ids, allKBs 哨兵, tenant/project 父作用域清单)。
+// 只有 global 绑定可以使用全量哨兵；tenant/project 绑定交由调用方反查 KB 目录。
+func authorizedKBsFromBindings(bindings []permissionBinding, permissions map[string]bool, failOpenWhenUnbound bool) ([]string, bool, []kbParentScope) {
+	parentScopes := []kbParentScope{}
+	seenParent := map[kbParentScope]bool{}
+	if len(bindings) == 0 {
+		if failOpenWhenUnbound {
+			return nil, true, nil
+		}
+		return nil, false, nil
+	}
+	allKBs := false
+	kbSet := make(map[string]struct{})
+	for _, binding := range bindings {
+		if len(permissions) > 0 && !permissions[binding.PermissionCode] {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(binding.ScopeType)) {
+		case "", "global":
+			// global：明确的全量授权，仅保留给全局绑定（M4-R1 FIX #1）。
+			allKBs = true
+		case "tenant", "project":
+			// tenant/project：不放大为全部 KB，记录父作用域，由调用方通过
+			// knowledge_bases 目录反查真实授权 KB 集合。
+			tenantID, scopeErr := normalizeBindingScopeID("tenant_id", binding.TenantID)
+			if scopeErr != nil {
+				continue
+			}
+			projectID, scopeErr := normalizeBindingScopeID("project_id", binding.ProjectID)
+			if scopeErr != nil {
+				continue
+			}
+			if tenantID == "" && projectID == "" {
+				continue
+			}
+			parent := kbParentScope{TenantID: tenantID, ProjectID: projectID}
+			if !seenParent[parent] {
+				seenParent[parent] = true
+				parentScopes = append(parentScopes, parent)
+			}
+		case "kb":
+			normalized, err := normalizeBindingKBID(binding.KBID)
+			if err != nil || normalized == "" {
+				// 非法 kb_id 绑定按“未授权该 KB”处理（fail-closed），不让脏数据放大授权。
+				continue
+			}
+			kbSet[normalized] = struct{}{}
+		default:
+			continue
+		}
+	}
+	if allKBs {
+		return nil, true, nil
+	}
+	kbIDs := sortedKBIDSet(kbSet)
+	return kbIDs, false, parentScopes
+}
+
+// knowledgeBaseIDsForParentScopes 通过 knowledge_bases 目录表反查父作用域下的 KB id。
+// 目录查询失败（表不存在等）按错误返回，调用方 fail-closed。
+func (c *Client) knowledgeBaseIDsForParentScopes(ctx context.Context, parentScopes []kbParentScope) ([]string, error) {
+	if len(parentScopes) == 0 {
+		return nil, nil
+	}
+	clauses := make([]string, 0, len(parentScopes))
+	args := make([]interface{}, 0, len(parentScopes)*2)
+	for _, parent := range parentScopes {
+		if parent.TenantID != "" && parent.ProjectID != "" {
+			args = append(args, parent.TenantID, parent.ProjectID)
+			clauses = append(clauses, fmt.Sprintf("(tenant_id = $%d AND project_id = $%d)", len(args)-1, len(args)))
+			continue
+		}
+		if parent.TenantID != "" {
+			args = append(args, parent.TenantID)
+			clauses = append(clauses, fmt.Sprintf("tenant_id = $%d", len(args)))
+			continue
+		}
+		args = append(args, parent.ProjectID)
+		clauses = append(clauses, fmt.Sprintf("project_id = $%d", len(args)))
+	}
+	query := fmt.Sprintf(`
+		SELECT id
+		FROM knowledge_bases
+		WHERE %s
+	`, strings.Join(clauses, " OR "))
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query knowledge bases for parent scopes failed: %w", err)
+	}
+	defer rows.Close()
+
+	kbSet := make(map[string]struct{})
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("scan knowledge base id failed: %w", err)
+		}
+		normalized, scopeErr := normalizeBindingKBID(raw)
+		if scopeErr != nil || normalized == "" {
+			// 目录中的脏 id 不进入授权集合（fail-closed）。
+			continue
+		}
+		kbSet[normalized] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate knowledge base ids failed: %w", err)
+	}
+	return sortedKBIDSet(kbSet), nil
+}
+
+func sortedKBIDSet(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	kbIDs := make([]string, 0, len(set))
+	for id := range set {
+		kbIDs = append(kbIDs, id)
+	}
+	sort.Strings(kbIDs)
+	return kbIDs
+}
+
+// normalizedKBIDSet 合并两组 kb id（显式绑定 + 目录反查），归一化去重排序。
+func normalizedKBIDSet(values []string) []string {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		normalized, err := normalizeBindingKBID(value)
+		if err != nil || normalized == "" {
+			continue
+		}
+		set[normalized] = struct{}{}
+	}
+	return sortedKBIDSet(set)
+}
+
+func permissionCodeSet(codes []string) map[string]bool {
+	if len(codes) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(codes))
+	for _, code := range codes {
+		trimmed := strings.TrimSpace(code)
+		if trimmed != "" {
+			set[trimmed] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+// normalizeBindingKBID 对绑定中的 kb_id 应用 scope 契约的归一化规则。
+func normalizeBindingKBID(value string) (string, error) {
+	return normalizeBindingScopeID("kb_id", value)
+}
+
+func normalizeBindingScopeID(kind, value string) (string, error) {
+	normalized, scopeErr := scope.NormalizeScopeID(kind, value)
+	if scopeErr != nil {
+		return "", scopeErr
+	}
+	return normalized, nil
 }

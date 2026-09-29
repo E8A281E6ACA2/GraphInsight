@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"graphinsight/go-backend/internal/orchestrator"
+	"graphinsight/go-backend/internal/scope"
 )
 
 func buildOrchestratorHandler(
@@ -327,7 +328,21 @@ func forwardOrchestratorJSON(
 	body []byte,
 	safeRetry bool,
 ) (int, error) {
-	headers := buildForwardHeaders(r)
+	return forwardOrchestratorJSONWithHeaders(w, r, logger, client, path, body, buildForwardHeaders(r), safeRetry)
+}
+
+// forwardOrchestratorJSONWithHeaders 允许调用方显式指定转发头
+// （QA/NL2Cypher 需要把解析+授权后的有效 kb 范围转发给 Python，契约 §3.3）。
+func forwardOrchestratorJSONWithHeaders(
+	w http.ResponseWriter,
+	r *http.Request,
+	logger *slog.Logger,
+	client *orchestrator.Client,
+	path string,
+	body []byte,
+	headers map[string]string,
+	safeRetry bool,
+) (int, error) {
 	status, respBody, err := client.DoJSONWithOptions(
 		r.Context(),
 		r.Method,
@@ -370,6 +385,29 @@ func buildForwardHeaders(r *http.Request) map[string]string {
 		"x-authz-permission": r.Header.Get("x-authz-permission"),
 		"x-authz-reason":     r.Header.Get("x-authz-reason"),
 	}
+}
+
+// buildScopedForwardHeaders 在 buildForwardHeaders 基础上以服务端解析并授权后的
+// 有效作用域覆盖转发头（M4）：x-tenant-id/x-project-id 来自解析出的 SearchTarget，
+// x-kb-ids 为逗号连接的有效 KB 集合（请求 ∩ 授权）；单一 KB 时同时携带 x-kb-id。
+// Python 侧独立校验 payload，本头仅用于链路内 scope 传递。
+func buildScopedForwardHeaders(r *http.Request, target *scope.SearchTarget, effectiveKBIDs []string) map[string]string {
+	headers := buildForwardHeaders(r)
+	if target != nil {
+		if strings.TrimSpace(target.TenantID) != "" {
+			headers["x-tenant-id"] = target.TenantID
+		}
+		if strings.TrimSpace(target.ProjectID) != "" {
+			headers["x-project-id"] = target.ProjectID
+		}
+	}
+	if len(effectiveKBIDs) == 1 {
+		headers["x-kb-id"] = effectiveKBIDs[0]
+	}
+	if len(effectiveKBIDs) > 0 {
+		headers["x-kb-ids"] = strings.Join(effectiveKBIDs, ",")
+	}
+	return headers
 }
 
 func newForwardTraceID() string {

@@ -2,8 +2,8 @@ package httpserver
 
 import (
 	"bytes"
-	"encoding/csv"
 	"context"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"log/slog"

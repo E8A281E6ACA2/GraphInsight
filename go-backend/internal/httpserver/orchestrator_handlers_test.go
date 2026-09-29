@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"graphinsight/go-backend/internal/adminstore"
+	"graphinsight/go-backend/internal/authz"
 	"graphinsight/go-backend/internal/config"
 	"graphinsight/go-backend/internal/graph"
 	"graphinsight/go-backend/internal/orchestrator"
@@ -26,7 +27,66 @@ type fakeUnifiedGraphBuildStore struct {
 	*fakeAdminConfigStore
 	*fakeAdminJobStore
 	*fakeAdminLogStore
+	*fakeAdminDocumentStore
 	createCalls int32
+}
+
+// fakeAdminDocumentStore 满足 adminDocumentStore（M3 文档注册表路由使用）。
+// 所有方法 nil-receiver 安全：嵌入指针未初始化时返回零值，避免误触发路由时 panic。
+type fakeAdminDocumentStore struct {
+	listResult     adminstore.DocumentListResult
+	getRow         adminstore.DocumentRegistryItem
+	getErr         error
+	insertErr      error
+	insertRequests []adminstore.DocumentInsertRequest
+	deletedRowIDs  []string
+}
+
+func (s *fakeAdminDocumentStore) InsertDocument(_ context.Context, req adminstore.DocumentInsertRequest) (adminstore.DocumentRegistryItem, error) {
+	if s == nil || s.insertErr != nil {
+		return adminstore.DocumentRegistryItem{}, adminstore.ErrDocumentNotFound
+	}
+	s.insertRequests = append(s.insertRequests, req)
+	return adminstore.DocumentRegistryItem{
+		DocID: req.DocID, KBID: req.KBID, TenantID: req.TenantID, ProjectID: req.ProjectID,
+		Name: req.Name, RelativePath: req.RelativePath, Status: req.Status, CreatedAt: time.Now(),
+	}, nil
+}
+
+func (s *fakeAdminDocumentStore) GetDocument(_ context.Context, docID string) (adminstore.DocumentRegistryItem, error) {
+	if s == nil || s.getErr != nil {
+		return adminstore.DocumentRegistryItem{}, adminstore.ErrDocumentNotFound
+	}
+	if s.getRow.DocID == "" {
+		return adminstore.DocumentRegistryItem{}, adminstore.ErrDocumentNotFound
+	}
+	return s.getRow, nil
+}
+
+func (s *fakeAdminDocumentStore) ListDocumentsByKB(_ context.Context, _ adminstore.DocumentListQuery) (adminstore.DocumentListResult, error) {
+	if s == nil {
+		return adminstore.DocumentListResult{}, nil
+	}
+	return s.listResult, nil
+}
+
+func (s *fakeAdminDocumentStore) MarkDocumentStatus(_ context.Context, req adminstore.DocumentStatusUpdate) (adminstore.DocumentRegistryItem, error) {
+	if s == nil {
+		return adminstore.DocumentRegistryItem{}, adminstore.ErrDocumentNotFound
+	}
+	return s.getRow, nil
+}
+
+func (s *fakeAdminDocumentStore) DeleteDocumentRow(_ context.Context, docID string, _ string) error {
+	if s == nil {
+		return nil
+	}
+	s.deletedRowIDs = append(s.deletedRowIDs, docID)
+	return nil
+}
+
+func (s *fakeAdminDocumentStore) DeleteDocumentRowsByKB(_ context.Context, _ string) (int64, error) {
+	return 0, nil
 }
 
 func (s *fakeUnifiedGraphBuildStore) CreateJob(ctx context.Context, req adminstore.JobCreateRequest) (adminstore.JobItem, error) {
@@ -172,7 +232,7 @@ func TestGraphBuildRouteInjectsComplexScenarioReasoningProfileFromConfig(t *test
 	registerRoutes(mux, cfg, logger, nil, nil, pythonWakeClient, nil, nil, nil, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/graph/build", strings.NewReader(`{"force":false,"complex_extraction":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/graph/build?kb_id=kb-a", strings.NewReader(`{"force":false,"complex_extraction":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 
@@ -210,7 +270,7 @@ func TestGraphBuildRouteIdempotencyReplay(t *testing.T) {
 	registerRoutes(mux, cfg, logger, nil, nil, pythonWakeClient, nil, nil, nil, store)
 
 	rec1 := httptest.NewRecorder()
-	req1 := httptest.NewRequest(http.MethodPost, "/api/graph/build", strings.NewReader(`{"force":false}`))
+	req1 := httptest.NewRequest(http.MethodPost, "/api/graph/build?kb_id=kb-a", strings.NewReader(`{"force":false}`))
 	req1.Header.Set("Idempotency-Key", "build-456")
 	req1.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec1, req1)
@@ -260,7 +320,7 @@ func TestGraphBuildRouteIdempotencyConflict(t *testing.T) {
 	registerRoutes(mux, cfg, logger, nil, nil, pythonWakeClient, nil, nil, nil, store)
 
 	rec1 := httptest.NewRecorder()
-	req1 := httptest.NewRequest(http.MethodPost, "/api/graph/build", strings.NewReader(`{"force":false}`))
+	req1 := httptest.NewRequest(http.MethodPost, "/api/graph/build?kb_id=kb-a", strings.NewReader(`{"force":false}`))
 	req1.Header.Set("Idempotency-Key", "build-789")
 	req1.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec1, req1)
@@ -269,7 +329,7 @@ func TestGraphBuildRouteIdempotencyConflict(t *testing.T) {
 	}
 
 	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodPost, "/api/graph/build", strings.NewReader(`{"force":true}`))
+	req2 := httptest.NewRequest(http.MethodPost, "/api/graph/build?kb_id=kb-a", strings.NewReader(`{"force":true}`))
 	req2.Header.Set("Idempotency-Key", "build-789")
 	req2.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec2, req2)
@@ -288,7 +348,12 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	docDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(docDir, "alpha.txt"), []byte("alpha"), 0o644); err != nil {
+	// M3：文档物理路径为 DocumentStoragePath / storage_prefix / relative_path。
+	docPrefix := filepath.Join("tenant-a", "project-a", "kb-a")
+	if err := os.MkdirAll(filepath.Join(docDir, docPrefix), 0o755); err != nil {
+		t.Fatalf("mkdir kb storage prefix: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(docDir, docPrefix, "alpha.txt"), []byte("alpha"), 0o644); err != nil {
 		t.Fatalf("write temp document: %v", err)
 	}
 	graphSvc := &stubGraphService{
@@ -303,15 +368,34 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 		DocumentStoragePath:         docDir,
 		DocumentStorageFallbackPath: docDir,
 	}
-	registerRoutes(mux, cfg, logger, graphSvc, nil, nil, nil, nil, nil, nil)
+	alphaRow := adminstore.DocumentRegistryItem{
+		DocID: "doc-alpha", KBID: "kb-a", TenantID: "tenant-a", ProjectID: "project-a",
+		Name: "alpha.txt", RelativePath: "alpha.txt", Status: adminstore.DocumentStatusUploaded, CreatedAt: time.Now(),
+	}
+	store := &fakeUnifiedGraphBuildStore{
+		fakeAdminUserStore:   &fakeAdminUserStore{},
+		fakeAdminConfigStore: &fakeAdminConfigStore{},
+		fakeAdminLogStore:    &fakeAdminLogStore{},
+		fakeAdminJobStore: &fakeAdminJobStore{
+			kbRow: adminstore.KnowledgeBaseItem{
+				ID: "kb-a", TenantID: "tenant-a", ProjectID: "project-a",
+				Status: adminstore.KBStatusActive, StoragePrefix: "tenant-a/project-a/kb-a",
+			},
+		},
+		fakeAdminDocumentStore: &fakeAdminDocumentStore{
+			listResult: adminstore.DocumentListResult{Items: []adminstore.DocumentRegistryItem{alphaRow}, Total: 1},
+			getRow:     alphaRow,
+		},
+	}
+	registerRoutes(mux, cfg, logger, graphSvc, nil, nil, nil, nil, nil, store)
 
 	getCases := []struct {
 		method string
 		path   string
 		owner  string
 	}{
-		{method: http.MethodGet, path: "/api/documents", owner: "go-native"},
-		{method: http.MethodGet, path: "/api/documents/deleted", owner: "go-native"},
+		{method: http.MethodGet, path: "/api/documents?kb_id=kb-a", owner: "go-native"},
+		{method: http.MethodGet, path: "/api/documents/deleted?kb_id=kb-a", owner: "go-native"},
 	}
 	for _, tc := range getCases {
 		rec := httptest.NewRecorder()
@@ -332,7 +416,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 		} `json:"data"`
 	}
 	recList := httptest.NewRecorder()
-	reqList := httptest.NewRequest(http.MethodGet, "/api/documents", nil)
+	reqList := httptest.NewRequest(http.MethodGet, "/api/documents?kb_id=kb-a", nil)
 	mux.ServeHTTP(recList, reqList)
 	if err := json.Unmarshal(recList.Body.Bytes(), &listBody); err != nil {
 		t.Fatalf("unmarshal list response: %v", err)
@@ -348,7 +432,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 	}
 
 	recDelete := httptest.NewRecorder()
-	reqDelete := httptest.NewRequest(http.MethodDelete, "/api/documents/"+docID+"?purge_graph=false&soft_delete=true&dry_run=false&verify_after=true", nil)
+	reqDelete := httptest.NewRequest(http.MethodDelete, "/api/documents/"+docID+"?purge_graph=false&soft_delete=true&dry_run=false&verify_after=true&kb_id=kb-a", nil)
 	mux.ServeHTTP(recDelete, reqDelete)
 	if recDelete.Code != http.StatusOK {
 		t.Fatalf("request DELETE /api/documents/{id} expected 200, got %d body=%s", recDelete.Code, recDelete.Body.String())
@@ -357,8 +441,25 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 		t.Fatalf("request DELETE /api/documents/{id} unexpected route owner: %s", recDelete.Header().Get(routeOwnerHeader))
 	}
 
+	// M4 FIX #4：删除成功后 best-effort 向量清理——orchestrator 客户端不可用时
+	// 尝试仍会被记录（attempted=true, success=false），且删除不受影响。
+	var deleteBody struct {
+		Data struct {
+			VectorCleanup struct {
+				Attempted bool `json:"attempted"`
+				Success   bool `json:"success"`
+			} `json:"vector_cleanup"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recDelete.Body.Bytes(), &deleteBody); err != nil {
+		t.Fatalf("decode delete response: %v body=%s", err, recDelete.Body.String())
+	}
+	if !deleteBody.Data.VectorCleanup.Attempted || deleteBody.Data.VectorCleanup.Success {
+		t.Fatalf("unexpected vector_cleanup result: %#v", deleteBody.Data.VectorCleanup)
+	}
+
 	recRestore := httptest.NewRecorder()
-	reqRestore := httptest.NewRequest(http.MethodPost, "/api/documents/"+docID+"/restore", nil)
+	reqRestore := httptest.NewRequest(http.MethodPost, "/api/documents/"+docID+"/restore?kb_id=kb-a", nil)
 	mux.ServeHTTP(recRestore, reqRestore)
 	if recRestore.Code != http.StatusOK {
 		t.Fatalf("request POST /api/documents/{id}/restore expected 200, got %d body=%s", recRestore.Code, recRestore.Body.String())
@@ -367,7 +468,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 		t.Fatalf("request POST /api/documents/{id}/restore unexpected route owner: %s", recRestore.Header().Get(routeOwnerHeader))
 	}
 
-	reqClear := httptest.NewRequest(http.MethodDelete, "/api/documents?purge_graph=true", nil)
+	reqClear := httptest.NewRequest(http.MethodDelete, "/api/documents?purge_graph=true&kb_id=kb-a", nil)
 	mux.ServeHTTP(recClear, reqClear)
 	if recClear.Code != http.StatusOK {
 		t.Fatalf("request DELETE /api/documents expected 200, got %d body=%s", recClear.Code, recClear.Body.String())
@@ -376,7 +477,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 		t.Fatalf("request DELETE /api/documents unexpected route owner: %s", recClear.Header().Get(routeOwnerHeader))
 	}
 
-	if _, err := os.Stat(filepath.Join(docDir, "alpha.txt")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(docDir, docPrefix, "alpha.txt")); !os.IsNotExist(err) {
 		t.Fatalf("expected document to be removed from active directory, err=%v", err)
 	}
 	trashDir := filepath.Join(docDir, documentsSoftDeleteDirName)
@@ -402,7 +503,19 @@ func TestOrchestratorUploadRoute(t *testing.T) {
 		DocumentStoragePath:         docDir,
 		DocumentStorageFallbackPath: docDir,
 	}
-	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, nil, nil, nil)
+	uploadStore := &fakeUnifiedGraphBuildStore{
+		fakeAdminUserStore:   &fakeAdminUserStore{},
+		fakeAdminConfigStore: &fakeAdminConfigStore{},
+		fakeAdminLogStore:    &fakeAdminLogStore{},
+		fakeAdminJobStore: &fakeAdminJobStore{
+			kbRow: adminstore.KnowledgeBaseItem{
+				ID: "kb-a", TenantID: "tenant-a", ProjectID: "project-a",
+				Status: adminstore.KBStatusActive, StoragePrefix: "tenant-a/project-a/kb-a",
+			},
+		},
+		fakeAdminDocumentStore: &fakeAdminDocumentStore{},
+	}
+	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, nil, nil, uploadStore)
 
 	var b strings.Builder
 	writer := multipart.NewWriter(&b)
@@ -411,7 +524,7 @@ func TestOrchestratorUploadRoute(t *testing.T) {
 	_ = writer.Close()
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/documents/upload", strings.NewReader(b.String()))
+	req := httptest.NewRequest(http.MethodPost, "/api/documents/upload?kb_id=kb-a", strings.NewReader(b.String()))
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	mux.ServeHTTP(rec, req)
 
@@ -444,8 +557,8 @@ func TestOrchestratorUploadRoute(t *testing.T) {
 	if payload.Data.Uploaded[0]["name"] != "a.txt" {
 		t.Fatalf("unexpected uploaded name: %v", payload.Data.Uploaded[0]["name"])
 	}
-	if _, err := os.Stat(filepath.Join(docDir, "a.txt")); err != nil {
-		t.Fatalf("expected uploaded file written to disk: %v", err)
+	if _, err := os.Stat(filepath.Join(docDir, "tenant-a", "project-a", "kb-a", "a.txt")); err != nil {
+		t.Fatalf("expected uploaded file written to disk under kb storage prefix: %v", err)
 	}
 }
 
@@ -487,7 +600,7 @@ func TestOrchestratorMetricsRoute(t *testing.T) {
 	}
 
 	recCall2 := httptest.NewRecorder()
-	reqCall2 := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"x"}`))
+	reqCall2 := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"x","kb_id":"kb-a"}`))
 	reqCall2.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(recCall2, reqCall2)
 	if recCall2.Code != http.StatusServiceUnavailable {
@@ -580,7 +693,7 @@ func TestOrchestratorNL2CypherRoutes(t *testing.T) {
 	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, store)
 
 	postRec := httptest.NewRecorder()
-	postReq := httptest.NewRequest(http.MethodPost, "/api/nl2cypher", strings.NewReader(`{"natural_language":"查找小麦"}`))
+	postReq := httptest.NewRequest(http.MethodPost, "/api/nl2cypher", strings.NewReader(`{"natural_language":"查找小麦","kb_id":"kb-a"}`))
 	postReq.Header.Set("Content-Type", "application/json")
 	postReq.Header.Set("x-authz-permission", "nl2cypher:use")
 	mux.ServeHTTP(postRec, postReq)
@@ -756,11 +869,13 @@ func TestDocQARouteWritesBusinessAudit(t *testing.T) {
 
 	var seen []string
 	forwardedBody := map[string]interface{}{}
+	var forwardedKBIDs string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.Method+" "+r.URL.Path)
 		if r.URL.Path != "/api/internal/docqa" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
+		forwardedKBIDs = r.Header.Get("x-kb-ids")
 		rawBody, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(rawBody, &forwardedBody); err != nil {
 			t.Fatalf("decode forwarded body: %v body=%s", err, string(rawBody))
@@ -787,7 +902,7 @@ func TestDocQARouteWritesBusinessAudit(t *testing.T) {
 	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"他们的工作单位呢","top_k":3,"require_citation":true,"conversation_history":[{"role":"user","content":"郑雪梅和兰香瑚是谁？"},{"role":"assistant","content":"他们是论文作者。"}]}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"他们的工作单位呢","kb_id":"kb-a","top_k":3,"require_citation":true,"conversation_history":[{"role":"user","content":"郑雪梅和兰香瑚是谁？"},{"role":"assistant","content":"他们是论文作者。"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-authz-permission", "qa:ask")
 	mux.ServeHTTP(rec, req)
@@ -800,6 +915,9 @@ func TestDocQARouteWritesBusinessAudit(t *testing.T) {
 	}
 	if len(seen) != 1 || seen[0] != "POST /api/internal/docqa" {
 		t.Fatalf("unexpected upstream calls: %v", seen)
+	}
+	if forwardedKBIDs != "kb-a" {
+		t.Fatalf("expected x-kb-ids effective scope forwarded to python, got %q", forwardedKBIDs)
 	}
 	history, ok := forwardedBody["conversation_history"].([]interface{})
 	if !ok || len(history) != 2 {
@@ -945,7 +1063,7 @@ func TestDeepResearchRouteWritesBusinessAudit(t *testing.T) {
 	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"你好","top_k":8,"max_sub_questions":4}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"你好","kb_id":"kb-a","top_k":8,"max_sub_questions":4}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-authz-permission", "qa:ask")
 	mux.ServeHTTP(rec, req)
@@ -1005,7 +1123,7 @@ func TestDocQARouteInjectsScenarioReasoningProfileFromConfig(t *testing.T) {
 	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"你好"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"你好","kb_id":"kb-a"}`))
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 
@@ -1055,7 +1173,7 @@ func TestDeepResearchRouteInjectsScenarioReasoningProfileFromConfig(t *testing.T
 	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"你好"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"你好","kb_id":"kb-a"}`))
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 
@@ -1202,6 +1320,141 @@ func TestDocQAHealthRejectsInvalidProbeLLMBeforeUpstream(t *testing.T) {
 	}
 }
 
+// fakeQAScopeStore 同时满足 adminPermissionStore 与 qaScopeAuthorizer，
+// 用于验证 M4 问答范围授权的 请求 ∩ 授权 语义。
+type fakeQAScopeStore struct {
+	fakeAdminPermissionStore
+	kbIDs                []string
+	allKBs               bool
+	err                  error
+	calledWithSubject    string
+	calledWithPermission string
+}
+
+func (s *fakeQAScopeStore) AuthorizedKBIDs(_ context.Context, subject string, permissions ...string) ([]string, bool, error) {
+	s.calledWithSubject = subject
+	if len(permissions) > 0 {
+		s.calledWithPermission = permissions[0]
+	}
+	return s.kbIDs, s.allKBs, s.err
+}
+
+func TestDocQAScopeAuthorizationIntersectsAuthorizedKBs(t *testing.T) {
+	t.Parallel()
+
+	upstreamCalled := false
+	var upstreamKBIDs string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled = true
+		upstreamKBIDs = r.Header.Get("x-kb-ids")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":200,"message":"ok","data":{"answer":"ok","citations":[]}}`))
+	}))
+	defer upstream.Close()
+
+	orc, err := orchestrator.New(config.Config{PythonBackendBaseURL: upstream.URL, PythonBackendTimeoutSeconds: 2})
+	if err != nil {
+		t.Fatalf("new orchestrator client: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	token := issueTestAdminJWT(t, "admin@example.com", "test-secret", time.Now().Add(time.Hour))
+
+	buildHandler := func(store *fakeQAScopeStore, logStore *fakeAdminLogStore) http.HandlerFunc {
+		guard := newBusinessPermissionGuard(config.Config{
+			RBACEnforceBusinessAPI: true,
+			RBACAuthzMode:          "go_db",
+			AdminSecretKey:         "test-secret",
+		}, logger, store)
+		// 与路由注册一致：guard.wrap 负责第一轮鉴权并传播 x-auth-user-name。
+		return guard.wrap("qa:ask", buildNativeDocQAHandler(logger, guard, orc, nil, newOrchestratorMetrics(), logStore, &fakeAdminConfigStore{}, false))
+	}
+
+	newRequest := func(body string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		return req
+	}
+
+	t.Run("empty intersection denied with audit before upstream", func(t *testing.T) {
+		logStore := &fakeAdminLogStore{}
+		store := &fakeQAScopeStore{
+			fakeAdminPermissionStore: fakeAdminPermissionStore{result: authz.CheckResult{Allowed: true, UserID: 1, User: "admin@example.com"}},
+			kbIDs:                    []string{"kb-b"},
+		}
+		rec := httptest.NewRecorder()
+		buildHandler(store, logStore).ServeHTTP(rec, newRequest(`{"question":"你好","kb_id":"kb-a"}`))
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "KB_ACCESS_DENIED") {
+			t.Fatalf("expected KB_ACCESS_DENIED error code, got body=%s", rec.Body.String())
+		}
+		if upstreamCalled {
+			t.Fatalf("upstream must not be called when the intersection is empty")
+		}
+		if store.calledWithSubject != "admin@example.com" || store.calledWithPermission != "qa:ask" {
+			t.Fatalf("unexpected authorized lookup: subject=%q permission=%q", store.calledWithSubject, store.calledWithPermission)
+		}
+		if logStore.businessAuditReq.Status != "denied" || logStore.businessAuditReq.Action != "authz_denied" {
+			t.Fatalf("expected denial audit, got %#v", logStore.businessAuditReq)
+		}
+	})
+
+	t.Run("intersection forwarded as effective scope", func(t *testing.T) {
+		store := &fakeQAScopeStore{
+			fakeAdminPermissionStore: fakeAdminPermissionStore{result: authz.CheckResult{Allowed: true, UserID: 1, User: "admin@example.com"}},
+			kbIDs:                    []string{"kb-a", "kb-b"},
+		}
+		rec := httptest.NewRecorder()
+		buildHandler(store, &fakeAdminLogStore{}).ServeHTTP(rec, newRequest(`{"question":"你好","kb_id":"kb-a"}`))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !upstreamCalled || upstreamKBIDs != "kb-a" {
+			t.Fatalf("expected forwarded x-kb-ids=kb-a, got %q (called=%v)", upstreamKBIDs, upstreamCalled)
+		}
+	})
+
+	t.Run("global binding short circuits to request set", func(t *testing.T) {
+		store := &fakeQAScopeStore{
+			fakeAdminPermissionStore: fakeAdminPermissionStore{result: authz.CheckResult{Allowed: true, UserID: 1, User: "admin@example.com"}},
+			allKBs:                   true,
+		}
+		rec := httptest.NewRecorder()
+		buildHandler(store, &fakeAdminLogStore{}).ServeHTTP(rec, newRequest(`{"question":"你好","kb_ids":["kb-a","kb-c"]}`))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !upstreamCalled || upstreamKBIDs != "kb-a,kb-c" {
+			t.Fatalf("expected forwarded x-kb-ids=kb-a,kb-c, got %q (called=%v)", upstreamKBIDs, upstreamCalled)
+		}
+	})
+
+	t.Run("missing kb scope rejected before upstream", func(t *testing.T) {
+		store := &fakeQAScopeStore{
+			fakeAdminPermissionStore: fakeAdminPermissionStore{result: authz.CheckResult{Allowed: true, UserID: 1, User: "admin@example.com"}},
+			allKBs:                   true,
+		}
+		rec := httptest.NewRecorder()
+		buildHandler(store, &fakeAdminLogStore{}).ServeHTTP(rec, newRequest(`{"question":"你好"}`))
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "KB_SCOPE_REQUIRED") {
+			t.Fatalf("expected KB_SCOPE_REQUIRED error code, got body=%s", rec.Body.String())
+		}
+		if store.calledWithSubject != "" {
+			t.Fatalf("AuthorizedKBIDs must not be called when scope resolution fails, got subject %q", store.calledWithSubject)
+		}
+	})
+}
+
 func TestOrchestratorDocQAOptionalSafeRetry(t *testing.T) {
 	t.Parallel()
 
@@ -1245,7 +1498,7 @@ func TestOrchestratorDocQAOptionalSafeRetry(t *testing.T) {
 	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, nil)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"你好"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"你好","kb_id":"kb-a"}`))
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 

@@ -44,7 +44,7 @@ func (r *fakeRows) Scan(dest ...interface{}) error {
 	return nil
 }
 
-func (r *fakeRows) Err() error { return nil }
+func (r *fakeRows) Err() error   { return nil }
 func (r *fakeRows) Close() error { return nil }
 
 func TestEstimateQACostSupportsPromptAndCompletionPricing(t *testing.T) {
@@ -246,6 +246,9 @@ func TestScanQATraceItemExtractsReasoningProfile(t *testing.T) {
 				"success",
 				"who is wheat",
 				int64(3),
+				"tenant-a",
+				"project-a",
+				"kb-1",
 				"qwen-plus",
 				string(mustJSON(map[string]interface{}{
 					"reasoning_profile": "balanced",
@@ -270,6 +273,16 @@ func TestScanQATraceItemExtractsReasoningProfile(t *testing.T) {
 	}
 	if item.ReasoningProfile == nil || *item.ReasoningProfile != "balanced" {
 		t.Fatalf("unexpected reasoning profile: %#v", item.ReasoningProfile)
+	}
+	// M4-R1 审计 P0-2：列表项必须回带 KB 归属字段，供响应层暴露 tenant/project/kb。
+	if item.TenantID == nil || *item.TenantID != "tenant-a" {
+		t.Fatalf("unexpected tenant_id: %#v", item.TenantID)
+	}
+	if item.ProjectID == nil || *item.ProjectID != "project-a" {
+		t.Fatalf("unexpected project_id: %#v", item.ProjectID)
+	}
+	if item.KBID == nil || *item.KBID != "kb-1" {
+		t.Fatalf("unexpected kb_id: %#v", item.KBID)
 	}
 }
 

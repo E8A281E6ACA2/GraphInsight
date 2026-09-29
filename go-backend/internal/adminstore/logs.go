@@ -108,6 +108,8 @@ type LogCleanResult struct {
 type BusinessAuditRequest struct {
 	OperatorID   *int
 	TenantID     *string
+	ProjectID    *string
+	KBID         *string
 	TraceID      *string
 	Action       string
 	Resource     string
@@ -486,6 +488,8 @@ func (c *Client) RecordBusinessAudit(ctx context.Context, req BusinessAuditReque
 			user_id,
 			operator_id,
 			tenant_id,
+			project_id,
+			kb_id,
 			trace_id,
 			action,
 			resource,
@@ -496,8 +500,8 @@ func (c *Client) RecordBusinessAudit(ctx context.Context, req BusinessAuditReque
 			status,
 			error_message
 		)
-		VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`, req.OperatorID, req.TenantID, req.TraceID, req.Action, resource, req.ResourceID, string(encodedDetails), req.IPAddress, req.UserAgent, status, req.ErrorMessage); err != nil {
+		VALUES ($1, $1, $2, $12, $13, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, req.OperatorID, req.TenantID, req.TraceID, req.Action, resource, req.ResourceID, string(encodedDetails), req.IPAddress, req.UserAgent, status, req.ErrorMessage, req.ProjectID, req.KBID); err != nil {
 		return fmt.Errorf("insert business audit log failed: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

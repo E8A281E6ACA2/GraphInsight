@@ -15,8 +15,12 @@ import (
 	"graphinsight/go-backend/internal/orchestrator"
 )
 
+// publicNL2CypherPayload 的 kb_id/kb_ids（M4）：与 header/query 三来源严格一致合并，
+// 服务端再与授权求交出有效范围后转发。
 type publicNL2CypherPayload struct {
 	NaturalLanguage string                 `json:"natural_language"`
+	KBID            *string                `json:"kb_id,omitempty"`
+	KBIDs           []string               `json:"kb_ids,omitempty"`
 	Context         map[string]interface{} `json:"context"`
 }
 
@@ -30,6 +34,7 @@ func optionalAuditMessage(value string) *string {
 
 func buildNativeNL2CypherGenerateHandler(
 	logger *slog.Logger,
+	guard businessPermissionGuard,
 	client *orchestrator.Client,
 	clientErr error,
 	metrics *orchestratorMetrics,
@@ -84,7 +89,21 @@ func buildNativeNL2CypherGenerateHandler(
 			return
 		}
 
-		status, forwardErr := forwardOrchestratorJSON(w, r, logger, client, "/api/internal/nl2cypher", body, false)
+		// M4：kb 作用域解析（header/query/body 三来源严格一致）+ 授权求交。
+		target, scopeErr := resolveQARequestScope(r, optionalStringValue(payload.KBID), payload.KBIDs)
+		if scopeErr != nil {
+			record(scopeErr.Status, nil)
+			writeQAScopeRejectionAudit(r, logger, logStore, "nl2cypher:use", scopeErr)
+			writeScopeError(w, scopeErr)
+			return
+		}
+		effectiveKBIDs, ok := guard.authorizeQAEffectiveKBIDs(w, r, logStore, "nl2cypher:use", target)
+		if !ok {
+			record(http.StatusForbidden, nil)
+			return
+		}
+
+		status, forwardErr := forwardOrchestratorJSONWithHeaders(w, r, logger, client, "/api/internal/nl2cypher", body, buildScopedForwardHeaders(r, target, effectiveKBIDs), false)
 		auditStatus := "success"
 		errorMessage := (*string)(nil)
 		if status >= http.StatusBadRequest {
@@ -94,6 +113,9 @@ func buildNativeNL2CypherGenerateHandler(
 		writeNL2CypherAudit(r, logStore, &payload, auditStatus, errorMessage, map[string]interface{}{
 			"http_status": status,
 			"forwarded":   forwardErr == nil,
+			"kb_ids":      effectiveKBIDs,
+			"tenant_id":   target.TenantID,
+			"project_id":  target.ProjectID,
 		})
 		record(status, forwardErr)
 	})

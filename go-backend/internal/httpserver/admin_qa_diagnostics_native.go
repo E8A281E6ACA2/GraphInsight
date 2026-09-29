@@ -13,11 +13,19 @@ import (
 
 type adminRetrievalDiagnosticsPayload struct {
 	Question string   `json:"question"`
+	KBID     *string  `json:"kb_id,omitempty"`
+	KBIDs    []string `json:"kb_ids,omitempty"`
 	TopK     int      `json:"top_k,omitempty"`
 	Modes    []string `json:"modes,omitempty"`
 }
 
-func buildAdminRetrievalDiagnosticsHandler(logger *slog.Logger, guard businessPermissionGuard, pythonClient *proxy.Client) http.HandlerFunc {
+func buildAdminRetrievalDiagnosticsHandler(
+	logger *slog.Logger,
+	guard businessPermissionGuard,
+	pythonClient *proxy.Client,
+	kbStore adminKBStore,
+	logStore adminLogStore,
+) http.HandlerFunc {
 	return withRouteOwner("go-control-plane", guard.wrap("qa:ask", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			WriteJSON(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
@@ -50,6 +58,18 @@ func buildAdminRetrievalDiagnosticsHandler(logger *slog.Logger, guard businessPe
 			WriteJSON(w, http.StatusBadRequest, "问题长度超过限制", map[string]interface{}{"error_code": "INVALID_BODY"})
 			return
 		}
+
+		// M4-R1 审计 P0-1：第二阶段 KB 授权完整链（解析 scope -> 加载 KB 权威行 ->
+		// 校验 tenant/project/kb 一致 -> 权限求交）。任一步失败已在内部写出响应与
+		// 拒绝审计并返回 false，此时绝不能转发 Python（拒绝路径不调用上游）。
+		target, effectiveKBIDs, ok := guard.authorizeQAKBScopedRequest(
+			w, r, logStore, kbStore, "qa:ask",
+			optionalStringValue(payload.KBID), payload.KBIDs,
+		)
+		if !ok {
+			return
+		}
+
 		if payload.TopK <= 0 {
 			payload.TopK = 5
 		}
@@ -57,6 +77,9 @@ func buildAdminRetrievalDiagnosticsHandler(logger *slog.Logger, guard businessPe
 			payload.TopK = 20
 		}
 		payload.Modes = normalizeRetrievalDiagnosticModes(payload.Modes)
+		// 转发服务端规范化后的作用域：清空客户端自报 kb_id，kb_ids 置为授权求交结果。
+		payload.KBID = nil
+		payload.KBIDs = effectiveKBIDs
 		forwardBody, err := json.Marshal(payload)
 		if err != nil {
 			WriteJSON(w, http.StatusInternalServerError, "构造诊断请求失败", map[string]interface{}{"error_code": "INTERNAL_ERROR"})
@@ -77,6 +100,16 @@ func buildAdminRetrievalDiagnosticsHandler(logger *slog.Logger, guard businessPe
 			upstreamReq.Header.Del(key)
 			for _, value := range values {
 				upstreamReq.Header.Add(key, value)
+			}
+		}
+		// 以服务端规范化后的作用域覆盖客户端自报的 scope 头，避免透传未校验的 kb/project。
+		for key, value := range buildScopedForwardHeaders(r, target, effectiveKBIDs) {
+			switch key {
+			case "x-tenant-id", "x-project-id", "x-kb-id", "x-kb-ids":
+				upstreamReq.Header.Del(key)
+				if strings.TrimSpace(value) != "" {
+					upstreamReq.Header.Set(key, value)
+				}
 			}
 		}
 		upstreamReq.Header.Set("Content-Type", "application/json; charset=utf-8")

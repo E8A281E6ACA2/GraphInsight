@@ -20,8 +20,12 @@ type publicConversationTurn struct {
 	Content string `json:"content"`
 }
 
+// publicDocQAPayload 的 kb_id/kb_ids（M4）：与 header/query 三来源严格一致合并
+// （scope.ResolveRequestWithBody），服务端再与授权求交出有效范围后转发。
 type publicDocQAPayload struct {
 	Question            string                   `json:"question"`
+	KBID                *string                  `json:"kb_id,omitempty"`
+	KBIDs               []string                 `json:"kb_ids,omitempty"`
 	TopK                *int                     `json:"top_k,omitempty"`
 	RequireCitation     *bool                    `json:"require_citation,omitempty"`
 	ReasoningProfile    string                   `json:"reasoning_profile,omitempty"`
@@ -29,14 +33,17 @@ type publicDocQAPayload struct {
 }
 
 type publicDeepResearchPayload struct {
-	Question         string `json:"question"`
-	TopK             *int   `json:"top_k,omitempty"`
-	MaxSubQuestions  *int   `json:"max_sub_questions,omitempty"`
-	ReasoningProfile string `json:"reasoning_profile,omitempty"`
+	Question         string   `json:"question"`
+	KBID             *string  `json:"kb_id,omitempty"`
+	KBIDs            []string `json:"kb_ids,omitempty"`
+	TopK             *int     `json:"top_k,omitempty"`
+	MaxSubQuestions  *int     `json:"max_sub_questions,omitempty"`
+	ReasoningProfile string   `json:"reasoning_profile,omitempty"`
 }
 
 func buildNativeDocQAHandler(
 	logger *slog.Logger,
+	guard businessPermissionGuard,
 	client *orchestrator.Client,
 	clientErr error,
 	metrics *orchestratorMetrics,
@@ -92,12 +99,26 @@ func buildNativeDocQAHandler(
 			WriteJSON(w, http.StatusBadRequest, "问题不能为空", map[string]interface{}{"error_code": "INVALID_BODY"})
 			return
 		}
+		// M4：kb 作用域解析（header/query/body 三来源严格一致）+ 授权求交。
+		// 失败路径已写响应与拒绝审计，直接返回。
+		target, scopeErr := resolveQARequestScope(r, optionalStringValue(payload.KBID), payload.KBIDs)
+		if scopeErr != nil {
+			record(scopeErr.Status, nil)
+			writeQAScopeRejectionAudit(r, logger, logStore, "qa:ask", scopeErr)
+			writeScopeError(w, scopeErr)
+			return
+		}
+		effectiveKBIDs, ok := guard.authorizeQAEffectiveKBIDs(w, r, logStore, "qa:ask", target)
+		if !ok {
+			record(http.StatusForbidden, nil)
+			return
+		}
 		if strings.TrimSpace(payload.ReasoningProfile) == "" {
 			payload.ReasoningProfile = resolveScenarioReasoningProfile(r.Context(), configStore, "docqa", "balanced")
 			body = encodeDocQAPayload(body, payload)
 		}
 
-		status, forwardErr := forwardOrchestratorJSON(w, r, logger, client, "/api/internal/docqa", body, safeRetry)
+		status, forwardErr := forwardOrchestratorJSONWithHeaders(w, r, logger, client, "/api/internal/docqa", body, buildScopedForwardHeaders(r, target, effectiveKBIDs), safeRetry)
 		auditStatus := "success"
 		errorMessage := (*string)(nil)
 		if status >= http.StatusBadRequest {
@@ -107,6 +128,9 @@ func buildNativeDocQAHandler(
 		writeDocQAAudit(r, logStore, &payload, auditStatus, errorMessage, map[string]interface{}{
 			"http_status": status,
 			"forwarded":   forwardErr == nil,
+			"kb_ids":      effectiveKBIDs,
+			"tenant_id":   target.TenantID,
+			"project_id":  target.ProjectID,
 		})
 		record(status, forwardErr)
 	})
@@ -175,6 +199,7 @@ func writeDocQAAudit(
 
 func buildNativeDeepResearchHandler(
 	logger *slog.Logger,
+	guard businessPermissionGuard,
 	client *orchestrator.Client,
 	clientErr error,
 	metrics *orchestratorMetrics,
@@ -230,12 +255,25 @@ func buildNativeDeepResearchHandler(
 			WriteJSON(w, http.StatusBadRequest, "问题不能为空", map[string]interface{}{"error_code": "INVALID_BODY"})
 			return
 		}
+		// M4：kb 作用域解析（header/query/body 三来源严格一致）+ 授权求交。
+		target, scopeErr := resolveQARequestScope(r, optionalStringValue(payload.KBID), payload.KBIDs)
+		if scopeErr != nil {
+			record(scopeErr.Status, nil)
+			writeQAScopeRejectionAudit(r, logger, logStore, "qa:ask", scopeErr)
+			writeScopeError(w, scopeErr)
+			return
+		}
+		effectiveKBIDs, ok := guard.authorizeQAEffectiveKBIDs(w, r, logStore, "qa:ask", target)
+		if !ok {
+			record(http.StatusForbidden, nil)
+			return
+		}
 		if strings.TrimSpace(payload.ReasoningProfile) == "" {
 			payload.ReasoningProfile = resolveScenarioReasoningProfile(r.Context(), configStore, "deep_research", "deep")
 			body = encodeDocQAPayload(body, payload)
 		}
 
-		status, forwardErr := forwardOrchestratorJSON(w, r, logger, client, "/api/internal/docqa/deep-research", body, safeRetry)
+		status, forwardErr := forwardOrchestratorJSONWithHeaders(w, r, logger, client, "/api/internal/docqa/deep-research", body, buildScopedForwardHeaders(r, target, effectiveKBIDs), safeRetry)
 		auditStatus := "success"
 		errorMessage := (*string)(nil)
 		if status >= http.StatusBadRequest {
@@ -245,6 +283,9 @@ func buildNativeDeepResearchHandler(
 		writeDeepResearchAudit(r, logStore, &payload, auditStatus, errorMessage, map[string]interface{}{
 			"http_status": status,
 			"forwarded":   forwardErr == nil,
+			"kb_ids":      effectiveKBIDs,
+			"tenant_id":   target.TenantID,
+			"project_id":  target.ProjectID,
 		})
 		record(status, forwardErr)
 	})

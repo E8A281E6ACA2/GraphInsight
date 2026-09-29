@@ -16,22 +16,25 @@ import (
 var ErrQATraceNotFound = errors.New("qa trace not found")
 
 type QATraceItem struct {
-	ID             int         `json:"id"`
-	TraceID        *string     `json:"trace_id,omitempty"`
-	QAType         string      `json:"qa_type"`
-	Status         string      `json:"status"`
-	Question       string      `json:"question"`
-	OperatorID     *int        `json:"operator_id,omitempty"`
-	Model          *string     `json:"model,omitempty"`
-	ReasoningProfile *string   `json:"reasoning_profile,omitempty"`
-	TopK           *int        `json:"top_k,omitempty"`
-	LatencyMS      *int        `json:"latency_ms,omitempty"`
-	RetrievalCount int         `json:"retrieval_count"`
-	CitationCount  int         `json:"citation_count"`
-	AnswerPreview  *string     `json:"answer_preview,omitempty"`
-	ErrorMessage   *string     `json:"error_message,omitempty"`
-	CreatedAt      time.Time   `json:"created_at"`
-	Extra          interface{} `json:"-"`
+	ID               int         `json:"id"`
+	TraceID          *string     `json:"trace_id,omitempty"`
+	QAType           string      `json:"qa_type"`
+	Status           string      `json:"status"`
+	Question         string      `json:"question"`
+	OperatorID       *int        `json:"operator_id,omitempty"`
+	TenantID         *string     `json:"tenant_id,omitempty"`
+	ProjectID        *string     `json:"project_id,omitempty"`
+	KBID             *string     `json:"kb_id,omitempty"`
+	Model            *string     `json:"model,omitempty"`
+	ReasoningProfile *string     `json:"reasoning_profile,omitempty"`
+	TopK             *int        `json:"top_k,omitempty"`
+	LatencyMS        *int        `json:"latency_ms,omitempty"`
+	RetrievalCount   int         `json:"retrieval_count"`
+	CitationCount    int         `json:"citation_count"`
+	AnswerPreview    *string     `json:"answer_preview,omitempty"`
+	ErrorMessage     *string     `json:"error_message,omitempty"`
+	CreatedAt        time.Time   `json:"created_at"`
+	Extra            interface{} `json:"-"`
 }
 
 type QATraceDetail struct {
@@ -41,6 +44,9 @@ type QATraceDetail struct {
 	Status             string      `json:"status"`
 	Question           string      `json:"question"`
 	OperatorID         *int        `json:"operator_id,omitempty"`
+	TenantID           *string     `json:"tenant_id,omitempty"`
+	ProjectID          *string     `json:"project_id,omitempty"`
+	KBID               *string     `json:"kb_id,omitempty"`
 	Model              *string     `json:"model,omitempty"`
 	TopK               *int        `json:"top_k,omitempty"`
 	LatencyMS          *int        `json:"latency_ms,omitempty"`
@@ -60,6 +66,7 @@ type QATraceListQuery struct {
 	TraceID    string
 	OperatorID *int
 	Keyword    string
+	KBID       string
 	Page       int
 	PageSize   int
 }
@@ -99,6 +106,7 @@ type QACostSummary struct {
 type QACostSummaryQuery struct {
 	QAType      string
 	Status      string
+	KBID        string
 	WindowHours int
 }
 
@@ -128,6 +136,9 @@ func (c *Client) ListQATraces(ctx context.Context, query QATraceListQuery) (QATr
 			status,
 			question,
 			operator_id,
+			tenant_id,
+			project_id,
+			kb_id,
 			model,
 			generation_snapshot,
 			top_k,
@@ -161,7 +172,7 @@ func (c *Client) ListQATraces(ctx context.Context, query QATraceListQuery) (QATr
 	return QATraceListResult{Items: items, Total: total}, nil
 }
 
-func (c *Client) GetQATrace(ctx context.Context, traceIDOrPK string) (QATraceDetail, error) {
+func (c *Client) GetQATrace(ctx context.Context, traceIDOrPK string, kbID string) (QATraceDetail, error) {
 	if c == nil || c.db == nil {
 		return QATraceDetail{}, errors.New("admin store is not initialized")
 	}
@@ -170,12 +181,22 @@ func (c *Client) GetQATrace(ctx context.Context, traceIDOrPK string) (QATraceDet
 		return QATraceDetail{}, ErrQATraceNotFound
 	}
 
-	where := "trace_id = $1"
-	arg := interface{}(traceIDOrPK)
+	clauses := []string{}
+	args := []interface{}{}
 	if id, err := strconv.Atoi(traceIDOrPK); err == nil {
-		where = "id = $1"
-		arg = id
+		args = append(args, id)
+		clauses = append(clauses, fmt.Sprintf("id = $%d", len(args)))
+	} else {
+		args = append(args, traceIDOrPK)
+		clauses = append(clauses, fmt.Sprintf("trace_id = $%d", len(args)))
 	}
+	// KB 作用域强制（M4-R1 审计 P0-2）：非空 kb_id 时只允许读取该 KB 下的 trace，
+	// 跨 KB 读取自然落空（ErrQATraceNotFound -> 404），避免全局可读。
+	if scopedKB := strings.TrimSpace(kbID); scopedKB != "" {
+		args = append(args, scopedKB)
+		clauses = append(clauses, fmt.Sprintf("kb_id = $%d", len(args)))
+	}
+	where := strings.Join(clauses, " AND ")
 
 	row := c.db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT
@@ -185,6 +206,9 @@ func (c *Client) GetQATrace(ctx context.Context, traceIDOrPK string) (QATraceDet
 			status,
 			question,
 			operator_id,
+			tenant_id,
+			project_id,
+			kb_id,
 			model,
 			top_k,
 			latency_ms,
@@ -199,7 +223,7 @@ func (c *Client) GetQATrace(ctx context.Context, traceIDOrPK string) (QATraceDet
 		FROM admin_qa_traces
 		WHERE %s
 		LIMIT 1
-	`, where), arg)
+	`, where), args...)
 	detail, err := scanQATraceDetail(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return QATraceDetail{}, ErrQATraceNotFound
@@ -225,6 +249,7 @@ func (c *Client) GetQACostSummary(ctx context.Context, query QACostSummaryQuery)
 	filters := QATraceListQuery{
 		QAType: query.QAType,
 		Status: query.Status,
+		KBID:   query.KBID,
 	}
 	where, args := buildQATraceWhere(filters)
 	args = append(args, since)
@@ -481,6 +506,11 @@ func buildQATraceWhere(query QATraceListQuery) (string, []interface{}) {
 		idx := len(args)
 		clauses = append(clauses, fmt.Sprintf("(q.question ILIKE $%d OR q.answer_preview ILIKE $%d)", idx, idx))
 	}
+	// KB 作用域强制（M4-R1 审计 P0-2）：非空 kb_id 时按知识库归属过滤。
+	if kbID := strings.TrimSpace(query.KBID); kbID != "" {
+		args = append(args, kbID)
+		clauses = append(clauses, fmt.Sprintf("q.kb_id = $%d", len(args)))
+	}
 	if len(clauses) == 0 {
 		return "", args
 	}
@@ -508,6 +538,9 @@ func scanQATraceItem(scanner qaTraceRowScanner) (QATraceItem, error) {
 	var item QATraceItem
 	var traceID sql.NullString
 	var operatorID sql.NullInt64
+	var tenantID sql.NullString
+	var projectID sql.NullString
+	var kbID sql.NullString
 	var model sql.NullString
 	var generationSnapshot sql.NullString
 	var topK sql.NullInt64
@@ -521,6 +554,9 @@ func scanQATraceItem(scanner qaTraceRowScanner) (QATraceItem, error) {
 		&item.Status,
 		&item.Question,
 		&operatorID,
+		&tenantID,
+		&projectID,
+		&kbID,
 		&model,
 		&generationSnapshot,
 		&topK,
@@ -535,6 +571,9 @@ func scanQATraceItem(scanner qaTraceRowScanner) (QATraceItem, error) {
 	}
 	item.TraceID = stringPtrFromNull(traceID)
 	item.OperatorID = intPtrFromNull(operatorID)
+	item.TenantID = stringPtrFromNull(tenantID)
+	item.ProjectID = stringPtrFromNull(projectID)
+	item.KBID = stringPtrFromNull(kbID)
 	item.Model = stringPtrFromNull(model)
 	item.ReasoningProfile = extractQAReasoningProfile(stringPtrFromNull(generationSnapshot))
 	item.TopK = intPtrFromNull(topK)
@@ -548,6 +587,9 @@ func scanQATraceDetail(scanner qaTraceRowScanner) (QATraceDetail, error) {
 	var item QATraceItem
 	var traceID sql.NullString
 	var operatorID sql.NullInt64
+	var tenantID sql.NullString
+	var projectID sql.NullString
+	var kbID sql.NullString
 	var model sql.NullString
 	var topK sql.NullInt64
 	var latencyMS sql.NullInt64
@@ -563,6 +605,9 @@ func scanQATraceDetail(scanner qaTraceRowScanner) (QATraceDetail, error) {
 		&item.Status,
 		&item.Question,
 		&operatorID,
+		&tenantID,
+		&projectID,
+		&kbID,
 		&model,
 		&topK,
 		&latencyMS,
@@ -579,6 +624,9 @@ func scanQATraceDetail(scanner qaTraceRowScanner) (QATraceDetail, error) {
 	}
 	item.TraceID = stringPtrFromNull(traceID)
 	item.OperatorID = intPtrFromNull(operatorID)
+	item.TenantID = stringPtrFromNull(tenantID)
+	item.ProjectID = stringPtrFromNull(projectID)
+	item.KBID = stringPtrFromNull(kbID)
 	item.Model = stringPtrFromNull(model)
 	item.TopK = intPtrFromNull(topK)
 	item.LatencyMS = intPtrFromNull(latencyMS)
@@ -591,6 +639,9 @@ func scanQATraceDetail(scanner qaTraceRowScanner) (QATraceDetail, error) {
 		Status:             item.Status,
 		Question:           item.Question,
 		OperatorID:         item.OperatorID,
+		TenantID:           item.TenantID,
+		ProjectID:          item.ProjectID,
+		KBID:               item.KBID,
 		Model:              item.Model,
 		TopK:               item.TopK,
 		LatencyMS:          item.LatencyMS,

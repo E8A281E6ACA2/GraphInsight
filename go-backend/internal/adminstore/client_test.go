@@ -8,6 +8,113 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+func TestAuthorizedKBsFromBindings(t *testing.T) {
+	t.Parallel()
+
+	qaPermissions := map[string]bool{"qa:ask": true, "nl2cypher:use": true}
+
+	tests := []struct {
+		name             string
+		bindings         []permissionBinding
+		permission       map[string]bool
+		failOpen         bool
+		wantKBIDs        []string
+		wantAllKBs       bool
+		wantParentScopes []kbParentScope
+	}{
+		{
+			name:       "no binding deny",
+			wantKBIDs:  nil,
+			wantAllKBs: false,
+		},
+		{
+			name:       "no binding fail open means all kbs",
+			failOpen:   true,
+			wantKBIDs:  nil,
+			wantAllKBs: true,
+		},
+		{
+			name: "global qa binding grants all kbs",
+			bindings: []permissionBinding{
+				{PermissionCode: "qa:ask", ScopeType: "global"},
+			},
+			permission: qaPermissions,
+			wantAllKBs: true,
+		},
+		{
+			name: "global binding for other permission does not grant qa scope",
+			bindings: []permissionBinding{
+				{PermissionCode: "job:read", ScopeType: "global"},
+			},
+			permission: qaPermissions,
+			wantAllKBs: false,
+		},
+		{
+			name: "kb scoped bindings give explicit ids normalized and deduplicated",
+			bindings: []permissionBinding{
+				{PermissionCode: "qa:ask", ScopeType: "kb", KBID: "KB-A"},
+				{PermissionCode: "qa:ask", ScopeType: "kb", KBID: "kb-a"},
+				{PermissionCode: "nl2cypher:use", ScopeType: "kb", KBID: "kb-b"},
+			},
+			permission: qaPermissions,
+			wantKBIDs:  []string{"kb-a", "kb-b"},
+		},
+		{
+			// M4-R1 FIX #1：tenant/project 绑定不再放大为全部 KB，而是记录父作用域供目录反查。
+			name: "tenant or project scoped binding resolves via parent scopes not all kbs",
+			bindings: []permissionBinding{
+				{PermissionCode: "qa:ask", ScopeType: "tenant", TenantID: "tenant-a"},
+				{PermissionCode: "qa:ask", ScopeType: "project", ProjectID: "project-a"},
+			},
+			permission:       qaPermissions,
+			wantAllKBs:       false,
+			wantParentScopes: []kbParentScope{{TenantID: "tenant-a", ProjectID: ""}, {TenantID: "", ProjectID: "project-a"}},
+		},
+		{
+			name: "tenant binding with dirty scope is skipped fail-closed",
+			bindings: []permissionBinding{
+				{PermissionCode: "qa:ask", ScopeType: "tenant", TenantID: "../escape"},
+			},
+			permission: qaPermissions,
+			wantAllKBs: false,
+		},
+		{
+			name: "invalid kb binding is skipped not fatal",
+			bindings: []permissionBinding{
+				{PermissionCode: "qa:ask", ScopeType: "kb", KBID: "../escape"},
+				{PermissionCode: "qa:ask", ScopeType: "kb", KBID: "kb-ok"},
+			},
+			permission: qaPermissions,
+			wantKBIDs:  []string{"kb-ok"},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotKBIDs, gotAllKBs, gotParentScopes := authorizedKBsFromBindings(tc.bindings, tc.permission, tc.failOpen)
+			if gotAllKBs != tc.wantAllKBs {
+				t.Fatalf("expected allKBs=%v, got %v (kbIDs=%v)", tc.wantAllKBs, gotAllKBs, gotKBIDs)
+			}
+			if tc.wantAllKBs {
+				return
+			}
+			if !reflect.DeepEqual(gotKBIDs, tc.wantKBIDs) {
+				t.Fatalf("expected kbIDs %v, got %v", tc.wantKBIDs, gotKBIDs)
+			}
+			if len(gotParentScopes) != len(tc.wantParentScopes) {
+				t.Fatalf("expected parent scopes %v, got %v", tc.wantParentScopes, gotParentScopes)
+			}
+			for i := range gotParentScopes {
+				if gotParentScopes[i] != tc.wantParentScopes[i] {
+					t.Fatalf("parent scope %d expected %v, got %v", i, tc.wantParentScopes[i], gotParentScopes[i])
+				}
+			}
+		})
+	}
+}
+
 func TestEvaluatePermissionBindingsMatchesPythonAuthzRules(t *testing.T) {
 	t.Parallel()
 

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"graphinsight/go-backend/internal/adminstore"
 	"graphinsight/go-backend/internal/config"
 	"graphinsight/go-backend/internal/graph"
 )
@@ -33,6 +34,10 @@ type stubGraphService struct {
 	docClear        graph.DocumentGraphStats
 	docClearErr     error
 	healthErr       error
+	// M4-R1 负向测试：记录下游是否被调用，验证跨 KB 拒绝时不触达 Neo4j 服务。
+	discoverSchemaCalls int
+	getNodeDetailCalls  int
+	expandNodeCalls     int
 }
 
 func (s *stubGraphService) CheckHealth(ctx context.Context) error {
@@ -57,28 +62,35 @@ func (s *stubGraphService) GetDocumentGraphTotals(ctx context.Context) (graph.Do
 	return s.docTotals, nil
 }
 
-func (s *stubGraphService) PreviewDeleteDocumentGraph(ctx context.Context, docID string) (graph.DocumentGraphStats, error) {
+func (s *stubGraphService) GetDocumentGraphTotalsForKB(ctx context.Context, kbID string) (graph.DocumentGraphStats, error) {
+	if s.docTotErr != nil {
+		return graph.DocumentGraphStats{}, s.docTotErr
+	}
+	return s.docTotals, nil
+}
+
+func (s *stubGraphService) PreviewDeleteDocumentGraph(ctx context.Context, docID string, kbID string) (graph.DocumentGraphStats, error) {
 	if s.docPrevErr != nil {
 		return graph.DocumentGraphStats{}, s.docPrevErr
 	}
 	return s.docPreview, nil
 }
 
-func (s *stubGraphService) DeleteDocumentGraph(ctx context.Context, docID string) (graph.DocumentGraphStats, error) {
+func (s *stubGraphService) DeleteDocumentGraph(ctx context.Context, docID string, kbID string) (graph.DocumentGraphStats, error) {
 	if s.docDelErr != nil {
 		return graph.DocumentGraphStats{}, s.docDelErr
 	}
 	return s.docDelete, nil
 }
 
-func (s *stubGraphService) PreviewClearDocumentGraph(ctx context.Context) (graph.DocumentGraphStats, error) {
+func (s *stubGraphService) PreviewClearDocumentGraph(ctx context.Context, kbID string) (graph.DocumentGraphStats, error) {
 	if s.docClearPrevErr != nil {
 		return graph.DocumentGraphStats{}, s.docClearPrevErr
 	}
 	return s.docClearPreview, nil
 }
 
-func (s *stubGraphService) ClearDocumentGraph(ctx context.Context) (graph.DocumentGraphStats, error) {
+func (s *stubGraphService) ClearDocumentGraph(ctx context.Context, kbID string) (graph.DocumentGraphStats, error) {
 	if s.docClearErr != nil {
 		return graph.DocumentGraphStats{}, s.docClearErr
 	}
@@ -89,7 +101,8 @@ func (s *stubGraphService) ExecuteQuery(ctx context.Context, cypher string, para
 	return graph.QueryResponse{}, nil
 }
 
-func (s *stubGraphService) DiscoverSchema(ctx context.Context) (graph.GraphSchemaResponse, error) {
+func (s *stubGraphService) DiscoverSchema(ctx context.Context, kbID string) (graph.GraphSchemaResponse, error) {
+	s.discoverSchemaCalls++
 	if s.schemaErr != nil {
 		return graph.GraphSchemaResponse{}, s.schemaErr
 	}
@@ -97,14 +110,32 @@ func (s *stubGraphService) DiscoverSchema(ctx context.Context) (graph.GraphSchem
 }
 
 func (s *stubGraphService) ExpandNode(ctx context.Context, req graph.ExpandRequest) (graph.QueryResponse, error) {
+	s.expandNodeCalls++
 	return graph.QueryResponse{}, nil
 }
 
-func (s *stubGraphService) GetNodeDetail(ctx context.Context, nodeID string) (graph.NodeDetail, error) {
+func (s *stubGraphService) GetNodeDetail(ctx context.Context, nodeID string, kbID string) (graph.NodeDetail, error) {
+	s.getNodeDetailCalls++
 	if s.nodeErr != nil {
 		return graph.NodeDetail{}, s.nodeErr
 	}
 	return s.nodeDetail, nil
+}
+
+// newGraphRouteKBStore 构造满足普通图谱只读路由二阶段鉴权的 KB 存储（M4-R1 FIX #3）。
+// kb-a 为 active，tenant-a/project-a，与测试请求携带的 kb_id=kb-a 一致。
+func newGraphRouteKBStore() *fakeUnifiedGraphBuildStore {
+	return &fakeUnifiedGraphBuildStore{
+		fakeAdminUserStore:   &fakeAdminUserStore{},
+		fakeAdminConfigStore: &fakeAdminConfigStore{},
+		fakeAdminLogStore:    &fakeAdminLogStore{},
+		fakeAdminJobStore: &fakeAdminJobStore{
+			kbRow: adminstore.KnowledgeBaseItem{
+				ID: "kb-a", TenantID: "tenant-a", ProjectID: "project-a",
+				Status: adminstore.KBStatusActive, StoragePrefix: "tenant-a/project-a/kb-a",
+			},
+		},
+	}
 }
 
 func newTestLogger() *slog.Logger {
@@ -131,10 +162,10 @@ func TestNodeDetailContractSuccess(t *testing.T) {
 		},
 	}}
 
-	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, nil)
+	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, newGraphRouteKBStore())
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/node/42", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/node/42?kb_id=kb-a", nil)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -167,10 +198,10 @@ func TestNodeDetailContractNotFound(t *testing.T) {
 	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
 	graphSvc := &stubGraphService{nodeErr: graph.ErrNodeNotFound}
 
-	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, nil)
+	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, newGraphRouteKBStore())
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/node/not-exists", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/node/not-exists?kb_id=kb-a", nil)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
@@ -203,10 +234,10 @@ func TestNodeDetailContractInternalError(t *testing.T) {
 	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
 	graphSvc := &stubGraphService{nodeErr: errors.New("boom")}
 
-	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, nil)
+	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, newGraphRouteKBStore())
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/node/42", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/node/42?kb_id=kb-a", nil)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusInternalServerError {
@@ -236,10 +267,10 @@ func TestGraphSchemaContractSuccess(t *testing.T) {
 		},
 	}}
 
-	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, nil)
+	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, newGraphRouteKBStore())
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/graph/schema", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/graph/schema?kb_id=kb-a", nil)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {

@@ -1039,6 +1039,12 @@ func TestAdminJobsListNativeRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	guard := newBusinessPermissionGuard(config.Config{RBACEnforceBusinessAPI: false}, logger)
 	store := &fakeAdminJobStore{
+		// M4-R1 FIX #2：任务列表二阶段鉴权会加载目标 KB 并校验 {tenant,project,kb} 一致性，
+		// KB 行必须与请求作用域（tenant-1/project-1/kb-1）匹配，否则返回 KB_CROSS_SCOPE。
+		kbRow: adminstore.KnowledgeBaseItem{
+			ID: "kb-1", TenantID: "tenant-1", ProjectID: "project-1",
+			Status: adminstore.KBStatusActive, StoragePrefix: "tenant-1/project-1/kb-1",
+		},
 		listResult: adminstore.JobListResult{
 			Items: []adminstore.JobItem{
 				{ID: 12, JobType: "build_graph", Status: "failed", Payload: map[string]interface{}{}, RetryCount: 1, MaxRetries: 3, CreatedAt: time.Date(2026, 6, 5, 11, 0, 0, 0, time.UTC)},
@@ -1094,12 +1100,13 @@ func TestAdminJobsListNativeRouteUsesReadPermission(t *testing.T) {
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	guard := newGoDBPermissionGuardForTest(&gotPermission, 1)
-	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, &fakeAdminJobStore{
+	jobStore := &fakeAdminJobStore{
 		listResult: adminstore.JobListResult{Items: []adminstore.JobItem{}, Total: 0},
-	})
+	}
+	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, jobStore)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs?kb_id=kb-a", nil)
 	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(rec, req)
 
@@ -1108,6 +1115,9 @@ func TestAdminJobsListNativeRouteUsesReadPermission(t *testing.T) {
 	}
 	if gotPermission != "job:read" {
 		t.Fatalf("expected job:read permission, got %s", gotPermission)
+	}
+	if jobStore.listQuery.KBID != "kb-a" {
+		t.Fatalf("expected store list query to filter by kb-a, got %q", jobStore.listQuery.KBID)
 	}
 }
 
@@ -1121,11 +1131,13 @@ func TestAdminJobsDetailAndLogsNativeRoutesSkipProxy(t *testing.T) {
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	guard := newBusinessPermissionGuard(config.Config{RBACEnforceBusinessAPI: false}, logger)
+	jobKBID := "kb-a"
 	store := &fakeAdminJobStore{
 		detail: adminstore.JobItem{
 			ID:         12,
 			JobType:    "build_graph",
 			Status:     "succeeded",
+			KBID:       &jobKBID,
 			Payload:    map[string]interface{}{"source": "test"},
 			RetryCount: 0,
 			MaxRetries: 3,
@@ -1141,7 +1153,7 @@ func TestAdminJobsDetailAndLogsNativeRoutesSkipProxy(t *testing.T) {
 	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, store)
 
 	detailRec := httptest.NewRecorder()
-	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs/12", nil)
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs/12?kb_id=kb-a", nil)
 	mux.ServeHTTP(detailRec, detailReq)
 	if detailRec.Code != http.StatusOK {
 		t.Fatalf("expected detail 200, got %d", detailRec.Code)
@@ -1151,7 +1163,7 @@ func TestAdminJobsDetailAndLogsNativeRoutesSkipProxy(t *testing.T) {
 	}
 
 	logsRec := httptest.NewRecorder()
-	logsReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs/12/logs?page=1&page_size=100", nil)
+	logsReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs/12/logs?page=1&page_size=100&kb_id=kb-a", nil)
 	mux.ServeHTTP(logsRec, logsReq)
 	if logsRec.Code != http.StatusOK {
 		t.Fatalf("expected logs 200, got %d", logsRec.Code)
@@ -1202,6 +1214,46 @@ type fakeAdminJobStore struct {
 	cancelReq    adminstore.JobCancelRequest
 	cancelResult adminstore.JobItem
 	cancelErr    error
+	// kbRow 覆盖 GetKnowledgeBase 的返回；为空时默认返回 tenant-a/project-a 下的 active KB。
+	kbRow adminstore.KnowledgeBaseItem
+}
+
+// GetKnowledgeBase 满足 adminKBStore（M3 起 build_graph/clear_kb 任务创建需要加载
+// KB 行做作用域校验）。默认行为：任何 kb_id 都返回 active KB（tenant-a/project-a）。
+func (s *fakeAdminJobStore) GetKnowledgeBase(_ context.Context, kbID string) (adminstore.KnowledgeBaseItem, error) {
+	if s.kbRow.ID != "" {
+		if s.kbRow.ID == kbID {
+			return s.kbRow, nil
+		}
+		return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
+	}
+	return adminstore.KnowledgeBaseItem{
+		ID:            kbID,
+		TenantID:      "tenant-a",
+		ProjectID:     "project-a",
+		Status:        adminstore.KBStatusActive,
+		StoragePrefix: "tenant-a/project-a/" + kbID,
+	}, nil
+}
+
+func (s *fakeAdminJobStore) ListKnowledgeBases(_ context.Context, _ adminstore.KBListQuery) (adminstore.KBListResult, error) {
+	return adminstore.KBListResult{}, nil
+}
+
+func (s *fakeAdminJobStore) CreateKnowledgeBase(_ context.Context, req adminstore.KBCreateRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{ID: req.ID, TenantID: req.TenantID, ProjectID: req.ProjectID, Name: req.Name, Status: adminstore.KBStatusActive}, nil
+}
+
+func (s *fakeAdminJobStore) UpdateKnowledgeBase(_ context.Context, _ adminstore.KBUpdateRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
+}
+
+func (s *fakeAdminJobStore) ArchiveKnowledgeBase(_ context.Context, _ adminstore.KBArchiveRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
+}
+
+func (s *fakeAdminJobStore) DeleteKnowledgeBase(_ context.Context, _ adminstore.KBDeleteRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
 }
 
 func (s *fakeAdminJobStore) ListJobs(_ context.Context, query adminstore.JobListQuery) (adminstore.JobListResult, error) {
@@ -1330,7 +1382,7 @@ func TestAdminJobsCreateNativeRouteUsesManagePermission(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/jobs/build-graph", strings.NewReader(`{"tenant_id":"tenant-a","payload":{"force":true},"max_retries":3}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/jobs/build-graph", strings.NewReader(`{"tenant_id":"tenant-a","kb_id":"kb-a","payload":{"force":true},"max_retries":3}`))
 	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	req.Header.Set(traceHeader, "trace-create-job")
 	mux.ServeHTTP(rec, req)
@@ -1394,7 +1446,7 @@ func TestAdminBuildGraphJobCreateInjectsComplexScenarioReasoningProfile(t *testi
 	})
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/jobs/build-graph", strings.NewReader(`{"tenant_id":"tenant-a","payload":{"force":false,"complex_extraction":true},"max_retries":3}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/jobs/build-graph", strings.NewReader(`{"tenant_id":"tenant-a","kb_id":"kb-a","payload":{"force":false,"complex_extraction":true},"max_retries":3}`))
 	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	req.Header.Set(traceHeader, "trace-create-job-complex")
 	mux.ServeHTTP(rec, req)
@@ -1452,7 +1504,7 @@ func TestAdminQATracesNativeListRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces?page=2&page_size=10&keyword=wheat&qa_type=docqa&status=success&trace_id=trace-1&operator_id=3", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces?page=2&page_size=10&keyword=wheat&qa_type=docqa&status=success&trace_id=trace-1&operator_id=3&kb_id=kb-1", nil)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -1495,6 +1547,9 @@ func TestAdminQATracesNativeListRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 	}
 	if store.listQuery.OperatorID == nil || *store.listQuery.OperatorID != 3 {
 		t.Fatalf("unexpected operator filter: %#v", store.listQuery.OperatorID)
+	}
+	if store.listQuery.KBID != "kb-1" {
+		t.Fatalf("expected list query scoped to kb-1, got %q", store.listQuery.KBID)
 	}
 }
 
@@ -1546,7 +1601,7 @@ func TestAdminQATracesDetailNativeRouteUsesReadPermission(t *testing.T) {
 	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces/trace-1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces/trace-1?kb_id=kb-1", nil)
 	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(rec, req)
 
@@ -1561,6 +1616,9 @@ func TestAdminQATracesDetailNativeRouteUsesReadPermission(t *testing.T) {
 	}
 	if store.detailKey != "trace-1" {
 		t.Fatalf("unexpected detail key: %s", store.detailKey)
+	}
+	if store.detailKBID != "kb-1" {
+		t.Fatalf("expected detail scoped to kb-1, got %q", store.detailKBID)
 	}
 }
 
@@ -1593,7 +1651,7 @@ func TestAdminQATracesCostSummaryNativeRouteMarksOwnerAndSkipsProxy(t *testing.T
 	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, store)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces/cost-summary?window_hours=24", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces/cost-summary?window_hours=24&kb_id=kb-1", nil)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -1655,7 +1713,7 @@ func TestAdminQATracesCostSummaryNativeRouteUsesReadPermission(t *testing.T) {
 	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, &fakeAdminQATraceStore{summary: adminstore.QACostSummary{WindowHours: 24, Currency: "USD", PricingSource: "not_configured", Models: []adminstore.QACostModelBreakdown{}}})
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces/cost-summary?window_hours=24", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces/cost-summary?window_hours=24&kb_id=kb-1", nil)
 	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(rec, req)
 
@@ -1693,7 +1751,7 @@ func TestAdminRetrievalDiagnosticsRouteForwardsToPythonInternal(t *testing.T) {
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/api/v1/admin/qa/retrieval-diagnostics",
-		strings.NewReader(`{"question":"  hybrid search  ","top_k":30,"modes":["hybrid","bad","vector","hybrid"]}`),
+		strings.NewReader(`{"question":"  hybrid search  ","kb_id":"kb-1","top_k":30,"modes":["hybrid","bad","vector","hybrid"]}`),
 	)
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
@@ -1715,6 +1773,9 @@ func TestAdminRetrievalDiagnosticsRouteForwardsToPythonInternal(t *testing.T) {
 	}
 	if len(upstreamPayload.Modes) != 2 || upstreamPayload.Modes[0] != "hybrid" || upstreamPayload.Modes[1] != "vector" {
 		t.Fatalf("unexpected modes: %#v", upstreamPayload.Modes)
+	}
+	if len(upstreamPayload.KBIDs) != 1 || upstreamPayload.KBIDs[0] != "kb-1" {
+		t.Fatalf("expected forwarded kb_ids=[kb-1], got %#v", upstreamPayload.KBIDs)
 	}
 }
 
@@ -1747,11 +1808,14 @@ type fakeAdminQATraceStore struct {
 	listResult   adminstore.QATraceListResult
 	listErr      error
 	detailKey    string
+	detailKBID   string
 	detail       adminstore.QATraceDetail
 	detailErr    error
 	summaryQuery adminstore.QACostSummaryQuery
 	summary      adminstore.QACostSummary
 	summaryErr   error
+	// kbRow 覆盖 GetKnowledgeBase 默认行（为空时任何 kb_id 返回 tenant-a/project-a active KB）。
+	kbRow adminstore.KnowledgeBaseItem
 }
 
 func (s *fakeAdminQATraceStore) ListQATraces(_ context.Context, query adminstore.QATraceListQuery) (adminstore.QATraceListResult, error) {
@@ -1759,14 +1823,53 @@ func (s *fakeAdminQATraceStore) ListQATraces(_ context.Context, query adminstore
 	return s.listResult, s.listErr
 }
 
-func (s *fakeAdminQATraceStore) GetQATrace(_ context.Context, traceIDOrPK string) (adminstore.QATraceDetail, error) {
+func (s *fakeAdminQATraceStore) GetQATrace(_ context.Context, traceIDOrPK string, kbID string) (adminstore.QATraceDetail, error) {
 	s.detailKey = traceIDOrPK
+	s.detailKBID = kbID
 	return s.detail, s.detailErr
 }
 
 func (s *fakeAdminQATraceStore) GetQACostSummary(_ context.Context, query adminstore.QACostSummaryQuery) (adminstore.QACostSummary, error) {
 	s.summaryQuery = query
 	return s.summary, s.summaryErr
+}
+
+// 以下方法使 fakeAdminQATraceStore 同时满足 adminKBStore，供 QA trace 路由的第二阶段
+// KB 权威行加载使用（M4-R1 审计 P0-2）。
+func (s *fakeAdminQATraceStore) GetKnowledgeBase(_ context.Context, kbID string) (adminstore.KnowledgeBaseItem, error) {
+	if s.kbRow.ID != "" {
+		if s.kbRow.ID == kbID {
+			return s.kbRow, nil
+		}
+		return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
+	}
+	return adminstore.KnowledgeBaseItem{
+		ID:            kbID,
+		TenantID:      "tenant-a",
+		ProjectID:     "project-a",
+		Status:        adminstore.KBStatusActive,
+		StoragePrefix: "tenant-a/project-a/" + kbID,
+	}, nil
+}
+
+func (s *fakeAdminQATraceStore) ListKnowledgeBases(_ context.Context, _ adminstore.KBListQuery) (adminstore.KBListResult, error) {
+	return adminstore.KBListResult{}, nil
+}
+
+func (s *fakeAdminQATraceStore) CreateKnowledgeBase(_ context.Context, _ adminstore.KBCreateRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
+}
+
+func (s *fakeAdminQATraceStore) UpdateKnowledgeBase(_ context.Context, _ adminstore.KBUpdateRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
+}
+
+func (s *fakeAdminQATraceStore) ArchiveKnowledgeBase(_ context.Context, _ adminstore.KBArchiveRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
+}
+
+func (s *fakeAdminQATraceStore) DeleteKnowledgeBase(_ context.Context, _ adminstore.KBDeleteRequest) (adminstore.KnowledgeBaseItem, error) {
+	return adminstore.KnowledgeBaseItem{}, adminstore.ErrKBNotFound
 }
 
 type fakeAdminMonitorStore struct {

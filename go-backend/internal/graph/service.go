@@ -14,6 +14,7 @@ import (
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j/dbtype"
 
 	"graphinsight/go-backend/internal/config"
+	"graphinsight/go-backend/internal/scope"
 )
 
 type Service struct {
@@ -28,6 +29,10 @@ type Service struct {
 }
 
 var ErrNodeNotFound = errors.New("node not found")
+
+// ErrKBScopeRequired 普通图谱接口缺少 KB 作用域（M4-R1 FIX #3，手册 §10.3）。
+// 服务层是最后一道防线：即使 handler 被绕过，无 scope 也不执行任何 Neo4j 查询。
+var ErrKBScopeRequired = scope.ErrScopeRequired()
 
 const (
 	defaultQueryTimeout = 20 * time.Second
@@ -272,10 +277,30 @@ func (s *Service) GetDocumentGraphTotals(ctx context.Context) (DocumentGraphStat
 	return s.getDocumentGraphTotals(ctx, session)
 }
 
-func (s *Service) PreviewDeleteDocumentGraph(ctx context.Context, docID string) (DocumentGraphStats, error) {
+// GetDocumentGraphTotalsForKB 返回目标 KB 的文档图谱统计（与 getDocumentGraphTotals
+// 同口径，但所有计数追加 kb_id 条件）。文档删除/清空的 verify_before/verify_after
+// 差值校验必须使用本方法，避免把其他 KB 的图谱规模计入 delta（M4 FIX #5）。
+func (s *Service) GetDocumentGraphTotalsForKB(ctx context.Context, kbID string) (DocumentGraphStats, error) {
+	kbID = strings.TrimSpace(kbID)
+	if kbID == "" {
+		return DocumentGraphStats{}, fmt.Errorf("kb id is empty")
+	}
+	session, err := s.newSession(ctx)
+	if err != nil {
+		return DocumentGraphStats{}, err
+	}
+	defer func() { _ = session.Close(ctx) }()
+
+	return s.getDocumentGraphTotalsForKB(ctx, session, kbID)
+}
+
+// PreviewDeleteDocumentGraph 预览删除单个文档的图谱投影。
+// M3：doc_id 与 kb_id 双条件，跨 KB 的 doc_id 不可见也不可删。
+func (s *Service) PreviewDeleteDocumentGraph(ctx context.Context, docID string, kbID string) (DocumentGraphStats, error) {
 	docID = strings.TrimSpace(docID)
-	if docID == "" {
-		return DocumentGraphStats{}, fmt.Errorf("doc id is empty")
+	kbID = strings.TrimSpace(kbID)
+	if docID == "" || kbID == "" {
+		return DocumentGraphStats{}, fmt.Errorf("doc id and kb id are required")
 	}
 
 	session, err := s.newSession(ctx)
@@ -284,15 +309,15 @@ func (s *Service) PreviewDeleteDocumentGraph(ctx context.Context, docID string) 
 	}
 	defer func() { _ = session.Close(ctx) }()
 
-	relations, err := s.countDocumentRelationsForDoc(ctx, session, docID)
+	relations, err := s.countDocumentRelationsForDoc(ctx, session, docID, kbID)
 	if err != nil {
 		return DocumentGraphStats{}, err
 	}
-	chunks, err := scalarCount(ctx, session, "MATCH (c:Chunk {doc_id: $doc_id}) RETURN count(c) AS c", map[string]any{"doc_id": docID}, "documents.previewDelete.chunks")
+	chunks, err := scalarCount(ctx, session, "MATCH (c:Chunk {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(c) AS c", map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.previewDelete.chunks")
 	if err != nil {
 		return DocumentGraphStats{}, err
 	}
-	documents, err := scalarCount(ctx, session, "MATCH (d:Document {doc_id: $doc_id}) RETURN count(d) AS c", map[string]any{"doc_id": docID}, "documents.previewDelete.documents")
+	documents, err := scalarCount(ctx, session, "MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(d) AS c", map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.previewDelete.documents")
 	if err != nil {
 		return DocumentGraphStats{}, err
 	}
@@ -305,10 +330,13 @@ func (s *Service) PreviewDeleteDocumentGraph(ctx context.Context, docID string) 
 	}, nil
 }
 
-func (s *Service) DeleteDocumentGraph(ctx context.Context, docID string) (DocumentGraphStats, error) {
+// DeleteDocumentGraph 删除单个文档的图谱投影（Document/Chunk/关系/孤儿实体）。
+// M3：全部 MATCH/DELETE 增加 kb_id 条件，防止 doc_id 碰撞跨 KB 误删。
+func (s *Service) DeleteDocumentGraph(ctx context.Context, docID string, kbID string) (DocumentGraphStats, error) {
 	docID = strings.TrimSpace(docID)
-	if docID == "" {
-		return DocumentGraphStats{}, fmt.Errorf("doc id is empty")
+	kbID = strings.TrimSpace(kbID)
+	if docID == "" || kbID == "" {
+		return DocumentGraphStats{}, fmt.Errorf("doc id and kb id are required")
 	}
 
 	session, err := s.newSession(ctx)
@@ -319,24 +347,24 @@ func (s *Service) DeleteDocumentGraph(ctx context.Context, docID string) (Docume
 
 	statsAny, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		relations, err := scalarCountTx(ctx, tx, `
-MATCH (:Document {doc_id: $doc_id})-[r:HAS_CHUNK]->(:Chunk)
+MATCH (:Document {doc_id: $doc_id, kb_id: $kb_id})-[r:HAS_CHUNK]->(:Chunk)
 RETURN count(r) AS c
-`, map[string]any{"doc_id": docID}, "documents.delete.relations.hasChunk")
+`, map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.delete.relations.hasChunk")
 		if err != nil {
 			return nil, err
 		}
 		mentions, err := scalarCountTx(ctx, tx, `
-MATCH (:Chunk {doc_id: $doc_id})-[r:MENTIONS]->(:Entity)
+MATCH (:Chunk {doc_id: $doc_id, kb_id: $kb_id})-[r:MENTIONS]->(:Entity)
 RETURN count(r) AS c
-`, map[string]any{"doc_id": docID}, "documents.delete.relations.mentions")
+`, map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.delete.relations.mentions")
 		if err != nil {
 			return nil, err
 		}
 		entityRelations, err := scalarCountTx(ctx, tx, `
 MATCH (:Entity)-[r]->(:Entity)
-WHERE r.doc_id = $doc_id
+WHERE r.doc_id = $doc_id AND r.kb_id = $kb_id
 RETURN count(r) AS c
-`, map[string]any{"doc_id": docID}, "documents.delete.relations.entities")
+`, map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.delete.relations.entities")
 		if err != nil {
 			return nil, err
 		}
@@ -345,34 +373,34 @@ RETURN count(r) AS c
 		if relations > 0 {
 			if _, err := tx.Run(ctx, `
 MATCH (:Entity)-[r]->(:Entity)
-WHERE r.doc_id = $doc_id
+WHERE r.doc_id = $doc_id AND r.kb_id = $kb_id
 DELETE r
-`, map[string]any{"doc_id": docID}); err != nil {
+`, map[string]any{"doc_id": docID, "kb_id": kbID}); err != nil {
 				return nil, err
 			}
 		}
 
-		chunks, err := scalarCountTx(ctx, tx, "MATCH (c:Chunk {doc_id: $doc_id}) RETURN count(c) AS c", map[string]any{"doc_id": docID}, "documents.delete.chunks")
+		chunks, err := scalarCountTx(ctx, tx, "MATCH (c:Chunk {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(c) AS c", map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.delete.chunks")
 		if err != nil {
 			return nil, err
 		}
 		if chunks > 0 {
-			if _, err := tx.Run(ctx, "MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c", map[string]any{"doc_id": docID}); err != nil {
+			if _, err := tx.Run(ctx, "MATCH (c:Chunk {doc_id: $doc_id, kb_id: $kb_id}) DETACH DELETE c", map[string]any{"doc_id": docID, "kb_id": kbID}); err != nil {
 				return nil, err
 			}
 		}
 
-		documents, err := scalarCountTx(ctx, tx, "MATCH (d:Document {doc_id: $doc_id}) RETURN count(d) AS c", map[string]any{"doc_id": docID}, "documents.delete.documents")
+		documents, err := scalarCountTx(ctx, tx, "MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id}) RETURN count(d) AS c", map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.delete.documents")
 		if err != nil {
 			return nil, err
 		}
 		if documents > 0 {
-			if _, err := tx.Run(ctx, "MATCH (d:Document {doc_id: $doc_id}) DETACH DELETE d", map[string]any{"doc_id": docID}); err != nil {
+			if _, err := tx.Run(ctx, "MATCH (d:Document {doc_id: $doc_id, kb_id: $kb_id}) DETACH DELETE d", map[string]any{"doc_id": docID, "kb_id": kbID}); err != nil {
 				return nil, err
 			}
 		}
 
-		orphanEntities, err := cleanupOrphanEntitiesTx(ctx, tx)
+		orphanEntities, err := cleanupOrphanEntitiesTx(ctx, tx, kbID)
 		if err != nil {
 			return nil, err
 		}
@@ -391,14 +419,19 @@ DELETE r
 	return stats, nil
 }
 
-func (s *Service) PreviewClearDocumentGraph(ctx context.Context) (DocumentGraphStats, error) {
+// PreviewClearDocumentGraph 预览清空目标 KB 的图谱投影（scope 内统计）。
+func (s *Service) PreviewClearDocumentGraph(ctx context.Context, kbID string) (DocumentGraphStats, error) {
+	kbID = strings.TrimSpace(kbID)
+	if kbID == "" {
+		return DocumentGraphStats{}, fmt.Errorf("kb id is empty")
+	}
 	session, err := s.newSession(ctx)
 	if err != nil {
 		return DocumentGraphStats{}, err
 	}
 	defer func() { _ = session.Close(ctx) }()
 
-	totals, err := s.getDocumentGraphTotals(ctx, session)
+	totals, err := s.getDocumentGraphTotalsForKB(ctx, session, kbID)
 	if err != nil {
 		return DocumentGraphStats{}, err
 	}
@@ -406,34 +439,41 @@ func (s *Service) PreviewClearDocumentGraph(ctx context.Context) (DocumentGraphS
 	return totals, nil
 }
 
-func (s *Service) ClearDocumentGraph(ctx context.Context) (DocumentGraphStats, error) {
+// ClearDocumentGraph 清空目标 KB 的图谱投影，保留 source='document_ingest' 守卫，
+// 所有语句追加 kb_id 条件；孤儿实体清理同样限定在该 KB 内。
+func (s *Service) ClearDocumentGraph(ctx context.Context, kbID string) (DocumentGraphStats, error) {
+	kbID = strings.TrimSpace(kbID)
+	if kbID == "" {
+		return DocumentGraphStats{}, fmt.Errorf("kb id is empty")
+	}
 	session, err := s.newSession(ctx)
 	if err != nil {
 		return DocumentGraphStats{}, err
 	}
 	defer func() { _ = session.Close(ctx) }()
 
+	params := map[string]any{"kb_id": kbID}
 	statsAny, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
 		relations, err := scalarCountTx(ctx, tx, `
-MATCH (:Document {source: 'document_ingest'})-[r:HAS_CHUNK]->(:Chunk)
+MATCH (d:Document {source: 'document_ingest', kb_id: $kb_id})-[r:HAS_CHUNK]->(:Chunk)
 RETURN count(r) AS c
-`, nil, "documents.clear.relations.hasChunk")
+`, params, "documents.clear.relations.hasChunk")
 		if err != nil {
 			return nil, err
 		}
 		mentions, err := scalarCountTx(ctx, tx, `
 MATCH (c:Chunk)-[r:MENTIONS]->(:Entity)
-WHERE c.source = 'document_ingest' OR c.doc_id IS NOT NULL
+WHERE c.kb_id = $kb_id AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
 RETURN count(r) AS c
-`, nil, "documents.clear.relations.mentions")
+`, params, "documents.clear.relations.mentions")
 		if err != nil {
 			return nil, err
 		}
 		entityRelations, err := scalarCountTx(ctx, tx, `
 MATCH (:Entity)-[r]->(:Entity)
-WHERE r.source = 'document_ingest' OR r.doc_id IS NOT NULL
+WHERE r.kb_id = $kb_id AND (r.source = 'document_ingest' OR r.doc_id IS NOT NULL)
 RETURN count(r) AS c
-`, nil, "documents.clear.relations.entities")
+`, params, "documents.clear.relations.entities")
 		if err != nil {
 			return nil, err
 		}
@@ -442,48 +482,48 @@ RETURN count(r) AS c
 		if relations > 0 {
 			if _, err := tx.Run(ctx, `
 MATCH (:Entity)-[r]->(:Entity)
-WHERE r.source = 'document_ingest' OR r.doc_id IS NOT NULL
+WHERE r.kb_id = $kb_id AND (r.source = 'document_ingest' OR r.doc_id IS NOT NULL)
 DELETE r
-`, nil); err != nil {
+`, params); err != nil {
 				return nil, err
 			}
 		}
 
 		chunks, err := scalarCountTx(ctx, tx, `
 MATCH (c:Chunk)
-WHERE c.source = 'document_ingest' OR c.doc_id IS NOT NULL
+WHERE c.kb_id = $kb_id AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
 RETURN count(c) AS c
-`, nil, "documents.clear.chunks")
+`, params, "documents.clear.chunks")
 		if err != nil {
 			return nil, err
 		}
 		if chunks > 0 {
 			if _, err := tx.Run(ctx, `
 MATCH (c:Chunk)
-WHERE c.source = 'document_ingest' OR c.doc_id IS NOT NULL
+WHERE c.kb_id = $kb_id AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
 DETACH DELETE c
-`, nil); err != nil {
+`, params); err != nil {
 				return nil, err
 			}
 		}
 
 		documents, err := scalarCountTx(ctx, tx, `
-MATCH (d:Document {source: 'document_ingest'})
+MATCH (d:Document {source: 'document_ingest', kb_id: $kb_id})
 RETURN count(d) AS c
-`, nil, "documents.clear.documents")
+`, params, "documents.clear.documents")
 		if err != nil {
 			return nil, err
 		}
 		if documents > 0 {
 			if _, err := tx.Run(ctx, `
-MATCH (d:Document {source: 'document_ingest'})
+MATCH (d:Document {source: 'document_ingest', kb_id: $kb_id})
 DETACH DELETE d
-`, nil); err != nil {
+`, params); err != nil {
 				return nil, err
 			}
 		}
 
-		orphanEntities, err := cleanupOrphanEntitiesTx(ctx, tx)
+		orphanEntities, err := cleanupOrphanEntitiesTx(ctx, tx, kbID)
 		if err != nil {
 			return nil, err
 		}
@@ -559,7 +599,25 @@ func (s *Service) ExecuteQuery(ctx context.Context, cypher string, parameters ma
 	}, nil
 }
 
-func (s *Service) DiscoverSchema(ctx context.Context) (GraphSchemaResponse, error) {
+// requireScopedKBID 归一化并强制 KB 作用域（契约 §3.1/§10.3）。
+func requireScopedKBID(kbID string) (string, error) {
+	normalized, scopeErr := scope.NormalizeScopeID("kb_id", kbID)
+	if scopeErr != nil {
+		return "", scopeErr
+	}
+	if normalized == "" {
+		return "", ErrKBScopeRequired
+	}
+	return normalized, nil
+}
+
+func (s *Service) DiscoverSchema(ctx context.Context, kbID string) (GraphSchemaResponse, error) {
+	// M4-R1 FIX #3：schema 发现限定在单一 KB 作用域内，禁止全局目录返回。
+	scopedKBID, err := requireScopedKBID(kbID)
+	if err != nil {
+		return GraphSchemaResponse{}, err
+	}
+	params := map[string]any{"kb_id": scopedKBID}
 	start := time.Now()
 	session, err := s.newSession(ctx)
 	if err != nil {
@@ -567,27 +625,27 @@ func (s *Service) DiscoverSchema(ctx context.Context) (GraphSchemaResponse, erro
 	}
 	defer func() { _ = session.Close(ctx) }()
 
-	labels, err := s.discoverLabels(ctx, session)
+	labels, err := s.discoverLabels(ctx, session, params)
 	if err != nil && s.logger != nil {
 		s.logger.Warn("schema label discovery failed", "error", err.Error())
 	}
-	relationships, err := s.discoverRelationships(ctx, session)
+	relationships, err := s.discoverRelationships(ctx, session, params)
 	if err != nil && s.logger != nil {
 		s.logger.Warn("schema relationship discovery failed", "error", err.Error())
 	}
-	patterns, err := s.discoverPatterns(ctx, session)
+	patterns, err := s.discoverPatterns(ctx, session, params)
 	if err != nil && s.logger != nil {
 		s.logger.Warn("schema pattern discovery failed", "error", err.Error())
 	}
-	nodeProperties, err := s.discoverNodeProperties(ctx, session)
+	nodeProperties, err := s.discoverNodeProperties(ctx, session, params)
 	if err != nil && s.logger != nil {
 		s.logger.Warn("schema node property discovery failed", "error", err.Error())
 	}
-	relProperties, err := s.discoverRelProperties(ctx, session)
+	relProperties, err := s.discoverRelProperties(ctx, session, params)
 	if err != nil && s.logger != nil {
 		s.logger.Warn("schema relationship property discovery failed", "error", err.Error())
 	}
-	nodeCount, edgeCount, err := s.discoverCounts(ctx, session)
+	nodeCount, edgeCount, err := s.discoverCounts(ctx, session, params)
 	if err != nil && s.logger != nil {
 		s.logger.Warn("schema count discovery failed", "error", err.Error())
 	}
@@ -644,26 +702,93 @@ RETURN count(e) AS c
 	}, nil
 }
 
-func (s *Service) countDocumentRelationsForDoc(ctx context.Context, session neo4j.SessionWithContext, docID string) (int64, error) {
+func (s *Service) countDocumentRelationsForDoc(ctx context.Context, session neo4j.SessionWithContext, docID string, kbID string) (int64, error) {
 	hasChunk, err := scalarCount(ctx, session, `
-MATCH (:Document {doc_id: $doc_id})-[r:HAS_CHUNK]->(:Chunk)
+MATCH (:Document {doc_id: $doc_id, kb_id: $kb_id})-[r:HAS_CHUNK]->(:Chunk)
 RETURN count(r) AS c
-`, map[string]any{"doc_id": docID}, "documents.countRelationsForDoc.hasChunk")
+`, map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.countRelationsForDoc.hasChunk")
 	if err != nil {
 		return 0, err
 	}
 	mentions, err := scalarCount(ctx, session, `
-MATCH (:Chunk {doc_id: $doc_id})-[r:MENTIONS]->(:Entity)
+MATCH (:Chunk {doc_id: $doc_id, kb_id: $kb_id})-[r:MENTIONS]->(:Entity)
 RETURN count(r) AS c
-`, map[string]any{"doc_id": docID}, "documents.countRelationsForDoc.mentions")
+`, map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.countRelationsForDoc.mentions")
 	if err != nil {
 		return 0, err
 	}
 	entityRelations, err := scalarCount(ctx, session, `
 MATCH (:Entity)-[r]->(:Entity)
-WHERE r.doc_id = $doc_id
+WHERE r.doc_id = $doc_id AND r.kb_id = $kb_id
 RETURN count(r) AS c
-`, map[string]any{"doc_id": docID}, "documents.countRelationsForDoc.entities")
+`, map[string]any{"doc_id": docID, "kb_id": kbID}, "documents.countRelationsForDoc.entities")
+	if err != nil {
+		return 0, err
+	}
+	return hasChunk + mentions + entityRelations, nil
+}
+
+// getDocumentGraphTotalsForKB 与 getDocumentGraphTotals 相同口径，但限定在目标 KB
+// （PreviewClearDocumentGraph 的 scope 内统计使用）。
+func (s *Service) getDocumentGraphTotalsForKB(ctx context.Context, session neo4j.SessionWithContext, kbID string) (DocumentGraphStats, error) {
+	params := map[string]any{"kb_id": kbID}
+	relations, err := s.countDocumentRelationsForKB(ctx, session, kbID)
+	if err != nil {
+		return DocumentGraphStats{}, err
+	}
+	chunks, err := scalarCount(ctx, session, `
+MATCH (c:Chunk)
+WHERE c.kb_id = $kb_id AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
+RETURN count(c) AS c
+`, params, "documents.totalsKB.chunks")
+	if err != nil {
+		return DocumentGraphStats{}, err
+	}
+	documents, err := scalarCount(ctx, session, `
+MATCH (d:Document {source: 'document_ingest', kb_id: $kb_id})
+RETURN count(d) AS c
+`, params, "documents.totalsKB.documents")
+	if err != nil {
+		return DocumentGraphStats{}, err
+	}
+	entities, err := scalarCount(ctx, session, `
+MATCH (e:Entity {source: 'document_ingest', kb_id: $kb_id})
+RETURN count(e) AS c
+`, params, "documents.totalsKB.entities")
+	if err != nil {
+		return DocumentGraphStats{}, err
+	}
+
+	return DocumentGraphStats{
+		Documents: documents,
+		Chunks:    chunks,
+		Relations: relations,
+		Entities:  entities,
+	}, nil
+}
+
+func (s *Service) countDocumentRelationsForKB(ctx context.Context, session neo4j.SessionWithContext, kbID string) (int64, error) {
+	params := map[string]any{"kb_id": kbID}
+	hasChunk, err := scalarCount(ctx, session, `
+MATCH (d:Document {source: 'document_ingest', kb_id: $kb_id})-[r:HAS_CHUNK]->(:Chunk)
+RETURN count(r) AS c
+`, params, "documents.countRelationsKB.hasChunk")
+	if err != nil {
+		return 0, err
+	}
+	mentions, err := scalarCount(ctx, session, `
+MATCH (c:Chunk)-[r:MENTIONS]->(:Entity)
+WHERE c.kb_id = $kb_id AND (c.source = 'document_ingest' OR c.doc_id IS NOT NULL)
+RETURN count(r) AS c
+`, params, "documents.countRelationsKB.mentions")
+	if err != nil {
+		return 0, err
+	}
+	entityRelations, err := scalarCount(ctx, session, `
+MATCH (:Entity)-[r]->(:Entity)
+WHERE r.kb_id = $kb_id AND (r.source = 'document_ingest' OR r.doc_id IS NOT NULL)
+RETURN count(r) AS c
+`, params, "documents.countRelationsKB.entities")
 	if err != nil {
 		return 0, err
 	}
@@ -756,12 +881,13 @@ func scalarCountTx(
 	return int64FromRecord(record, "c"), nil
 }
 
-func cleanupOrphanEntitiesTx(ctx context.Context, tx neo4j.ManagedTransaction) (int64, error) {
+func cleanupOrphanEntitiesTx(ctx context.Context, tx neo4j.ManagedTransaction, kbID string) (int64, error) {
+	params := map[string]any{"kb_id": kbID}
 	count, err := scalarCountTx(ctx, tx, `
-MATCH (e:Entity {source: 'document_ingest'})
+MATCH (e:Entity {source: 'document_ingest', kb_id: $kb_id})
 WHERE NOT (e)--()
 RETURN count(e) AS c
-`, nil, "documents.cleanupOrphanEntities.preview")
+`, params, "documents.cleanupOrphanEntities.preview")
 	if err != nil {
 		return 0, err
 	}
@@ -769,22 +895,26 @@ RETURN count(e) AS c
 		return 0, nil
 	}
 	if _, err := tx.Run(ctx, `
-MATCH (e:Entity {source: 'document_ingest'})
+MATCH (e:Entity {source: 'document_ingest', kb_id: $kb_id})
 WHERE NOT (e)--()
 DELETE e
-`, nil); err != nil {
+`, params); err != nil {
 		return 0, err
 	}
 	return count, nil
 }
 
-func (s *Service) discoverLabels(ctx context.Context, session neo4j.SessionWithContext) ([]GraphLabelSummary, error) {
+func (s *Service) discoverLabels(ctx context.Context, session neo4j.SessionWithContext, params map[string]any) ([]GraphLabelSummary, error) {
+	// M4-R1 FIX #3：不再使用全局目录 CALL db.labels()，改为按 kb_id 反查该 KB 实际存在的标签。
 	result, err := session.Run(ctx, `
-CALL db.labels() YIELD label
-RETURN label, 0 AS count
+MATCH (n)
+WHERE n.kb_id = $kb_id
+WITH n LIMIT 1000
+UNWIND labels(n) AS label
+RETURN label, count(*) AS count
 ORDER BY label ASC
 LIMIT 50
-`, nil, schemaTxOptions("schema.labels")...)
+`, params, schemaTxOptions("schema.labels")...)
 	if err != nil {
 		return nil, err
 	}
@@ -799,13 +929,16 @@ LIMIT 50
 	return items, result.Err()
 }
 
-func (s *Service) discoverRelationships(ctx context.Context, session neo4j.SessionWithContext) ([]GraphRelationshipSummary, error) {
+func (s *Service) discoverRelationships(ctx context.Context, session neo4j.SessionWithContext, params map[string]any) ([]GraphRelationshipSummary, error) {
+	// M4-R1 FIX #3：不再使用全局目录 CALL db.relationshipTypes()，改为按 kb_id 反查该 KB 实际存在的关系类型。
 	result, err := session.Run(ctx, `
-CALL db.relationshipTypes() YIELD relationshipType
-RETURN relationshipType AS type, 0 AS count
-ORDER BY relationshipType ASC
+MATCH (a)-[r]->(b)
+WHERE a.kb_id = $kb_id
+WITH r LIMIT 1000
+RETURN type(r) AS type, count(*) AS count
+ORDER BY type ASC
 LIMIT 50
-`, nil, schemaTxOptions("schema.relationshipTypes")...)
+`, params, schemaTxOptions("schema.relationshipTypes")...)
 	if err != nil {
 		return nil, err
 	}
@@ -820,15 +953,16 @@ LIMIT 50
 	return items, result.Err()
 }
 
-func (s *Service) discoverPatterns(ctx context.Context, session neo4j.SessionWithContext) ([]GraphPatternSummary, error) {
+func (s *Service) discoverPatterns(ctx context.Context, session neo4j.SessionWithContext, params map[string]any) ([]GraphPatternSummary, error) {
 	result, err := session.Run(ctx, `
 MATCH (a)
+WHERE a.kb_id = $kb_id
 WITH a LIMIT 200
 MATCH (a)-[r]->(b)
 RETURN labels(a) AS source_labels, type(r) AS relationship, labels(b) AS target_labels, count(*) AS count
 ORDER BY count DESC
 LIMIT 50
-`, nil, schemaTxOptions("schema.patterns")...)
+`, params, schemaTxOptions("schema.patterns")...)
 	if err != nil {
 		return nil, err
 	}
@@ -845,16 +979,17 @@ LIMIT 50
 	return items, result.Err()
 }
 
-func (s *Service) discoverNodeProperties(ctx context.Context, session neo4j.SessionWithContext) ([]GraphPropertySummary, error) {
+func (s *Service) discoverNodeProperties(ctx context.Context, session neo4j.SessionWithContext, params map[string]any) ([]GraphPropertySummary, error) {
 	result, err := session.Run(ctx, `
 MATCH (n)
+WHERE n.kb_id = $kb_id
 WITH n LIMIT 200
 UNWIND labels(n) AS label
 UNWIND keys(n) AS key
 RETURN label, key, count(*) AS count
 ORDER BY count DESC
 LIMIT 100
-`, nil, schemaTxOptions("schema.nodeProperties")...)
+`, params, schemaTxOptions("schema.nodeProperties")...)
 	if err != nil {
 		return nil, err
 	}
@@ -870,16 +1005,17 @@ LIMIT 100
 	return items, result.Err()
 }
 
-func (s *Service) discoverRelProperties(ctx context.Context, session neo4j.SessionWithContext) ([]GraphPropertySummary, error) {
+func (s *Service) discoverRelProperties(ctx context.Context, session neo4j.SessionWithContext, params map[string]any) ([]GraphPropertySummary, error) {
 	result, err := session.Run(ctx, `
 MATCH (a)
+WHERE a.kb_id = $kb_id
 WITH a LIMIT 200
 MATCH (a)-[r]->()
 UNWIND keys(r) AS key
 RETURN type(r) AS type, key, count(*) AS count
 ORDER BY count DESC
 LIMIT 100
-`, nil, schemaTxOptions("schema.relProperties")...)
+`, params, schemaTxOptions("schema.relProperties")...)
 	if err != nil {
 		return nil, err
 	}
@@ -895,13 +1031,14 @@ LIMIT 100
 	return items, result.Err()
 }
 
-func (s *Service) discoverCounts(ctx context.Context, session neo4j.SessionWithContext) (int64, int64, error) {
+func (s *Service) discoverCounts(ctx context.Context, session neo4j.SessionWithContext, params map[string]any) (int64, int64, error) {
 	result, err := session.Run(ctx, `
 MATCH (n)
+WHERE n.kb_id = $kb_id
 WITH n LIMIT 1000
 OPTIONAL MATCH (n)-[r]-()
 RETURN count(DISTINCT n) AS node_count, count(DISTINCT r) AS edge_count
-`, nil, schemaTxOptions("schema.countSample")...)
+`, params, schemaTxOptions("schema.countSample")...)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -922,6 +1059,11 @@ func (s *Service) ExpandNode(ctx context.Context, req ExpandRequest) (QueryRespo
 	nodeID := strings.TrimSpace(req.NodeID)
 	if nodeID == "" {
 		return QueryResponse{}, fmt.Errorf("node id is empty")
+	}
+	// M4-R1 FIX #3：扩展查询强制 KB 作用域，禁止跨 KB 逆邻域泄漏。
+	scopedKBID, err := requireScopedKBID(req.KBID)
+	if err != nil {
+		return QueryResponse{}, err
 	}
 	direction := strings.ToLower(strings.TrimSpace(req.Direction))
 	if direction == "" {
@@ -955,12 +1097,13 @@ func (s *Service) ExpandNode(ctx context.Context, req ExpandRequest) (QueryRespo
 		relTypes = append(relTypes, v)
 	}
 
-	parsedInt, err := strconv.ParseInt(nodeID, 10, 64)
-	hasIntID := err == nil
+	parsedInt, parseErr := strconv.ParseInt(nodeID, 10, 64)
+	hasIntID := parseErr == nil
 
 	cypher := fmt.Sprintf(`
 MATCH %s
 WHERE (elementId(n) = $node_id_str OR ($has_int_id AND id(n) = $node_id_int))
+  AND n.kb_id = $kb_id AND m.kb_id = $kb_id
   AND (size($rel_types) = 0 OR type(r) IN $rel_types)
 RETURN n, r, m
 LIMIT $limit
@@ -970,16 +1113,22 @@ LIMIT $limit
 		"node_id_str": nodeID,
 		"node_id_int": parsedInt,
 		"has_int_id":  hasIntID,
+		"kb_id":       scopedKBID,
 		"rel_types":   relTypes,
 		"limit":       limit,
 	}
 	return s.ExecuteQuery(ctx, cypher, params)
 }
 
-func (s *Service) GetNodeDetail(ctx context.Context, nodeID string) (NodeDetail, error) {
+func (s *Service) GetNodeDetail(ctx context.Context, nodeID string, kbID string) (NodeDetail, error) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
 		return NodeDetail{}, fmt.Errorf("node id is empty")
+	}
+	// M4-R1 FIX #3：节点详情强制 KB 作用域，跨 KB 访问命中不到节点。
+	scopedKBID, scopeErr := requireScopedKBID(kbID)
+	if scopeErr != nil {
+		return NodeDetail{}, scopeErr
 	}
 
 	parsedInt, err := strconv.ParseInt(nodeID, 10, 64)
@@ -993,13 +1142,15 @@ func (s *Service) GetNodeDetail(ctx context.Context, nodeID string) (NodeDetail,
 
 	result, err := session.Run(ctx, `
 MATCH (n)
-WHERE elementId(n) = $node_id_str OR ($has_int_id AND id(n) = $node_id_int)
+WHERE (elementId(n) = $node_id_str OR ($has_int_id AND id(n) = $node_id_int))
+  AND n.kb_id = $kb_id
 RETURN n
 LIMIT 1
 `, map[string]interface{}{
 		"node_id_str": nodeID,
 		"node_id_int": parsedInt,
 		"has_int_id":  hasIntID,
+		"kb_id":       scopedKBID,
 	})
 	if err != nil {
 		return NodeDetail{}, err

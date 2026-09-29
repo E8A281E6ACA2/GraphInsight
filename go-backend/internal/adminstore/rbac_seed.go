@@ -23,9 +23,15 @@ var systemRoleDescriptions = map[string]string{
 var permissionSeeds = []rbacPermissionSeed{
 	{Code: "graph:read", ResourceType: "graph", Action: "read", Description: "图谱查询与查看"},
 	{Code: "graph:build", ResourceType: "graph", Action: "build", Description: "图谱构建与重建"},
+	// M4 D1：原始 Cypher 收口为管理员诊断入口，/api/query 使用该权限码强制。
+	{Code: "graph:admin", ResourceType: "graph", Action: "admin", Description: "原始 Cypher 诊断查询（受限）"},
 	{Code: "kb:read", ResourceType: "kb", Action: "read", Description: "知识库读取"},
 	{Code: "kb:write", ResourceType: "kb", Action: "write", Description: "知识库写入"},
 	{Code: "kb:delete", ResourceType: "kb", Action: "delete", Description: "知识库删除"},
+	// 预留权限码（契约 §2.5）：仅注册进权限种子，不参与任何强制校验，也未授予任何角色。
+	{Code: "kb:review", ResourceType: "kb", Action: "review", Description: "知识库审核（预留）"},
+	{Code: "kb:manage", ResourceType: "kb", Action: "manage", Description: "知识库治理（预留）"},
+	{Code: "kb:publish", ResourceType: "kb", Action: "publish", Description: "知识库发布（预留）"},
 	{Code: "qa:ask", ResourceType: "qa", Action: "ask", Description: "文档问答"},
 	{Code: "nl2cypher:use", ResourceType: "nl2cypher", Action: "use", Description: "自然语言转 Cypher"},
 	{Code: "config:read", ResourceType: "config", Action: "read", Description: "配置读取"},
@@ -39,8 +45,10 @@ var permissionSeeds = []rbacPermissionSeed{
 }
 
 var rolePermissionSeeds = map[string][]string{
+	// graph:admin 授予 super_admin：首管理员 bootstrap 注册即绑定 super_admin（全局），
+	// 因此首个管理员天然获得原始 Cypher 诊断权限（与现有 seed grant 模式一致）。
 	"super_admin": {
-		"graph:read", "graph:build", "kb:read", "kb:write", "kb:delete", "qa:ask", "nl2cypher:use",
+		"graph:read", "graph:build", "graph:admin", "kb:read", "kb:write", "kb:delete", "qa:ask", "nl2cypher:use",
 		"config:read", "config:write", "logs:read", "logs:clean", "monitor:read", "user:manage",
 		"job:read", "job:manage",
 	},

@@ -10,6 +10,9 @@ type ExpandRequest struct {
 	Direction         string   `json:"direction,omitempty"`
 	RelationshipTypes []string `json:"relationshipTypes,omitempty"`
 	Limit             int      `json:"limit,omitempty"`
+	// KBID 是 M4-R1 FIX #3 的硬作用域：普通工作台图谱接口禁止无 KB 查询。
+	// 由 handler 从 header/query/body 归一化后注入，服务层空值直接拒绝。
+	KBID string `json:"kb_id,omitempty"`
 }
 
 type Node struct {

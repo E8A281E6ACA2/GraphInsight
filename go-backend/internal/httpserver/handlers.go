@@ -129,7 +129,9 @@ func registerRoutes(
 		WriteJSON(w, http.StatusOK, "服务正常", data)
 	}))
 
-	registerNativeGraphRoutes(mux, logger, graphSvc, graphInitErr, guard)
+	registerNativeGraphRoutes(mux, logger, graphSvc, graphInitErr, guard, asAdminLogStore(adminStore), asAdminKBStore(adminStore))
+	// M4-R1 步骤 3：业务面 KB 目录（workspace KB 选择器数据源，按 graph:read 授权集合返回 active KB）。
+	mux.HandleFunc(workspaceKnowledgeBasesRoute, buildWorkspaceKnowledgeBasesHandler(logger, guard, asWorkspaceKBStore(adminStore)))
 	registerOrchestratedBusinessRoutes(
 		mux,
 		cfg,
@@ -138,6 +140,8 @@ func registerRoutes(
 		asAdminJobStore(adminStore),
 		asAdminConfigStore(adminStore),
 		asAdminLogStore(adminStore),
+		asAdminKBStore(adminStore),
+		asAdminDocumentStore(adminStore),
 		proxyClient,
 		orchestratorClient,
 		orchestratorInitErr,
@@ -183,8 +187,12 @@ func registerNativeGraphRoutes(
 	graphSvc graphService,
 	graphInitErr error,
 	guard businessPermissionGuard,
+	logStore adminLogStore,
+	kbStore adminKBStore,
 ) {
-	mux.HandleFunc("/api/query", withRouteOwner("go-native", guard.wrap("graph:read", func(w http.ResponseWriter, r *http.Request) {
+	// M4 D1：原始 Cypher 收口为管理员诊断入口（graph:admin），每次原始查询都写审计
+	// （action=graph_raw_query，details 只记录 cypher 长度，不落原文）。
+	mux.HandleFunc("/api/query", withRouteOwner("go-native", guard.wrap("graph:admin", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			WriteJSON(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 			return
@@ -210,14 +218,15 @@ func registerNativeGraphRoutes(
 		}
 
 		resp, err := graphSvc.ExecuteQuery(r.Context(), req.Cypher, req.Parameters)
+		status := http.StatusOK
 		if err != nil {
 			status, body := graph.ClassifyQueryError(err)
 			logger.Warn("query failed", "status", status, "error", err.Error())
 			writeGraphError(w, status, body)
-			return
+		} else {
+			WriteJSON(w, http.StatusOK, "查询成功", resp)
 		}
-
-		WriteJSON(w, http.StatusOK, "查询成功", resp)
+		writeGraphRawQueryAudit(r, logStore, req.Cypher, len(req.Parameters), status, err)
 	})))
 
 	mux.HandleFunc("/api/graph/schema", withRouteOwner("go-native", guard.wrap("graph:read", func(w http.ResponseWriter, r *http.Request) {
@@ -235,7 +244,12 @@ func registerNativeGraphRoutes(
 			return
 		}
 
-		resp, err := graphSvc.DiscoverSchema(r.Context())
+		kbItem, ok := authorizeGraphKBReadScope(w, r, logger, guard, kbStore, "")
+		if !ok {
+			return
+		}
+
+		resp, err := graphSvc.DiscoverSchema(r.Context(), kbItem.ID)
 		if err != nil {
 			status, body := graph.ClassifyQueryError(err)
 			logger.Warn("schema discovery failed", "status", status, "error", err.Error())
@@ -271,6 +285,13 @@ func registerNativeGraphRoutes(
 			return
 		}
 
+		kbItem, ok := authorizeGraphKBReadScope(w, r, logger, guard, kbStore, req.KBID)
+		if !ok {
+			return
+		}
+		// 以 KB 行为权威作用域，避免 body 传入非规范化 kb_id 绕过下游 scope 校验。
+		req.KBID = kbItem.ID
+
 		resp, err := graphSvc.ExpandNode(r.Context(), req)
 		if err != nil {
 			status, body := graph.ClassifyQueryError(err)
@@ -298,7 +319,11 @@ func registerNativeGraphRoutes(
 		}
 
 		nodeID := strings.TrimPrefix(r.URL.Path, "/api/node/")
-		resp, err := graphSvc.GetNodeDetail(r.Context(), nodeID)
+		kbItem, ok := authorizeGraphKBReadScope(w, r, logger, guard, kbStore, "")
+		if !ok {
+			return
+		}
+		resp, err := graphSvc.GetNodeDetail(r.Context(), nodeID, kbItem.ID)
 		if err != nil {
 			if errors.Is(err, graph.ErrNodeNotFound) {
 				writeGraphError(w, http.StatusNotFound, map[string]interface{}{
@@ -318,6 +343,55 @@ func registerNativeGraphRoutes(
 	})))
 }
 
+// writeGraphRawQueryAudit 对 /api/query 的每次原始 Cypher 执行写审计（M4 D1）。
+// details 只记录 cypher 长度与参数个数，绝不落原始 cypher 文本（可能含敏感内容）。
+func writeGraphRawQueryAudit(
+	r *http.Request,
+	logStore adminLogStore,
+	cypher string,
+	parameterCount int,
+	status int,
+	queryErr error,
+) {
+	if logStore == nil {
+		return
+	}
+	scopeHeaders := resolveScopeHeaders(r)
+	auditStatus := "success"
+	errorMessage := (*string)(nil)
+	if queryErr != nil {
+		auditStatus = "failed"
+		errorMessage = optionalAuditMessage("query_execution_failed")
+	}
+	traceID := optionalStringHeader(r, traceHeader)
+	resourceID := (*string)(nil)
+	if traceID != nil && strings.TrimSpace(*traceID) != "" {
+		resourceID = traceID
+	}
+	if err := logStore.RecordBusinessAudit(r.Context(), adminstore.BusinessAuditRequest{
+		OperatorID: optionalIntHeader(r, "x-auth-user-id"),
+		TenantID:   scopeStringPtr(scopeHeaders["x-tenant-id"]),
+		ProjectID:  scopeStringPtr(scopeHeaders["x-project-id"]),
+		KBID:       scopeStringPtr(scopeHeaders["x-kb-id"]),
+		TraceID:    traceID,
+		Action:     "graph_raw_query",
+		Resource:   "graph_query",
+		ResourceID: resourceID,
+		Details: map[string]interface{}{
+			"permission":      "graph:admin",
+			"cypher_length":   len([]rune(cypher)),
+			"parameter_count": parameterCount,
+			"http_status":     status,
+		},
+		IPAddress:    optionalString(firstRemoteAddr(r)),
+		UserAgent:    optionalString(r.UserAgent()),
+		Status:       auditStatus,
+		ErrorMessage: errorMessage,
+	}); err != nil {
+		// 审计为 best-effort，不改变查询响应。
+	}
+}
+
 func registerOrchestratedBusinessRoutes(
 	mux *http.ServeMux,
 	cfg config.Config,
@@ -326,6 +400,8 @@ func registerOrchestratedBusinessRoutes(
 	jobStore adminJobStore,
 	configStore adminConfigStore,
 	logStore adminLogStore,
+	kbStore adminKBStore,
+	docStore adminDocumentStore,
 	pythonWakeClient *proxy.Client,
 	orchestratorClient *orchestrator.Client,
 	orchestratorInitErr error,
@@ -334,16 +410,16 @@ func registerOrchestratedBusinessRoutes(
 	guard businessPermissionGuard,
 ) {
 	mux.HandleFunc("/api/docqa", guard.wrap("qa:ask", buildNativeDocQAHandler(
-		logger, orchestratorClient, orchestratorInitErr, orchestratorMetrics, logStore, configStore, cfg.OrchestratorSafeRetryDocQA,
+		logger, guard, orchestratorClient, orchestratorInitErr, orchestratorMetrics, logStore, configStore, cfg.OrchestratorSafeRetryDocQA,
 	)))
 	mux.HandleFunc("/api/docqa/deep-research", guard.wrap("qa:ask", buildNativeDeepResearchHandler(
-		logger, orchestratorClient, orchestratorInitErr, orchestratorMetrics, logStore, configStore, cfg.OrchestratorSafeRetryDocQA,
+		logger, guard, orchestratorClient, orchestratorInitErr, orchestratorMetrics, logStore, configStore, cfg.OrchestratorSafeRetryDocQA,
 	)))
 	mux.HandleFunc("/api/docqa/health", guard.wrap("monitor:read", buildNativeDocQAHealthHandler(
 		logger, orchestratorClient, orchestratorInitErr, orchestratorMetrics,
 	)))
 	mux.HandleFunc("/api/nl2cypher", guard.wrap("nl2cypher:use", buildNativeNL2CypherGenerateHandler(
-		logger, orchestratorClient, orchestratorInitErr, orchestratorMetrics, logStore,
+		logger, guard, orchestratorClient, orchestratorInitErr, orchestratorMetrics, logStore,
 	)))
 	mux.HandleFunc("/api/nl2cypher/examples", buildNativeNL2CypherExamplesHandler())
 	mux.HandleFunc("/api/nl2cypher/status", buildNativeNL2CypherStatusHandler(
@@ -355,13 +431,14 @@ func registerOrchestratedBusinessRoutes(
 		configStore,
 		pythonWakeClient,
 		idempotencyStore,
+		kbStore,
 	)))
-	documentsListHandler := buildNativeDocumentsListHandler(cfg, logger, guard)
-	documentsDeletedListHandler := buildNativeDeletedDocumentsListHandler(cfg, logger, guard)
-	documentsUploadHandler := buildNativeDocumentsUploadHandler(cfg, logger, guard)
-	documentDeleteNativeHandler := buildNativeDocumentDeleteHandler(cfg, logger, guard, graphSvc)
-	documentRestoreNativeHandler := buildNativeDocumentRestoreHandler(cfg, logger, guard)
-	documentsClearHandler := buildNativeDocumentsClearHandler(cfg, logger, guard, graphSvc)
+	documentsListHandler := buildNativeDocumentsListHandler(cfg, logger, guard, kbStore, docStore)
+	documentsDeletedListHandler := buildNativeDeletedDocumentsListHandler(cfg, logger, guard, kbStore)
+	documentsUploadHandler := buildNativeDocumentsUploadHandler(cfg, logger, guard, kbStore, docStore)
+	documentDeleteNativeHandler := buildNativeDocumentDeleteHandler(cfg, logger, guard, kbStore, docStore, graphSvc, orchestratorClient)
+	documentRestoreNativeHandler := buildNativeDocumentRestoreHandler(cfg, logger, guard, kbStore, docStore)
+	documentsClearHandler := buildNativeDocumentsClearHandler(cfg, logger, guard, kbStore, docStore, graphSvc)
 	mux.HandleFunc("/api/documents", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -494,12 +571,15 @@ func registerAdminControlPlaneRoutesWithContext(
 	mux.HandleFunc("/api/v1/admin/monitor/alerts/check", buildAdminMonitorAlertsCheckNativeHandler(logger, apiMetrics, guard, asAdminMonitorStore(adminStore)))
 	mux.HandleFunc("/api/v1/admin/monitor/health/simple", buildAdminMonitorSimpleHealthNativeHandler())
 
-	mux.HandleFunc("/api/v1/admin/jobs", buildAdminJobsHandler(logger, pythonWakeClient, guard, asAdminJobStore(adminStore), asAdminConfigStore(adminStore)))
-	mux.HandleFunc("/api/v1/admin/jobs/", buildAdminJobsHandler(logger, pythonWakeClient, guard, asAdminJobStore(adminStore), asAdminConfigStore(adminStore)))
+	mux.HandleFunc("/api/v1/admin/jobs", buildAdminJobsHandler(logger, pythonWakeClient, guard, asAdminJobStore(adminStore), asAdminConfigStore(adminStore), asAdminKBStore(adminStore)))
+	mux.HandleFunc("/api/v1/admin/jobs/", buildAdminJobsHandler(logger, pythonWakeClient, guard, asAdminJobStore(adminStore), asAdminConfigStore(adminStore), asAdminKBStore(adminStore)))
 
-	mux.HandleFunc("/api/v1/admin/qa-traces", buildAdminQATracesNativeHandler(logger, guard, asAdminQATraceStore(adminStore)))
-	mux.HandleFunc("/api/v1/admin/qa-traces/", buildAdminQATracesNativeHandler(logger, guard, asAdminQATraceStore(adminStore)))
-	mux.HandleFunc("/api/v1/admin/qa/retrieval-diagnostics", buildAdminRetrievalDiagnosticsHandler(logger, guard, pythonWakeClient))
+	mux.HandleFunc("/api/v1/admin/knowledge-bases", buildAdminKnowledgeBasesHandler(logger, guard, asAdminKBStore(adminStore), asAdminLogStore(adminStore)))
+	mux.HandleFunc("/api/v1/admin/knowledge-bases/", buildAdminKnowledgeBasesHandler(logger, guard, asAdminKBStore(adminStore), asAdminLogStore(adminStore)))
+
+	mux.HandleFunc("/api/v1/admin/qa-traces", buildAdminQATracesNativeHandler(logger, guard, asAdminQATraceStore(adminStore), asAdminKBStore(adminStore), asAdminLogStore(adminStore)))
+	mux.HandleFunc("/api/v1/admin/qa-traces/", buildAdminQATracesNativeHandler(logger, guard, asAdminQATraceStore(adminStore), asAdminKBStore(adminStore), asAdminLogStore(adminStore)))
+	mux.HandleFunc("/api/v1/admin/qa/retrieval-diagnostics", buildAdminRetrievalDiagnosticsHandler(logger, guard, pythonWakeClient, asAdminKBStore(adminStore), asAdminLogStore(adminStore)))
 
 	mux.HandleFunc("/api/v1/admin/config", buildAdminConfigHandler(cfg, logger, graphSvc, graphInitErr, guard, asAdminConfigStore(adminStore), modelConnectionSnapshots))
 	mux.HandleFunc("/api/v1/admin/config/", buildAdminConfigHandler(cfg, logger, graphSvc, graphInitErr, guard, asAdminConfigStore(adminStore), modelConnectionSnapshots))
@@ -534,9 +614,10 @@ func buildAdminJobsHandler(
 	guard businessPermissionGuard,
 	jobStore adminJobStore,
 	configStore adminConfigStore,
+	kbStore adminKBStore,
 ) http.HandlerFunc {
-	readHandler := buildAdminJobsReadNativeHandler(logger, guard, jobStore)
-	writeHandler := buildAdminJobsWriteNativeHandler(logger, guard, jobStore, configStore, pythonWakeClient)
+	readHandler := buildAdminJobsReadNativeHandler(logger, guard, jobStore, kbStore)
+	writeHandler := buildAdminJobsWriteNativeHandler(logger, guard, jobStore, configStore, pythonWakeClient, kbStore)
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/admin/jobs":
