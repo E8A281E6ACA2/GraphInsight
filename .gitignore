@@ -73,6 +73,8 @@ go-backend/documents/
 
 # Runtime/test artifacts
 artifacts/
+*.py8001.err
+*.py8001.out
 
 # Temporary files
 *.tmp
