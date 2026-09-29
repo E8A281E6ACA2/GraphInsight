@@ -83,6 +83,10 @@ export interface GroupingState {
 }
 
 interface GraphStore {
+  // 当前工作区激活的知识库（M4-R1 步骤 3：所有业务调用按此作用域发起）
+  activeKbId: string | null;
+  setActiveKbId: (id: string | null) => void;
+
   // 图数据
   graphData: GraphData | null;
   setGraphData: (data: GraphData) => void;
@@ -175,6 +179,7 @@ export const useGraphStore = create<GraphStore>()(
   persist(
     (set, get) => ({
       // 初始状态
+      activeKbId: null,
       graphData: null,
       selectedNodeId: null,
       queryHistory: [],
@@ -200,6 +205,15 @@ export const useGraphStore = create<GraphStore>()(
       preferredLayout: 'cose',
 
       // Actions
+      // 切换知识库时重置视图：清空图数据/选中节点/选中引用，避免跨库脏数据。
+      setActiveKbId: (id) =>
+        set({
+          activeKbId: id,
+          graphData: null,
+          selectedNodeId: null,
+          selectedCitation: null,
+        }),
+
       setGraphData: (data) => set({ graphData: data }),
 
       setSelectedNodeId: (id) => set({ selectedNodeId: id }),
@@ -391,8 +405,9 @@ export const useGraphStore = create<GraphStore>()(
     {
       name: 'graph-insight-storage', // localStorage key
       partialize: (state) => ({
-        // 只持久化主题偏好、查询历史、标签配置、样式配置和分组配置
+        // 只持久化主题偏好、激活知识库、查询历史、标签配置、样式配置和分组配置
         isDarkMode: state.isDarkMode,
+        activeKbId: state.activeKbId,
         queryHistory: state.queryHistory,
         nodeTypeStyles: state.nodeTypeStyles,
         activeFilters: state.activeFilters,

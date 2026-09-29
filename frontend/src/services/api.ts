@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { API_BASE_URL } from '../utils/apiBase';
+import { useGraphStore } from '../store/graphStore';
 
 // 创建 Axios 实例
 export const api = axios.create({
@@ -19,6 +20,13 @@ api.interceptors.request.use(
         : null;
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+    // M4-R1 步骤 3：已选择知识库时统一注入 X-KB-ID，覆盖所有 /api/* 业务调用
+    //（图谱 schema/节点、文档列表/上传/删除等）；未选择时不注入，由后端
+    // 返回 KB_SCOPE_REQUIRED，不降级为全局查询。
+    const activeKbId = useGraphStore.getState().activeKbId;
+    if (activeKbId) {
+      config.headers['X-KB-ID'] = activeKbId;
     }
     return config;
   },

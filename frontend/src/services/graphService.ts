@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { api } from './api';
+import { requireActiveKbId } from './kbScope';
 import type { QueryRequest, QueryResponse, ExpandRequest, NodeDetailResponse, GraphSchemaSummary } from '../types/api';
 import type { GraphData } from '../store/graphStore';
 
@@ -137,11 +138,14 @@ export async function expandNode(
   limit: number = 20
 ): Promise<GraphData> {
   try {
+    // 展开在 body 显式携带 kb_id（与拦截器注入的 X-KB-ID 头一致）；未选择知识库时本地拦截。
+    const kbId = requireActiveKbId();
     const request: ExpandRequest = {
       nodeId,
       direction,
       relationshipTypes,
       limit,
+      kb_id: kbId,
     };
     const response = await api.post<QueryResponse | ApiEnvelope<QueryResponse>>('/api/expand', request);
     const data = unwrapApiData(response.data);

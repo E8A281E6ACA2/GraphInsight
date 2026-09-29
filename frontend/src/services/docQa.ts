@@ -1,4 +1,5 @@
 import { api } from './api';
+import { requireActiveKbId } from './kbScope';
 
 export interface DocQaCitation {
   id: string;
@@ -51,8 +52,11 @@ export async function askDocQa(
   reasoningProfile: ReasoningProfile = 'balanced',
   conversationHistory: DocQaConversationTurn[] = []
 ) {
+  // 问答必须显式携带 kb_id（与 X-KB-ID 头一致）；未选择知识库时本地拦截，不发请求。
+  const kbId = requireActiveKbId();
   const response = await api.post('/api/docqa', {
     question,
+    kb_id: kbId,
     top_k: topK,
     require_citation: true,
     reasoning_profile: reasoningProfile,
@@ -65,8 +69,11 @@ export async function askDocDeepResearch(
   question: string,
   options?: { topK?: number; maxSubQuestions?: number; reasoningProfile?: ReasoningProfile }
 ) {
+  // 深度研究同样必须显式携带 kb_id；未选择知识库时本地拦截。
+  const kbId = requireActiveKbId();
   const response = await api.post('/api/docqa/deep-research', {
     question,
+    kb_id: kbId,
     top_k: options?.topK ?? 8,
     max_sub_questions: options?.maxSubQuestions ?? 4,
     reasoning_profile: options?.reasoningProfile ?? 'deep',

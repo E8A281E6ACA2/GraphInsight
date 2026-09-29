@@ -21,6 +21,12 @@ const SCHEMA_CACHE_TTL_MS = 5000;
 let schemaCache: { value: GraphSchemaSummary; fetchedAt: number } | null = null;
 let schemaPromise: Promise<GraphSchemaSummary> | null = null;
 
+// 切换知识库后结构缓存必须作废（schema 是按 KB 作用域发现的）。
+function invalidateGraphSchemaCache() {
+  schemaCache = null;
+  schemaPromise = null;
+}
+
 function loadGraphSchemaOnce() {
   const now = Date.now();
   if (schemaCache && now - schemaCache.fetchedAt < SCHEMA_CACHE_TTL_MS) {
@@ -55,9 +61,15 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
 
   const isDarkMode = useGraphStore((state) => state.isDarkMode);
+  const activeKbId = useGraphStore((state) => state.activeKbId);
   const { execute, isExecuting, error, clearError } = useCypher();
 
   const handleExecute = async () => {
+    // 未选择知识库时不发起无作用域查询（后端会 KB_SCOPE_REQUIRED）。
+    if (!activeKbId) {
+      clearError();
+      return;
+    }
     await execute(query);
   };
 
@@ -77,6 +89,15 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
   };
 
   useEffect(() => {
+    // 门控：无 activeKbId 时不探测 schema（避发无作用域请求）；切库时作废缓存后重新探测。
+    if (!activeKbId) {
+      invalidateGraphSchemaCache();
+      setSchema(null);
+      setSchemaLoading(false);
+      setSchemaError(null);
+      return;
+    }
+    invalidateGraphSchemaCache();
     let cancelled = false;
 
     const loadSchema = async () => {
@@ -113,7 +134,7 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [activeKbId]);
 
   // 暴露方法给父组件
   useImperativeHandle(ref, () => ({
@@ -179,7 +200,13 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-      <SchemaSummary schema={schema} loading={schemaLoading} error={schemaError} />
+      {!activeKbId ? (
+        <Alert severity="info" sx={{ py: 0.5 }} data-testid="cypher-kb-required">
+          请先在右上角选择知识库，再探测图谱结构与执行查询。
+        </Alert>
+      ) : (
+        <SchemaSummary schema={schema} loading={schemaLoading} error={schemaError} />
+      )}
 
       {/* 编辑器 */}
       <Paper
@@ -232,7 +259,7 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
         startIcon={<ExecuteIcon />}
         loading={isExecuting}
         onClick={handleExecute}
-        disabled={isExecuting || !query.trim()}
+        disabled={isExecuting || !query.trim() || !activeKbId}
         fullWidth
         label="执行查询 (Ctrl+Enter)"
         loadingLabel="执行中..."

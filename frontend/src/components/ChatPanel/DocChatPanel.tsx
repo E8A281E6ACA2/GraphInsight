@@ -120,6 +120,7 @@ export function DocChatPanel() {
   const recentUploadedDocIds = useGraphStore((state) => state.recentUploadedDocIds);
   const setRecentUploadedDocIds = useGraphStore((state) => state.setRecentUploadedDocIds);
   const requestDocumentRefresh = useGraphStore((state) => state.requestDocumentRefresh);
+  const activeKbId = useGraphStore((state) => state.activeKbId);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
@@ -214,6 +215,19 @@ export function DocChatPanel() {
   const handleSend = async () => {
     const value = input.trim();
     if (!value || isTyping) return;
+    // 未选择知识库时不发起无作用域问答（后端会 KB_SCOPE_REQUIRED）。
+    if (!activeKbId) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `assistant-${Date.now()}`,
+          role: 'assistant',
+          content: '请先在右上角选择知识库，再发起文档问答。',
+          citations: [],
+        },
+      ]);
+      return;
+    }
 
     const userMessage: ChatMessage = {
       id: `user-${Date.now()}`,
@@ -267,6 +281,20 @@ export function DocChatPanel() {
   const handleDeepResearch = async () => {
     const value = input.trim();
     if (!value || isTyping) return;
+    // 未选择知识库时不发起无作用域深度调研。
+    if (!activeKbId) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `assistant-${Date.now()}`,
+          role: 'assistant',
+          content: '请先在右上角选择知识库，再发起深度调研。',
+          citations: [],
+          mode: 'deep_research',
+        },
+      ]);
+      return;
+    }
 
     const userMessage: ChatMessage = {
       id: `user-${Date.now()}`,

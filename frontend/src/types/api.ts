@@ -63,6 +63,8 @@ export interface ExpandRequest {
   direction?: 'in' | 'out' | 'both';
   relationshipTypes?: string[];
   limit?: number;
+  // M4-R1 步骤 3：图谱展开在 body 显式携带 kb_id（与 X-KB-ID 头一致，后端校验多来源一致）。
+  kb_id?: string;
 }
 
 export interface MediaResource {
@@ -88,4 +90,14 @@ export interface ApiError {
   code: string;
   message: string;
   details?: unknown;
+}
+
+// 业务面 KB 目录（GET /api/knowledge-bases，M4-R1 步骤 3）：
+// 当前用户按 graph:read 授权可访问的 active 知识库。
+export interface WorkspaceKnowledgeBase {
+  kb_id: string;
+  name: string;
+  tenant_id: string;
+  project_id: string;
+  status: string;
 }

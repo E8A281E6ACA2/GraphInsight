@@ -329,6 +329,9 @@ export interface QATraceItem {
   status: QATraceStatus;
   question: string;
   operator_id?: number;
+  tenant_id?: string;
+  project_id?: string;
+  kb_id?: string;
   model?: string;
   reasoning_profile?: 'fast' | 'balanced' | 'deep' | string;
   top_k?: number;
@@ -390,6 +393,7 @@ export interface QATraceQueryParams {
   trace_id?: string;
   operator_id?: number;
   keyword?: string;
+  kb_id?: string;
   page?: number;
   page_size?: number;
 }
@@ -787,29 +791,29 @@ export const ErrorCode = {
   UNKNOWN_ERROR: '1000',
   INVALID_REQUEST: '1001',
   NOT_FOUND: '1002',
-  
+
   // 认证错误 (2xxx)
   UNAUTHORIZED: '2001',
   TOKEN_EXPIRED: '2002',
   INVALID_TOKEN: '2003',
   INVALID_CREDENTIALS: '2004',
   USER_DISABLED: '2005',
-  
+
   // 业务错误 (3xxx)
   BUSINESS_ERROR: '3000',
   RESOURCE_NOT_FOUND: '3001',
   RESOURCE_ALREADY_EXISTS: '3002',
-  
+
   // 验证错误 (4xxx)
   VALIDATION_ERROR: '4001',
   MISSING_PARAMETER: '4002',
   INVALID_PARAMETER: '4003',
-  
+
   // 系统错误 (5xxx)
   INTERNAL_ERROR: '5000',
   DATABASE_ERROR: '5001',
   SERVICE_UNAVAILABLE: '5003',
-  
+
   // 限流错误 (6xxx)
   RATE_LIMIT_EXCEEDED: '6001',
 } as const;

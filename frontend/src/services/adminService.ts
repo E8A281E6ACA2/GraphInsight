@@ -939,17 +939,27 @@ export const jobsApi = {
     }
   },
 
-  async getJobById(jobId: number): Promise<JobItem> {
+  // M4-R1 审计：job detail/logs 后端按 KB 作用域强制（requireAdminJobKBScope），
+  // 必须携带 kb_id，否则返回 KB_SCOPE_REQUIRED。
+  async getJobById(jobId: number, kbId: string): Promise<JobItem> {
     try {
-      return await cachedGetData<JobItem>(`/api/v1/admin/jobs/${jobId}`);
+      return await cachedGetData<JobItem>(`/api/v1/admin/jobs/${jobId}`, {
+        params: { kb_id: kbId },
+      });
     } catch (error) {
       handleApiError(error);
     }
   },
 
-  async getJobLogs(jobId: number, params?: { page?: number; page_size?: number }): Promise<PaginatedData<JobLogItem>> {
+  async getJobLogs(
+    jobId: number,
+    kbId: string,
+    params?: { page?: number; page_size?: number },
+  ): Promise<PaginatedData<JobLogItem>> {
     try {
-      return await cachedGetData<PaginatedData<JobLogItem>>(`/api/v1/admin/jobs/${jobId}/logs`, { params });
+      return await cachedGetData<PaginatedData<JobLogItem>>(`/api/v1/admin/jobs/${jobId}/logs`, {
+        params: { ...params, kb_id: kbId },
+      });
     } catch (error) {
       handleApiError(error);
     }
@@ -987,9 +997,11 @@ export const qaTracesApi = {
     }
   },
 
-  async getTrace(traceIdOrPk: string | number): Promise<QATraceDetail> {
+  async getTrace(traceIdOrPk: string | number, kbId: string): Promise<QATraceDetail> {
     try {
-      return await cachedGetData<QATraceDetail>(`/api/v1/admin/qa-traces/${traceIdOrPk}`);
+      return await cachedGetData<QATraceDetail>(`/api/v1/admin/qa-traces/${traceIdOrPk}`, {
+        params: { kb_id: kbId },
+      });
     } catch (error) {
       handleApiError(error);
     }
@@ -998,6 +1010,7 @@ export const qaTracesApi = {
   async getCostSummary(params?: {
     qa_type?: QATraceType;
     status?: QATraceStatus;
+    kb_id?: string;
     window_hours?: number;
   }): Promise<QACostSummary> {
     try {
@@ -1009,6 +1022,7 @@ export const qaTracesApi = {
 
   async runRetrievalDiagnostics(payload: {
     question: string;
+    kb_id: string;
     top_k?: number;
     modes?: string[];
   }): Promise<RetrievalDiagnosticsResult> {

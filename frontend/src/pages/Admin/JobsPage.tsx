@@ -289,11 +289,18 @@ const JobsPage: React.FC = () => {
     }
   };
 
-  const openDetail = async (jobId: number) => {
+  const openDetail = async (job: JobItem) => {
     try {
       setError('');
-      const data = await jobsApi.getJobById(jobId);
-      const logs = await jobsApi.getJobLogs(jobId, { page: 1, page_size: 100 });
+      // M4-R1 审计：job detail/logs 必须携带 kb_id。优先用任务行归属，
+      // 回退到当前 KB 过滤；两者都缺失时无法定位作用域，不发起请求。
+      const scopedKbId = (job.kb_id || kbId).trim();
+      if (!scopedKbId) {
+        setError('缺少知识库归属，请先选择知识库后再查看任务详情');
+        return;
+      }
+      const data = await jobsApi.getJobById(job.id, scopedKbId);
+      const logs = await jobsApi.getJobLogs(job.id, scopedKbId, { page: 1, page_size: 100 });
       setSelectedJob(data);
       setJobLogs(logs.items || []);
       setDetailOpen(true);
@@ -486,7 +493,7 @@ const JobsPage: React.FC = () => {
                               <TableCell>{formatDate(item.finished_at)}</TableCell>
                               <TableCell align="right">
                                 <Stack direction="row" spacing={1} justifyContent="flex-end">
-                                  <Button size="small" onClick={() => void openDetail(item.id)}>
+                                  <Button size="small" onClick={() => void openDetail(item)}>
                                     详情
                                   </Button>
                                   <Button

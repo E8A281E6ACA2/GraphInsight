@@ -8,6 +8,7 @@ import {
 } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { useGraphStore } from '../../store/graphStore';
+import { KnowledgeBaseSelector } from '../Workspace/KnowledgeBaseSelector';
 import logoSvg from '../../assets/images/logo.svg';
 
 interface TopBarProps {
@@ -51,7 +52,9 @@ export function TopBar({ onExportClick }: TopBarProps) {
         </Box>
 
         {/* 操作按钮 */}
-        <Box sx={{ display: 'flex', gap: 1, flexShrink: 0 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0, minWidth: 0 }}>
+          {/* workspace 知识库选择器（M4-R1 步骤 3：所有业务调用按 activeKbId 作用域发起） */}
+          <KnowledgeBaseSelector />
           <Button
             variant="outlined"
             color="inherit"

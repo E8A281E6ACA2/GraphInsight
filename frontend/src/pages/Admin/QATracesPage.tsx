@@ -31,6 +31,8 @@ import AdminRefreshButton from '../../components/Admin/AdminRefreshButton';
 import AdminLoadingButton from '../../components/Admin/AdminLoadingButton';
 import { LoadingState } from '../../components/Loading/AppleSpinner';
 import { qaTracesApi } from '../../services/adminService';
+import { listWorkspaceKnowledgeBases } from '../../services/kbService';
+import type { WorkspaceKnowledgeBase } from '../../types/api';
 import type {
   QACostSummary,
   QACostModelBreakdown,
@@ -118,12 +120,33 @@ const QATracesPage: React.FC = () => {
   const [costSummary, setCostSummary] = useState<QACostSummary | null>(null);
   const [diagnostics, setDiagnostics] = useState<RetrievalDiagnosticsResult | null>(null);
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [knowledgeBases, setKnowledgeBases] = useState<WorkspaceKnowledgeBase[]>([]);
+  const [selectedKbId, setSelectedKbId] = useState('');
+
+  useEffect(() => {
+    const loadKnowledgeBases = async () => {
+      try {
+        const kbs = await listWorkspaceKnowledgeBases();
+        setKnowledgeBases(kbs);
+      } catch (err: unknown) {
+        setError(getErrorMessage(err, '知识库列表加载失败'));
+      }
+    };
+    void loadKnowledgeBases();
+  }, []);
 
   const loadTraces = useCallback(async () => {
+    if (!selectedKbId) {
+      setItems([]);
+      setTotal(0);
+      setCostSummary(null);
+      return;
+    }
     setLoading(true);
     setError('');
     try {
       const data = await qaTracesApi.getTraces({
+        kb_id: selectedKbId,
         page: page + 1,
         page_size: rowsPerPage,
         qa_type: qaType || undefined,
@@ -134,6 +157,7 @@ const QATracesPage: React.FC = () => {
       setItems(Array.isArray(data.items) ? data.items : []);
       setTotal(Number(data.total || 0));
       const costData = await qaTracesApi.getCostSummary({
+        kb_id: selectedKbId,
         qa_type: qaType || undefined,
         status: status || undefined,
         window_hours: 24,
@@ -144,17 +168,18 @@ const QATracesPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [keyword, page, qaType, rowsPerPage, status, traceId]);
+  }, [keyword, page, qaType, rowsPerPage, selectedKbId, status, traceId]);
 
   useEffect(() => {
     void loadTraces();
   }, [loadTraces]);
 
   const openDetail = async (item: QATraceItem) => {
+    if (!selectedKbId) return;
     setError('');
     setDiagnostics(null);
     try {
-      const data = await qaTracesApi.getTrace(item.id);
+      const data = await qaTracesApi.getTrace(item.id, item.kb_id || selectedKbId);
       setDetail(data);
       setDetailOpen(true);
     } catch (err: unknown) {
@@ -169,11 +194,17 @@ const QATracesPage: React.FC = () => {
 
   const runRetrievalDiagnostics = async () => {
     if (!detail?.question) return;
+    const kbId = detail.kb_id || selectedKbId;
+    if (!kbId) {
+      setError('缺少知识库归属，无法运行检索诊断');
+      return;
+    }
     setDiagnosticsLoading(true);
     setError('');
     try {
       const data = await qaTracesApi.runRetrievalDiagnostics({
         question: detail.question,
+        kb_id: kbId,
         top_k: detail.top_k || 5,
         modes: ['keyword', 'vector', 'hybrid', 'graph_hybrid'],
       });
@@ -341,6 +372,27 @@ const QATracesPage: React.FC = () => {
         <Card sx={{ mb: 2 }}>
           <CardContent>
             <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+              <TextField
+                select
+                label="知识库"
+                value={selectedKbId}
+                onChange={(e) => {
+                  setSelectedKbId(e.target.value);
+                  setPage(0);
+                }}
+                sx={{ minWidth: 220 }}
+              >
+                {knowledgeBases.length === 0 && (
+                  <MenuItem value="" disabled>
+                    无可访问的知识库
+                  </MenuItem>
+                )}
+                {knowledgeBases.map((kb) => (
+                  <MenuItem key={kb.kb_id} value={kb.kb_id}>
+                    {kb.name || kb.kb_id}
+                  </MenuItem>
+                ))}
+              </TextField>
               <TextField select label="类型" value={qaType} onChange={(e) => setQaType(e.target.value as QATraceTypeFilter)} sx={{ minWidth: 160 }}>
                 <MenuItem value="">全部</MenuItem>
                 <MenuItem value="docqa">文档问答</MenuItem>
@@ -360,81 +412,87 @@ const QATracesPage: React.FC = () => {
           </CardContent>
         </Card>
 
-        <Card>
-          <TableContainer>
-            <Table>
-              <TableHead>
-                <TableRow>
-                  <TableCell>ID</TableCell>
-                  <TableCell>类型</TableCell>
-                  <TableCell>状态</TableCell>
-                  <TableCell>档位</TableCell>
-                  <TableCell>问题</TableCell>
-                  <TableCell>检索/引用</TableCell>
-                  <TableCell>延迟</TableCell>
-                  <TableCell>时间</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {loading ? (
+        {!selectedKbId ? (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            请先在上方选择知识库。问答追踪数据按知识库隔离，未选择知识库时不加载任何记录。
+          </Alert>
+        ) : (
+          <Card>
+            <TableContainer>
+              <Table>
+                <TableHead>
                   <TableRow>
-                    <TableCell colSpan={8} sx={{ p: 0 }}>
-                      <LoadingState label="正在加载问答追踪" minHeight={240} />
-                    </TableCell>
+                    <TableCell>ID</TableCell>
+                    <TableCell>类型</TableCell>
+                    <TableCell>状态</TableCell>
+                    <TableCell>档位</TableCell>
+                    <TableCell>问题</TableCell>
+                    <TableCell>检索/引用</TableCell>
+                    <TableCell>延迟</TableCell>
+                    <TableCell>时间</TableCell>
                   </TableRow>
-                ) : items.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={8} align="center">暂无问答追踪记录</TableCell>
-                  </TableRow>
-                ) : (
-                  items.map((item) => (
-                    <TableRow key={item.id} hover sx={{ cursor: 'pointer' }} onClick={() => openDetail(item)}>
-                      <TableCell>{item.id}</TableCell>
-                      <TableCell>{qaTypeLabel(item.qa_type)}</TableCell>
-                      <TableCell>
-                        <Chip
-                          size="small"
-                          label={item.status === 'success' ? '成功' : '失败'}
-                          color={item.status === 'success' ? 'success' : 'error'}
-                        />
+                </TableHead>
+                <TableBody>
+                  {loading ? (
+                    <TableRow>
+                      <TableCell colSpan={8} sx={{ p: 0 }}>
+                        <LoadingState label="正在加载问答追踪" minHeight={240} />
                       </TableCell>
-                      <TableCell>
-                        <Chip
-                          size="small"
-                          variant="outlined"
-                          label={formatReasoningProfile(item.reasoning_profile)}
-                        />
-                      </TableCell>
-                      <TableCell sx={{ maxWidth: 360 }}>
-                        <Typography variant="body2" noWrap>{item.question}</Typography>
-                        {item.trace_id && (
-                          <Typography variant="caption" color="text.secondary" noWrap>
-                            {item.trace_id}
-                          </Typography>
-                        )}
-                      </TableCell>
-                      <TableCell>{item.retrieval_count} / {item.citation_count}</TableCell>
-                      <TableCell>{item.latency_ms ?? 0} ms</TableCell>
-                      <TableCell>{formatDate(item.created_at)}</TableCell>
                     </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </TableContainer>
-          <TablePagination
-            component="div"
-            count={total}
-            page={page}
-            rowsPerPage={rowsPerPage}
-            rowsPerPageOptions={[10, 20, 25, 50, 100]}
-            onPageChange={(_, next) => setPage(next)}
-            onRowsPerPageChange={(e) => {
-              setRowsPerPage(parseInt(e.target.value, 10));
-              setPage(0);
-            }}
-          />
-        </Card>
+                  ) : items.length === 0 ? (
+                    <TableRow>
+                      <TableCell colSpan={8} align="center">暂无问答追踪记录</TableCell>
+                    </TableRow>
+                  ) : (
+                    items.map((item) => (
+                      <TableRow key={item.id} hover sx={{ cursor: 'pointer' }} onClick={() => openDetail(item)}>
+                        <TableCell>{item.id}</TableCell>
+                        <TableCell>{qaTypeLabel(item.qa_type)}</TableCell>
+                        <TableCell>
+                          <Chip
+                            size="small"
+                            label={item.status === 'success' ? '成功' : '失败'}
+                            color={item.status === 'success' ? 'success' : 'error'}
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            label={formatReasoningProfile(item.reasoning_profile)}
+                          />
+                        </TableCell>
+                        <TableCell sx={{ maxWidth: 360 }}>
+                          <Typography variant="body2" noWrap>{item.question}</Typography>
+                          {item.trace_id && (
+                            <Typography variant="caption" color="text.secondary" noWrap>
+                              {item.trace_id}
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>{item.retrieval_count} / {item.citation_count}</TableCell>
+                        <TableCell>{item.latency_ms ?? 0} ms</TableCell>
+                        <TableCell>{formatDate(item.created_at)}</TableCell>
+                      </TableRow>
+                    ))
+                  )}
+                </TableBody>
+              </Table>
+            </TableContainer>
+            <TablePagination
+              component="div"
+              count={total}
+              page={page}
+              rowsPerPage={rowsPerPage}
+              rowsPerPageOptions={[10, 20, 25, 50, 100]}
+              onPageChange={(_, next) => setPage(next)}
+              onRowsPerPageChange={(e) => {
+                setRowsPerPage(parseInt(e.target.value, 10));
+                setPage(0);
+              }}
+            />
+          </Card>
+        )}
 
         <Drawer anchor="right" open={detailOpen} onClose={() => setDetailOpen(false)} PaperProps={{ sx: { width: { xs: '100%', md: 720 }, p: 3 } }}>
           {detail && (
