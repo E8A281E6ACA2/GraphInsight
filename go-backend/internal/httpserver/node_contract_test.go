@@ -146,7 +146,7 @@ func TestNodeDetailContractSuccess(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	graphSvc := &stubGraphService{nodeDetail: graph.NodeDetail{
 		ID:     "42",
 		Labels: []string{"Entity"},
@@ -166,6 +166,7 @@ func TestNodeDetailContractSuccess(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/node/42?kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, req)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -195,13 +196,14 @@ func TestNodeDetailContractNotFound(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	graphSvc := &stubGraphService{nodeErr: graph.ErrNodeNotFound}
 
 	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, newGraphRouteKBStore())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/node/not-exists?kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, req)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
@@ -231,13 +233,14 @@ func TestNodeDetailContractInternalError(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	graphSvc := &stubGraphService{nodeErr: errors.New("boom")}
 
 	registerRoutes(mux, cfg, newTestLogger(), graphSvc, nil, nil, nil, nil, nil, newGraphRouteKBStore())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/node/42?kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, req)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusInternalServerError {
@@ -249,7 +252,7 @@ func TestGraphSchemaContractSuccess(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	graphSvc := &stubGraphService{schema: graph.GraphSchemaResponse{
 		Labels: []graph.GraphLabelSummary{
 			{Label: "Section", Count: 12},
@@ -271,6 +274,7 @@ func TestGraphSchemaContractSuccess(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/graph/schema?kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, req)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -300,7 +304,7 @@ func TestHealthReportsNeo4jProbeFailure(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	graphSvc := &stubGraphService{
 		healthErr: errors.New("connection refused"),
 		runtimeInfo: graph.RuntimeConnectionInfo{

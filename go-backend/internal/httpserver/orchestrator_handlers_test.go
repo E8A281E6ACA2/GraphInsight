@@ -31,6 +31,25 @@ type fakeUnifiedGraphBuildStore struct {
 	createCalls int32
 }
 
+// AuthorizedKBIDs 让该 fake 满足 qaScopeAuthorizer（allKBs 哨兵）：
+// KB 第二阶段授权 fail-closed 后，携带合法主体的契约类正向测试可解析授权范围。
+// 交集/跨 KB 的负向语义由 fakeQAScopeStore 与 crossScopePermissionStore 覆盖。
+func (s *fakeUnifiedGraphBuildStore) AuthorizedKBIDs(_ context.Context, _ string, _ ...string) ([]string, bool, error) {
+	return nil, true, nil
+}
+
+func (s *fakeUnifiedGraphBuildStore) CheckPermission(_ context.Context, subject string, permission string, scope map[string]string) (authz.CheckResult, error) {
+	return authz.CheckResult{Allowed: true, User: subject, Reason: "fake_allow", Scope: scope}, nil
+}
+
+// attachAllowedTestAuth 给业务路由测试请求附加合法主体：
+// KB-scoped 路由第二阶段无条件 fail-closed 后，正向测试必须携带可归因主体。
+func attachAllowedTestAuth(t *testing.T, req *http.Request) *http.Request {
+	t.Helper()
+	req.Header.Set("Authorization", "Bearer "+issueTestAdminJWT(t, "admin@example.com", "test-secret", time.Now().Add(time.Hour)))
+	return req
+}
+
 // fakeAdminDocumentStore 满足 adminDocumentStore（M3 文档注册表路由使用）。
 // 所有方法 nil-receiver 安全：嵌入指针未初始化时返回零值，避免误触发路由时 panic。
 type fakeAdminDocumentStore struct {
@@ -115,7 +134,7 @@ func TestGraphBuildRouteCreatesNativeJob(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	createdAt := time.Date(2026, 6, 7, 9, 0, 0, 0, time.UTC)
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore: &fakeAdminUserStore{},
@@ -158,8 +177,8 @@ func TestGraphBuildRouteCreatesNativeJob(t *testing.T) {
 	if store.fakeAdminJobStore.createReq.JobType != "build_graph" {
 		t.Fatalf("unexpected job type: %#v", store.fakeAdminJobStore.createReq)
 	}
-	if store.fakeAdminJobStore.createReq.RequestedBy == nil || *store.fakeAdminJobStore.createReq.RequestedBy != 12 {
-		t.Fatalf("unexpected requested_by: %#v", store.fakeAdminJobStore.createReq.RequestedBy)
+	if store.fakeAdminJobStore.createReq.RequestedBy != nil {
+		t.Fatalf("unexpected untrusted requested_by: %#v", store.fakeAdminJobStore.createReq.RequestedBy)
 	}
 	if store.fakeAdminJobStore.createReq.TraceID == nil || *store.fakeAdminJobStore.createReq.TraceID != "trace-build-job" {
 		t.Fatalf("unexpected trace id: %#v", store.fakeAdminJobStore.createReq.TraceID)
@@ -213,7 +232,7 @@ func TestGraphBuildRouteInjectsComplexScenarioReasoningProfileFromConfig(t *test
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore: &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{
@@ -257,7 +276,7 @@ func TestGraphBuildRouteIdempotencyReplay(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	createdAt := time.Date(2026, 6, 7, 10, 0, 0, 0, time.UTC)
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
@@ -308,7 +327,7 @@ func TestGraphBuildRouteIdempotencyConflict(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -365,6 +384,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 		AppName:                     "GraphInsight Go API",
 		Version:                     "test",
 		RBACEnforceBusinessAPI:      false,
+		AdminSecretKey:              "test-secret",
 		DocumentStoragePath:         docDir,
 		DocumentStorageFallbackPath: docDir,
 	}
@@ -400,6 +420,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 	for _, tc := range getCases {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(tc.method, tc.path, nil)
+		attachAllowedTestAuth(t, req)
 		mux.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("request %s %s expected 200, got %d", tc.method, tc.path, rec.Code)
@@ -417,6 +438,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 	}
 	recList := httptest.NewRecorder()
 	reqList := httptest.NewRequest(http.MethodGet, "/api/documents?kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, reqList)
 	mux.ServeHTTP(recList, reqList)
 	if err := json.Unmarshal(recList.Body.Bytes(), &listBody); err != nil {
 		t.Fatalf("unmarshal list response: %v", err)
@@ -433,6 +455,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 
 	recDelete := httptest.NewRecorder()
 	reqDelete := httptest.NewRequest(http.MethodDelete, "/api/documents/"+docID+"?purge_graph=false&soft_delete=true&dry_run=false&verify_after=true&kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, reqDelete)
 	mux.ServeHTTP(recDelete, reqDelete)
 	if recDelete.Code != http.StatusOK {
 		t.Fatalf("request DELETE /api/documents/{id} expected 200, got %d body=%s", recDelete.Code, recDelete.Body.String())
@@ -460,6 +483,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 
 	recRestore := httptest.NewRecorder()
 	reqRestore := httptest.NewRequest(http.MethodPost, "/api/documents/"+docID+"/restore?kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, reqRestore)
 	mux.ServeHTTP(recRestore, reqRestore)
 	if recRestore.Code != http.StatusOK {
 		t.Fatalf("request POST /api/documents/{id}/restore expected 200, got %d body=%s", recRestore.Code, recRestore.Body.String())
@@ -469,6 +493,7 @@ func TestOrchestratorDocumentsRoutes(t *testing.T) {
 	}
 
 	reqClear := httptest.NewRequest(http.MethodDelete, "/api/documents?purge_graph=true&kb_id=kb-a", nil)
+	attachAllowedTestAuth(t, reqClear)
 	mux.ServeHTTP(recClear, reqClear)
 	if recClear.Code != http.StatusOK {
 		t.Fatalf("request DELETE /api/documents expected 200, got %d body=%s", recClear.Code, recClear.Body.String())
@@ -500,6 +525,7 @@ func TestOrchestratorUploadRoute(t *testing.T) {
 		AppName:                     "GraphInsight Go API",
 		Version:                     "test",
 		RBACEnforceBusinessAPI:      false,
+		AdminSecretKey:              "test-secret",
 		DocumentStoragePath:         docDir,
 		DocumentStorageFallbackPath: docDir,
 	}
@@ -526,6 +552,7 @@ func TestOrchestratorUploadRoute(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/documents/upload?kb_id=kb-a", strings.NewReader(b.String()))
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	attachAllowedTestAuth(t, req)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -589,8 +616,15 @@ func TestOrchestratorMetricsRoute(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
-	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, nil)
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
+	store := &fakeUnifiedGraphBuildStore{
+		fakeAdminUserStore: &fakeAdminUserStore{
+			permissionResult: authz.CheckResult{Allowed: true, User: "admin@example.com"},
+		},
+		fakeAdminConfigStore: &fakeAdminConfigStore{},
+		fakeAdminLogStore:    &fakeAdminLogStore{},
+	}
+	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, store)
 
 	recCall := httptest.NewRecorder()
 	reqCall := httptest.NewRequest(http.MethodGet, "/api/docqa/health", nil)
@@ -601,6 +635,7 @@ func TestOrchestratorMetricsRoute(t *testing.T) {
 
 	recCall2 := httptest.NewRecorder()
 	reqCall2 := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"x","kb_id":"kb-a"}`))
+	attachAllowedTestAuth(t, reqCall2)
 	reqCall2.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(recCall2, reqCall2)
 	if recCall2.Code != http.StatusServiceUnavailable {
@@ -677,7 +712,7 @@ func TestOrchestratorNL2CypherRoutes(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AIModel: "gpt-4o-mini", AIAPIKey: "sk-test"}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret", AIModel: "gpt-4o-mini", AIAPIKey: "sk-test"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore: &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{
@@ -696,6 +731,7 @@ func TestOrchestratorNL2CypherRoutes(t *testing.T) {
 	postReq := httptest.NewRequest(http.MethodPost, "/api/nl2cypher", strings.NewReader(`{"natural_language":"查找小麦","kb_id":"kb-a"}`))
 	postReq.Header.Set("Content-Type", "application/json")
 	postReq.Header.Set("x-authz-permission", "nl2cypher:use")
+	attachAllowedTestAuth(t, postReq)
 	mux.ServeHTTP(postRec, postReq)
 	if postRec.Code != http.StatusOK {
 		t.Fatalf("request POST /api/nl2cypher expected 200, got %d", postRec.Code)
@@ -785,7 +821,7 @@ func TestNL2CypherRouteRejectsInvalidJSONBeforeUpstream(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -834,7 +870,7 @@ func TestNL2CypherRouteRejectsBlankNaturalLanguageBeforeUpstream(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -893,7 +929,7 @@ func TestDocQARouteWritesBusinessAudit(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -905,6 +941,7 @@ func TestDocQARouteWritesBusinessAudit(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"他们的工作单位呢","kb_id":"kb-a","top_k":3,"require_citation":true,"conversation_history":[{"role":"user","content":"郑雪梅和兰香瑚是谁？"},{"role":"assistant","content":"他们是论文作者。"}]}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-authz-permission", "qa:ask")
+	req.Header.Set("Authorization", "Bearer "+issueTestAdminJWT(t, "admin@example.com", "test-secret", time.Now().Add(time.Hour)))
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -953,7 +990,7 @@ func TestDocQARouteRejectsInvalidJSONBeforeUpstream(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -1002,7 +1039,7 @@ func TestDocQARouteRejectsBlankQuestionBeforeUpstream(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -1054,7 +1091,7 @@ func TestDeepResearchRouteWritesBusinessAudit(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -1066,6 +1103,7 @@ func TestDeepResearchRouteWritesBusinessAudit(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"你好","kb_id":"kb-a","top_k":8,"max_sub_questions":4}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-authz-permission", "qa:ask")
+	attachAllowedTestAuth(t, req)
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -1108,7 +1146,7 @@ func TestDocQARouteInjectsScenarioReasoningProfileFromConfig(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore: &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{
@@ -1124,6 +1162,7 @@ func TestDocQARouteInjectsScenarioReasoningProfileFromConfig(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"你好","kb_id":"kb-a"}`))
+	attachAllowedTestAuth(t, req)
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 
@@ -1158,7 +1197,7 @@ func TestDeepResearchRouteInjectsScenarioReasoningProfileFromConfig(t *testing.T
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore: &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{
@@ -1174,6 +1213,7 @@ func TestDeepResearchRouteInjectsScenarioReasoningProfileFromConfig(t *testing.T
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/docqa/deep-research", strings.NewReader(`{"question":"你好","kb_id":"kb-a"}`))
+	attachAllowedTestAuth(t, req)
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 
@@ -1204,7 +1244,7 @@ func TestDeepResearchRouteRejectsInvalidJSONBeforeUpstream(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -1253,7 +1293,7 @@ func TestDeepResearchRouteRejectsBlankQuestionBeforeUpstream(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	store := &fakeUnifiedGraphBuildStore{
 		fakeAdminUserStore:   &fakeAdminUserStore{},
 		fakeAdminConfigStore: &fakeAdminConfigStore{},
@@ -1302,7 +1342,7 @@ func TestDocQAHealthRejectsInvalidProbeLLMBeforeUpstream(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false}
+	cfg := config.Config{AppName: "GraphInsight Go API", Version: "test", RBACEnforceBusinessAPI: false, AdminSecretKey: "test-secret"}
 	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, nil)
 
 	rec := httptest.NewRecorder()
@@ -1493,12 +1533,21 @@ func TestOrchestratorDocQAOptionalSafeRetry(t *testing.T) {
 		AppName:                    "GraphInsight Go API",
 		Version:                    "test",
 		RBACEnforceBusinessAPI:     false,
+		AdminSecretKey:             "test-secret",
 		OrchestratorSafeRetryDocQA: true,
 	}
-	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, nil)
+	store := &fakeUnifiedGraphBuildStore{
+		fakeAdminUserStore: &fakeAdminUserStore{
+			permissionResult: authz.CheckResult{Allowed: true, User: "admin@example.com"},
+		},
+		fakeAdminConfigStore: &fakeAdminConfigStore{},
+		fakeAdminLogStore:    &fakeAdminLogStore{},
+	}
+	registerRoutes(mux, cfg, logger, nil, nil, nil, nil, orc, nil, store)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/docqa", strings.NewReader(`{"question":"你好","kb_id":"kb-a"}`))
+	attachAllowedTestAuth(t, req)
 	req.Header.Set("Content-Type", "application/json")
 	mux.ServeHTTP(rec, req)
 

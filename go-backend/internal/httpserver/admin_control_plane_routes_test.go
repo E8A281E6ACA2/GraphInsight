@@ -164,6 +164,20 @@ func newAdminAuthRequestToken(t *testing.T) string {
 	return issueTestAdminJWT(t, "admin@example.com", "test-secret", time.Now().Add(time.Hour))
 }
 
+// newSoftKBGuardForTest 构造第一阶段 soft、第二阶段可正常放行的守卫：
+// KB 授权无条件 fail-closed 后，KB-scoped 正向契约测试也必须能归因主体。
+// 跨 KB / 无主体的拒绝语义由 m4r1 负向测试文件覆盖。
+func newSoftKBGuardForTest(logger *slog.Logger) businessPermissionGuard {
+	return newBusinessPermissionGuard(config.Config{
+		RBACEnforceBusinessAPI: false,
+		RBACAuthzMode:          "go_db",
+		AdminSecretKey:         "test-secret",
+	}, logger, &fakeQAScopeStore{
+		fakeAdminPermissionStore: fakeAdminPermissionStore{result: authz.CheckResult{Allowed: true, UserID: 1, User: "test-admin"}},
+		allKBs:                   true,
+	})
+}
+
 type fakeAdminPermissionStoreForControlPlane struct {
 	result            authz.CheckResult
 	err               error
@@ -1037,7 +1051,7 @@ func TestAdminJobsListNativeRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	guard := newBusinessPermissionGuard(config.Config{RBACEnforceBusinessAPI: false}, logger)
+	guard := newSoftKBGuardForTest(logger)
 	store := &fakeAdminJobStore{
 		// M4-R1 FIX #2：任务列表二阶段鉴权会加载目标 KB 并校验 {tenant,project,kb} 一致性，
 		// KB 行必须与请求作用域（tenant-1/project-1/kb-1）匹配，否则返回 KB_CROSS_SCOPE。
@@ -1056,6 +1070,7 @@ func TestAdminJobsListNativeRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs?page=2&page_size=10&status=failed&job_type=build_graph&tenant_id=tenant-1&project_id=project-1&kb_id=kb-1", nil)
+	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -1130,7 +1145,7 @@ func TestAdminJobsDetailAndLogsNativeRoutesSkipProxy(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	guard := newBusinessPermissionGuard(config.Config{RBACEnforceBusinessAPI: false}, logger)
+	guard := newSoftKBGuardForTest(logger)
 	jobKBID := "kb-a"
 	store := &fakeAdminJobStore{
 		detail: adminstore.JobItem{
@@ -1154,6 +1169,7 @@ func TestAdminJobsDetailAndLogsNativeRoutesSkipProxy(t *testing.T) {
 
 	detailRec := httptest.NewRecorder()
 	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs/12?kb_id=kb-a", nil)
+	detailReq.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(detailRec, detailReq)
 	if detailRec.Code != http.StatusOK {
 		t.Fatalf("expected detail 200, got %d", detailRec.Code)
@@ -1164,6 +1180,7 @@ func TestAdminJobsDetailAndLogsNativeRoutesSkipProxy(t *testing.T) {
 
 	logsRec := httptest.NewRecorder()
 	logsReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/jobs/12/logs?page=1&page_size=100&kb_id=kb-a", nil)
+	logsReq.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(logsRec, logsReq)
 	if logsRec.Code != http.StatusOK {
 		t.Fatalf("expected logs 200, got %d", logsRec.Code)
@@ -1492,7 +1509,7 @@ func TestAdminQATracesNativeListRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	guard := newBusinessPermissionGuard(config.Config{RBACEnforceBusinessAPI: false}, logger)
+	guard := newSoftKBGuardForTest(logger)
 	store := &fakeAdminQATraceStore{
 		listResult: adminstore.QATraceListResult{
 			Items: []adminstore.QATraceItem{
@@ -1505,6 +1522,7 @@ func TestAdminQATracesNativeListRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces?page=2&page_size=10&keyword=wheat&qa_type=docqa&status=success&trace_id=trace-1&operator_id=3&kb_id=kb-1", nil)
+	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -1631,7 +1649,7 @@ func TestAdminQATracesCostSummaryNativeRouteMarksOwnerAndSkipsProxy(t *testing.T
 
 	mux := http.NewServeMux()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	guard := newBusinessPermissionGuard(config.Config{RBACEnforceBusinessAPI: false}, logger)
+	guard := newSoftKBGuardForTest(logger)
 	store := &fakeAdminQATraceStore{
 		summary: adminstore.QACostSummary{
 			WindowHours:      24,
@@ -1652,6 +1670,7 @@ func TestAdminQATracesCostSummaryNativeRouteMarksOwnerAndSkipsProxy(t *testing.T
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/qa-traces/cost-summary?window_hours=24&kb_id=kb-1", nil)
+	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -1743,7 +1762,7 @@ func TestAdminRetrievalDiagnosticsRouteForwardsToPythonInternal(t *testing.T) {
 		WriteJSON(w, http.StatusOK, "ok", map[string]interface{}{"accepted": true})
 	})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	guard := newBusinessPermissionGuard(config.Config{RBACEnforceBusinessAPI: false}, logger)
+	guard := newSoftKBGuardForTest(logger)
 	mux := http.NewServeMux()
 	registerAdminControlPlaneRoutesWithContext(mux, config.Config{}, logger, nil, nil, newAPIMetrics(10), pythonWakeClient, nil, guard, &fakeAdminQATraceStore{})
 
@@ -1754,6 +1773,7 @@ func TestAdminRetrievalDiagnosticsRouteForwardsToPythonInternal(t *testing.T) {
 		strings.NewReader(`{"question":"  hybrid search  ","kb_id":"kb-1","top_k":30,"modes":["hybrid","bad","vector","hybrid"]}`),
 	)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+newAdminAuthRequestToken(t))
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -3272,8 +3292,8 @@ func TestAdminLogsCleanNativeRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 	if store.cleanReq.Days != 30 || !store.cleanReq.DryRun {
 		t.Fatalf("unexpected clean request: %#v", store.cleanReq)
 	}
-	if store.cleanReq.OperatorID == nil || *store.cleanReq.OperatorID != 12 {
-		t.Fatalf("unexpected operator id: %#v", store.cleanReq.OperatorID)
+	if store.cleanReq.OperatorID != nil {
+		t.Fatalf("unexpected untrusted operator id: %#v", store.cleanReq.OperatorID)
 	}
 	if store.cleanReq.TenantID == nil || *store.cleanReq.TenantID != "tenant-a" {
 		t.Fatalf("unexpected tenant id: %#v", store.cleanReq.TenantID)
@@ -3651,8 +3671,8 @@ func TestAdminRbacBindingsCreateNativeRouteMarksOwnerAndSkipsProxy(t *testing.T)
 	if store.createReq.TenantID == nil || *store.createReq.TenantID != "tenant-a" {
 		t.Fatalf("unexpected tenant id: %#v", store.createReq.TenantID)
 	}
-	if store.createReq.OperatorID == nil || *store.createReq.OperatorID != 12 {
-		t.Fatalf("unexpected operator id: %#v", store.createReq.OperatorID)
+	if store.createReq.OperatorID != nil {
+		t.Fatalf("unexpected untrusted operator id: %#v", store.createReq.OperatorID)
 	}
 	if store.createReq.TraceID == nil || *store.createReq.TraceID != "trace-rbac-create" {
 		t.Fatalf("unexpected trace id: %#v", store.createReq.TraceID)
@@ -3869,8 +3889,8 @@ func TestAdminUsersCreateNativeRouteMarksOwnerAndSkipsProxy(t *testing.T) {
 	if store.createReq.Username != "created" || store.createReq.Email != "created@example.com" || store.createReq.Password != "SmokePass123" {
 		t.Fatalf("unexpected create request: %#v", store.createReq)
 	}
-	if store.createReq.OperatorID == nil || *store.createReq.OperatorID != 8 {
-		t.Fatalf("unexpected operator id: %#v", store.createReq.OperatorID)
+	if store.createReq.OperatorID != nil {
+		t.Fatalf("unexpected untrusted operator id: %#v", store.createReq.OperatorID)
 	}
 }
 
@@ -4446,8 +4466,8 @@ func TestAdminUsersToggleAndDeleteNativeRoutesSkipProxy(t *testing.T) {
 	if toggleRec.Header().Get(routeOwnerHeader) != "go-native" {
 		t.Fatalf("unexpected toggle route owner: %s", toggleRec.Header().Get(routeOwnerHeader))
 	}
-	if store.toggleReq.UserID != 16 || store.toggleReq.OperatorID == nil || *store.toggleReq.OperatorID != 8 {
-		t.Fatalf("unexpected toggle request: %#v", store.toggleReq)
+	if store.toggleReq.UserID != 16 || store.toggleReq.OperatorID != nil {
+		t.Fatalf("unexpected untrusted toggle operator: %#v", store.toggleReq)
 	}
 
 	deleteRec := httptest.NewRecorder()

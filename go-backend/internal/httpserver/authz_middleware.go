@@ -62,24 +62,21 @@ func (g businessPermissionGuard) wrap(permission string, next http.HandlerFunc) 
 // handler 加载资源后，携带资源实际作用域 {tenant, project, kb} 重新求交，
 // 防止仅有父作用域绑定的调用方通过 URL 触达未授权 KB。
 //
-// KB 作用域是安全边界，第二阶段授权独立 fail-closed（M4-R1 审计 P0）：
-// 一旦能做出授权判定（存在已认证主体且授权服务可用），跨 KB 拒绝必须生效，
-// 不受 RBACEnforceBusinessAPI=false 或 local_jwt_soft 的 soft allow 影响。
-// 仅在“无法归因主体”（未认证，第一阶段已按 soft 放行）或“授权服务未接入”
-// （纯本地无库开发）时按第一阶段的既有语义处理，不改变跨 KB 的判定口径。
+// KB 作用域是安全边界，第二阶段授权无条件 fail-closed（M4-R1 审计 P0 + 复审整改）：
+//   - 无法归因主体（未认证）→ 拒绝，不再随第一阶段 soft 放行获得 KB 读取；
+//   - 授权服务未接入（adminStore 为 nil）→ 拒绝，纯本地无库开发应接入
+//     enforce 或 mock store，而不是让 KB 边界降级；
+//   - 授权判定失败（err）或明确拒绝 → 一律拒绝，
+//     不受 RBACEnforceBusinessAPI=false 或 local_jwt_soft 的 soft allow 影响。
 func (g businessPermissionGuard) checkPermissionWithScope(r *http.Request, permission string, scopeMap map[string]string) bool {
 	subject := strings.TrimSpace(r.Header.Get("x-auth-user-name"))
 	if subject == "" {
-		// 未认证：无法归因具体主体，与第一阶段 allowRequest 的无 token 语义保持一致。
-		return true
+		g.logger.Warn("missing authenticated subject for scoped permission check, fail closed", "permission", permission)
+		return false
 	}
 	if g.adminStore == nil {
-		// 授权服务未接入：启用强制时 fail-closed；纯本地无库软模式保持第一阶段放行。
-		if g.cfg.RBACEnforceBusinessAPI {
-			g.logger.Error("admin store unavailable for scoped permission check", "permission", permission)
-			return false
-		}
-		return true
+		g.logger.Error("admin store unavailable for scoped permission check, fail closed", "permission", permission)
+		return false
 	}
 	result, err := g.adminStore.CheckPermission(r.Context(), subject, permission, scopeMap)
 	if err != nil {
@@ -105,6 +102,7 @@ func (g businessPermissionGuard) allowRequest(w http.ResponseWriter, r *http.Req
 // CheckPermission 收到的是写入/查询真正指向的 tenant/project。
 // scopeMap 使用 CheckPermission 的 scope 键（x-tenant-id/x-project-id/x-kb-id）。
 func (g businessPermissionGuard) allowRequestWithScope(w http.ResponseWriter, r *http.Request, permission string, scopeMap map[string]string) bool {
+	clearPropagatedAuthContext(r)
 	token, hasToken := extractBearerToken(r.Header.Get("Authorization"))
 	if !hasToken {
 		if g.cfg.RBACEnforceBusinessAPI {
@@ -124,6 +122,12 @@ func (g businessPermissionGuard) allowRequestWithScope(w http.ResponseWriter, r 
 		return g.allowGoDBRequest(w, r, token, permission, scopeMap)
 	}
 	return g.allowGoDBRequest(w, r, token, permission, scopeMap)
+}
+
+func clearPropagatedAuthContext(r *http.Request) {
+	for _, key := range []string{"x-authz-permission", "x-authz-reason", "x-auth-user-id", "x-auth-user-name", "x-auth-user-email"} {
+		r.Header.Del(key)
+	}
 }
 
 func (g businessPermissionGuard) propagateAuthzResult(r *http.Request, permission string, result authz.CheckResult) {

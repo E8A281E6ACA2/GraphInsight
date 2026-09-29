@@ -36,10 +36,12 @@ func resolveQARequestScope(r *http.Request, bodyKBID string, bodyKBIDs []string)
 // 计算 请求 KB ∩ 授权 KB。allKBs 哨兵短路为请求集合；交集为空 → 403 KB_ACCESS_DENIED
 // 并写拒绝审计。返回 false 时响应（含审计）已写出。
 //
-// 语义说明（M4-R1 审计 P0：KB 路由独立 fail-closed）：
-//   - subject 为空（未认证）→ 无法归因主体，与第一阶段 allowRequest 语义一致，按请求范围放行；
-//   - 授权解析失败（AuthorizedKBIDs err）/ 交集为空（跨 KB）→ 无论 enforce/soft 一律拒绝，
-//     不再在 RBACEnforceBusinessAPI=false 或 local_jwt_soft 下降级放行跨 KB 范围。
+// 语义说明（M4-R1 审计 P0 + 复审整改：KB 路由无条件 fail-closed）：
+//   - subject 为空（未认证、无法归因主体）→ 401 拒绝（含审计），不再随第一阶段
+//     soft 放行获得任意 KB 范围；
+//   - 授权服务未接入 / 不支持 KB 作用域解析（含 adminStore 为 nil）→ 503 拒绝，
+//     不再在 RBACEnforceBusinessAPI=false 下降级放行；
+//   - 授权解析失败（AuthorizedKBIDs err）/ 交集为空（跨 KB）→ 无论 enforce/soft 一律拒绝。
 func (g businessPermissionGuard) authorizeQAEffectiveKBIDs(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -53,21 +55,24 @@ func (g businessPermissionGuard) authorizeQAEffectiveKBIDs(
 	}
 	subject := strings.TrimSpace(r.Header.Get("x-auth-user-name"))
 	if subject == "" {
-		return target.KBIDs, true
+		g.logger.Warn("missing authenticated subject for kb scope authorization, fail closed", "permission", permission)
+		writeQAAuthzDeniedAudit(r, g.logger, logStore, permission, target, false)
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		WriteJSON(w, http.StatusUnauthorized, "缺少认证凭证", map[string]string{"error_code": "UNAUTHORIZED"})
+		return nil, false
 	}
 	authorizer, ok := g.adminStore.(qaScopeAuthorizer)
 	if !ok {
-		if g.cfg.RBACEnforceBusinessAPI {
-			g.logger.Error("admin store does not support kb scope authorization", "permission", permission)
-			WriteJSON(w, http.StatusServiceUnavailable, "授权服务不可用", map[string]string{"error_code": "AUTHZ_UNAVAILABLE"})
-			return nil, false
-		}
-		return target.KBIDs, true
+		g.logger.Error("admin store does not support kb scope authorization, fail closed", "permission", permission)
+		writeQAAuthzRejectionAudit(r, g.logger, logStore, permission, target, "AUTHZ_UNAVAILABLE")
+		WriteJSON(w, http.StatusServiceUnavailable, "授权服务不可用", map[string]string{"error_code": "AUTHZ_UNAVAILABLE"})
+		return nil, false
 	}
 	authorized, allKBs, err := authorizer.AuthorizedKBIDs(r.Context(), subject, permission)
 	if err != nil {
 		// KB 边界 fail-closed：无法解析授权集合时不得降级放行跨 KB 范围。
 		g.logger.Error("resolve authorized kb ids failed, fail closed", "permission", permission, "error", err.Error())
+		writeQAAuthzRejectionAudit(r, g.logger, logStore, permission, target, "AUTHZ_UNAVAILABLE")
 		WriteJSON(w, http.StatusServiceUnavailable, "授权服务不可用", map[string]string{"error_code": "AUTHZ_UNAVAILABLE"})
 		return nil, false
 	}
@@ -111,17 +116,20 @@ func (g businessPermissionGuard) authorizeQAKBScopedRequest(
 	}
 	if kbStore == nil {
 		g.logger.Error("knowledge base store unavailable for qa scope authorization", "permission", permission)
+		writeQAAuthzRejectionAudit(r, g.logger, logStore, permission, target, "ADMIN_STORE_UNAVAILABLE")
 		WriteJSON(w, http.StatusServiceUnavailable, "知识库数据服务不可用", map[string]string{"error_code": "ADMIN_STORE_UNAVAILABLE"})
 		return nil, nil, false
 	}
 	for _, kbID := range target.KBIDs {
 		item, err := kbStore.GetKnowledgeBase(r.Context(), kbID)
 		if errors.Is(err, adminstore.ErrKBNotFound) {
+			writeQAAuthzRejectionAudit(r, g.logger, logStore, permission, target, scope.CodeKBNotFound)
 			writeScopeError(w, &scope.Error{Code: scope.CodeKBNotFound, Message: "知识库不存在", Status: http.StatusNotFound})
 			return nil, nil, false
 		}
 		if err != nil {
 			g.logger.Error("load knowledge base for qa scope authorization failed", "kb_id", kbID, "error", err.Error())
+			writeQAAuthzRejectionAudit(r, g.logger, logStore, permission, target, "ADMIN_STORE_UNAVAILABLE")
 			WriteJSON(w, http.StatusServiceUnavailable, "查询知识库失败", map[string]string{"error_code": "ADMIN_STORE_UNAVAILABLE"})
 			return nil, nil, false
 		}
@@ -151,11 +159,23 @@ func writeQAAuthzDeniedAudit(
 	target *scope.SearchTarget,
 	softAllow bool,
 ) {
+	writeQAAuthzRejectionAudit(r, logger, logStore, permission, target, scope.CodeAccessDenied, softAllow)
+}
+
+func writeQAAuthzRejectionAudit(
+	r *http.Request,
+	logger *slog.Logger,
+	logStore adminLogStore,
+	permission string,
+	target *scope.SearchTarget,
+	errorCode string,
+	softAllow ...bool,
+) {
 	if logStore == nil {
 		return
 	}
 	status := "denied"
-	if softAllow {
+	if len(softAllow) > 0 && softAllow[0] {
 		status = "denied_soft_allow"
 	}
 	request := adminstore.BusinessAuditRequest{
@@ -167,7 +187,7 @@ func writeQAAuthzDeniedAudit(
 		Resource:   "kb_scope",
 		Details: map[string]interface{}{
 			"permission":       permission,
-			"error_code":       scope.CodeAccessDenied,
+			"error_code":       errorCode,
 			"requested_kb_ids": target.KBIDs,
 		},
 		Status: status,
