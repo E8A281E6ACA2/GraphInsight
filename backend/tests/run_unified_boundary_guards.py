@@ -16,6 +16,13 @@ TESTS_DIR = Path(__file__).resolve().parent
 PYTHON_EXE = ROOT / ".venv" / "bin" / "python"
 
 
+def _utf8_env(base: dict[str, str]) -> dict[str, str]:
+    env = base.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 @dataclass(frozen=True)
 class GuardCase:
     name: str
@@ -70,6 +77,9 @@ def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str]:
         cwd=str(ROOT.parent),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_utf8_env(os.environ),
         timeout=case.timeout_seconds,
         check=False,
     )
