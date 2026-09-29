@@ -10,7 +10,7 @@
 
 strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜底，fail-closed 为唯一形态；第一阶段通用 RBAC soft 语义（store 不可用/错误/拒绝软放行、local_jwt_soft）按设计保留，不受第二阶段 KB 授权影响。该口径由 `backend/tests/check_migration_cleanup_guards.py::test_kb_scope_strict_mode_has_no_compat_toggle` 静态守卫防削弱。
 
-## 2. 提交清单（本地 main，领先 origin/main 14 个提交，待 push）
+## 2. 提交清单（本地 main，领先 origin/main 跟踪引用 15 个提交，待 push）
 
 | 提交 | 说明 |
 |---|---|
@@ -125,5 +125,5 @@ E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好�
 
 ### 7.5 待办
 
-- push 与 `git rev-parse HEAD` / `git ls-remote origin refs/heads/main` 一致性核验仍需在有 GitHub 出口的环境执行（本机 443 直连超时、1080 代理 handshake 失败）。
+- push 与 `git rev-parse HEAD` / `git ls-remote origin refs/heads/main` 一致性核验仍需在有 GitHub 出口的环境执行。2026-09-30 再次实测：`git ls-remote origin` 与 `git push --dry-run origin refs/heads/main:refs/heads/main` 均 `Failed to connect to github.com:443`（约 21s 超时），本机无出口；本地 main 领先 `origin/main` 跟踪引用（`a053532`）15 个提交，且 `git merge-base` 确认该跟踪引用是 HEAD 祖先，push 为纯 fast-forward、无冲突风险。**远端实际状态未经权威核验**：本轮出现一次 `ls-remote` 返回 `a053532`、紧随其后的重复 `ls-remote` 与 `push --dry-run` 均连接失败，前后矛盾，不能据此断言远端仍停在 `a053532`；必须在有出口的环境按 §7.5 首条命令核验。
 - 独立待办（与本轮整改无关）：`backend/scripts/seed_e2e_local_stack.py` 在本地活栈播种时打印 "admin user updated" 但新密码哈希实际未落库（`bcrypt.checkpw` 为 False），本轮靠手工 `UPDATE admin_users SET password_hash=...` 解除阻塞，需单独排查提交路径。
