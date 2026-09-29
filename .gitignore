@@ -107,3 +107,4 @@ study/
 
 # Go cross-compiled runtime binaries (rebuilt via scripts)
 go-backend/bin/
+!docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md
