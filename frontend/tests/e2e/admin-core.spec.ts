@@ -89,7 +89,8 @@ async function installFullscreenLoadingObserver(page: Page) {
 
 async function expectAdminShellStable(page: Page) {
   await expect(page.getByText('GraphInsight 正在加载')).toBeHidden();
-  await expect(page.getByText('Enterprise Admin')).toBeVisible();
+  // AdminLayout 侧栏品牌文案现为「Control Plane」（原「Enterprise Admin」已改版）。
+  await expect(page.getByText('Control Plane')).toBeVisible();
   const seen = await page.evaluate(() => {
     const globalWindow = window as Window & { __graphInsightFullscreenLoadingSeen?: boolean };
     return Boolean(globalWindow.__graphInsightFullscreenLoadingSeen);
@@ -128,7 +129,7 @@ test.describe('Admin Console Core Flow', () => {
       throw new Error(`admin login failed: status=${loginResponse.status()} body=${await loginResponse.text()}`);
     }
     await expect(page).toHaveURL(/\/admin\/dashboard$/);
-    await expect(page.getByRole('heading', { name: '系统仪表板' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: '运营总览' })).toBeVisible();
     await expect(page.getByText('系统健康状态')).toBeVisible();
   });
 
@@ -182,7 +183,8 @@ test.describe('Admin Console Core Flow', () => {
     await authenticate(page);
 
     await page.goto('/admin/dashboard');
-    await expect(page.getByRole('heading', { name: '系统仪表板' })).toBeVisible();
+    // DashboardPage 实际渲染标题为「运营总览」（AdminLayout title），与侧栏菜单名「仪表盘」不同。
+    await expect(page.getByRole('heading', { name: '运营总览' })).toBeVisible();
     await installFullscreenLoadingObserver(page);
     await expectAdminShellStable(page);
 
@@ -193,7 +195,7 @@ test.describe('Admin Console Core Flow', () => {
     await expect(page).toHaveURL(/\/admin\/config$/);
     await expect(page.getByRole('heading', { name: '配置中心', exact: true })).toBeVisible();
     await expectAdminShellStable(page);
-    await page.getByRole('tab', { name: 'AI 服务配置' }).click();
+    await page.getByRole('tab', { name: 'AI / 模型 / 检索' }).click();
     await expect(page.getByRole('button', { name: /测试当前模型/ })).toBeVisible();
 
     await sidebar.getByRole('button', { name: '任务中心', exact: true }).click();
@@ -208,6 +210,16 @@ test.describe('Admin Console Core Flow', () => {
     await expect(page).toHaveURL(/\/admin\/qa-traces$/);
     await expect(page.getByRole('heading', { name: '问答追踪', exact: true })).toBeVisible();
     await expectAdminShellStable(page);
+    // M4-R1 审计 P1：问答追踪页按知识库 fail-closed 隔离，未选库不加载、不渲染表格。
+    // 真实活栈必须先选择一个知识库，才能看到按 kb_id 作用域加载的结果表。
+    const kbSelect = page.getByLabel('知识库');
+    await expect(kbSelect).toBeVisible();
+    await kbSelect.click();
+    const firstKbOption = page
+      .locator('li[role="option"]:not([aria-disabled="true"])')
+      .first();
+    await expect(firstKbOption).toBeVisible();
+    await firstKbOption.click();
     await expect(page.getByRole('table')).toBeVisible();
   });
 });

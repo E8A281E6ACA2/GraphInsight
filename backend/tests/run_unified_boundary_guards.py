@@ -2,6 +2,7 @@
 """Run the Python-side unified boundary guard suite."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
+# 首选 Linux 后端虚拟环境；允许用 GUARD_PYTHON 显式覆盖，便于在容器 / 非默认布局中运行。
 PYTHON_EXE = ROOT / ".venv" / "bin" / "python"
 
 
@@ -41,12 +43,24 @@ CASES: tuple[GuardCase, ...] = (
 
 
 def _resolve_python() -> Path:
+    # 解析顺序：GUARD_PYTHON 环境变量 -> backend/.venv/bin/python（Linux）-> 当前解释器。
+    # 当前解释器兜底是为了让本套件在没有 Linux venv 布局的环境（容器 / Windows）也能执行；
+    # 前提是已安装 requirements.txt 依赖。缺失依赖导致的用例失败属于环境未就绪，不是代码缺陷。
+    override = os.environ.get("GUARD_PYTHON", "").strip()
+    if override:
+        override_path = Path(override)
+        if override_path.exists():
+            return override_path
+        raise RuntimeError(f"GUARD_PYTHON 指向的解释器不存在: {override_path}")
     if PYTHON_EXE.exists():
         return PYTHON_EXE
-    raise RuntimeError(
-        f"未找到 Linux 后端虚拟环境 Python: {PYTHON_EXE}。"
-        "请先运行: python3 -m venv backend/.venv && backend/.venv/bin/python -m pip install -r backend/requirements.txt"
+    fallback = Path(sys.executable)
+    print(
+        f"[warn] 未找到 Linux 后端虚拟环境 Python: {PYTHON_EXE}；"
+        f"回退使用当前解释器 {fallback}（需已安装 backend/requirements.txt 依赖）",
+        file=sys.stderr,
     )
+    return fallback
 
 
 def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str]:

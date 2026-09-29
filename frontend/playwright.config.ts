@@ -34,6 +34,8 @@ export default defineConfig({
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
+        // E2E_BROWSER_CHANNEL=chrome 时复用本机 Chrome，避免下载 playwright 自带浏览器。
+        channel: process.env.E2E_BROWSER_CHANNEL || undefined,
       },
     },
   ],
