@@ -71,6 +71,16 @@ on:
         required: false
         default: ''
         type: string
+      run_rollback_matrix:
+        description: Run the enforce + soft rollback acceptance matrix over the candidate versions.
+        required: false
+        default: false
+        type: boolean
+      rollback_matrix_versions:
+        description: Comma-separated versions for the rollback matrix. Every version runs in both authz modes.
+        required: false
+        default: 'HEAD,78b1f28'
+        type: string
 
 jobs:
   go-backend:
@@ -114,8 +124,10 @@ jobs:
             backend/tests/run_perf_soak.py \
             backend/tests/check_artifact_secrets.py \
             backend/tests/check_rbac_catalog_parity.py \
+            backend/tests/run_rollback_drill.py \
             go-backend/scripts/smoke_orchestrated_routes.py
-          bash -n backend/tests/run_release_acceptance.sh frontend/tests/run_admin_e2e.sh backend/tests/run_rollback_matrix.sh
+          bash -n backend/tests/run_release_acceptance.sh frontend/tests/run_admin_e2e.sh \
+            backend/tests/run_rollback_matrix.sh backend/tests/run_rollback_leg.sh
 
   backend-unified-guards:
     name: Backend unified boundary guards
@@ -536,6 +548,177 @@ jobs:
             frontend/playwright-report
             logs/dev/python.log
             logs/dev/go.log
+          if-no-files-found: ignore
+
+  rollback-matrix:
+    name: Rollback acceptance matrix (enforce + soft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # 回滚验收必须能重复执行，且必须两条授权腿都跑：只看 enforce 会把可回滚下限判高
+    # （45db134 在 enforce 下 15/15 全过，在 soft 下伪造入站身份头返回 200）。
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_rollback_matrix }}
+    env:
+      ADMIN_DATABASE_URL: postgresql://graphinsight:graphinsight-dev-password@127.0.0.1:5434/graphinsight_admin
+      ADMIN_BASE_URL: http://127.0.0.1:8081
+      ADMIN_EMAIL: ${{ secrets.GRAPHINSIGHT_E2E_ADMIN_EMAIL || 'e2e-admin@local.test' }}
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_PASSWORD: change-this-password
+      PYTHON_BACKEND_BASE_URL: http://127.0.0.1:8001
+      DRILL_PORT_BASE: '18091'
+      DRILL_BUILD_ROOT: ${{ runner.temp }}/drill-build
+      DRILL_PID_DIR: ${{ runner.temp }}/drill-pid
+      ROLLBACK_MATRIX_ARTIFACTS_DIR: artifacts/rollback-matrix
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 候选版本要能 git archive 出旧提交，浅克隆会让身份链构建直接失败。
+          fetch-depth: 0
+
+      - name: Provision single-use stack credentials
+        shell: bash
+        run: |
+          run_secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          run_password="$(python3 -c 'import secrets; print("Ci" + secrets.token_urlsafe(16) + "a1")')"
+          echo "::add-mask::$run_secret"
+          echo "::add-mask::$run_password"
+          {
+            echo "ADMIN_SECRET_KEY=$run_secret"
+            echo "ADMIN_PASSWORD=$run_password"
+          } >> "$GITHUB_ENV"
+          echo "credentials_provisioned=1 password_length_bytes=${#run_password}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create backend virtual environment
+        shell: bash
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python -m pip install --upgrade pip
+          backend/.venv/bin/python -m pip install -r backend/requirements.txt
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-backend/go.mod
+          cache-dependency-path: go-backend/go.sum
+
+      - name: Bring up unified stack
+        shell: bash
+        run: |
+          scripts/dev-backend.sh up
+          echo "--- runtime.env (base urls only) ---"
+          grep -E '^[A-Z_]+_BASE_URL=' logs/dev/runtime.env || echo "no_base_url_keys"
+
+      - name: Initialize fresh admin database
+        shell: bash
+        run: |
+          backend/.venv/bin/python backend/init_pg_database.py
+          backend/.venv/bin/python backend/admin/migrate_rbac_core.py --action migrate
+
+      - name: Wait for gateway dependencies
+        shell: bash
+        run: |
+          ready() {
+            curl -fsS --max-time 5 "$ADMIN_BASE_URL/health" | python3 -c 'import json,sys; d=(json.load(sys.stdin).get("data") or {}); sys.exit(0 if all(bool((d.get(k) or {}).get("connected")) for k in ("neo4j","python_backend","orchestrator")) else 1)'
+          }
+          for attempt in $(seq 1 120); do
+            if ready; then
+              echo "GATEWAY_READY attempt=$attempt"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "GATEWAY_NOT_READY url=$ADMIN_BASE_URL"
+          tail -n 80 logs/dev/go.log || true
+          exit 1
+
+      - name: Build rollback candidate binaries
+        shell: bash
+        run: |
+          IFS=',' read -r -a versions <<< "${{ inputs.rollback_matrix_versions }}"
+          for version in "${versions[@]}"; do
+            version="$(echo "$version" | xargs)"
+            sha="$(git rev-parse "$version")"
+            build_dir="$RUNNER_TEMP/drill-build/$version/go-backend"
+            rm -rf "$RUNNER_TEMP/drill-build/$version"
+            mkdir -p "$build_dir"
+            git archive "$sha" go-backend | tar -x -C "$RUNNER_TEMP/drill-build/$version"
+            (cd "$build_dir" && CGO_ENABLED=0 go build -trimpath -o bin/api ./cmd/api)
+            echo "CANDIDATE_BUILT version=$version sha=$sha sha256=$(sha256sum bin/api | cut -c1-64)"
+          done
+
+      - name: Establish drill fixtures on the release version
+        shell: bash
+        run: |
+          # 夹具只能在发布版本 + enforce 腿上建立一次，避免把新 kb / 新用户写进旧版本。
+          # state 文件必须落在仓库外，由探针自身强制（DRILL_PREREQ_INVALID）。
+          backend/.venv/bin/python backend/tests/run_rollback_drill.py \
+            --phase setup \
+            --base-url "$ADMIN_BASE_URL" \
+            --version-label HEAD \
+            --state-file "$RUNNER_TEMP/gi_drill_state.json" \
+            --admin-email "$ADMIN_EMAIL"
+          ls -l "$RUNNER_TEMP/gi_drill_state.json" | sed -E 's/.* [0-9]+ //'
+
+      - name: Run enforce + soft rollback matrix
+        shell: bash
+        run: |
+          mkdir -p "$ROLLBACK_MATRIX_ARTIFACTS_DIR"
+          backend/tests/run_rollback_matrix.sh \
+            --versions "${{ inputs.rollback_matrix_versions }}" \
+            --modes "enforce,soft" \
+            --python "backend/.venv/bin/python" \
+            --port-base "$DRILL_PORT_BASE" \
+            --base-url 'http://127.0.0.1:{port}' \
+            --state-file "$RUNNER_TEMP/gi_drill_state.json" \
+            --admin-email "$ADMIN_EMAIL" \
+            --log-dir "$ROLLBACK_MATRIX_ARTIFACTS_DIR/logs" \
+            --start-cmd 'bash backend/tests/run_rollback_leg.sh start {version} {mode} {port} {gw_log} {authz_env}' \
+            --stop-cmd 'bash backend/tests/run_rollback_leg.sh stop {version} {mode}' \
+            --identity-cmd 'git rev-parse {version} && sha256sum "${DRILL_BUILD_ROOT}"/{version}/go-backend/bin/api' \
+            2>&1 | tee "$ROLLBACK_MATRIX_ARTIFACTS_DIR/matrix-summary.log"
+
+      - name: Verify leg cleanup
+        if: always()
+        shell: bash
+        run: |
+          residual="$(pgrep -f 'drill-build/.*/bin/api' | wc -l | tr -d ' ')"
+          echo "LEG_CLEANUP_RESIDUAL processes=$residual"
+          echo "REPO_STATE_RESIDUAL files=$(find . -name '*drill_state*.json' -not -path './backend/.venv/*' | wc -l | tr -d ' ')"
+          [[ "$residual" == "0" ]] || { echo "::error::rollback legs still running after the matrix"; exit 1; }
+
+      - name: Scan upload paths for credential material
+        if: always()
+        id: matrix_secret_scan
+        shell: bash
+        run: |
+          if backend/.venv/bin/python backend/tests/check_artifact_secrets.py \
+            --path "$ROLLBACK_MATRIX_ARTIFACTS_DIR" \
+            --path logs/dev/go.log \
+            --secret-env-var ADMIN_PASSWORD \
+            --secret-env-var ADMIN_SECRET_KEY \
+            --secret-env-var ADMIN_TOKEN \
+            --allow-fixture graphinsight-dev-password \
+            --allow-fixture change-this-password \
+            --allow-fixture ci-internal-token; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "::error::credential material found in rollback matrix artifacts; artifacts are withheld"
+            exit 1
+          fi
+
+      - name: Upload rollback matrix artifacts
+        if: always() && steps.matrix_secret_scan.outputs.clean == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-matrix-artifacts
+          path: |
+            artifacts/rollback-matrix
           if-no-files-found: ignore
 
   frontend-build:
