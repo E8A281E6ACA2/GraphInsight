@@ -113,6 +113,7 @@ jobs:
             backend/tests/run_perf_probe.py \
             backend/tests/run_perf_soak.py \
             backend/tests/check_artifact_secrets.py \
+            backend/tests/check_rbac_catalog_parity.py \
             go-backend/scripts/smoke_orchestrated_routes.py
           bash -n backend/tests/run_release_acceptance.sh frontend/tests/run_admin_e2e.sh backend/tests/run_rollback_matrix.sh
 

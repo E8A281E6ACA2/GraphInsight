@@ -46,6 +46,7 @@ CASES: tuple[GuardCase, ...] = (
     GuardCase("qa_cost", "check_qa_cost_summary_unit.py", 60, "QA cost aggregation unit check"),
     GuardCase("admin_env_override", "check_admin_env_override_unit.py", 60, "unified runtime env override guard"),
     GuardCase("rate_limit_exempt", "check_rate_limit_exempt_unit.py", 60, "internal health probe rate limit exemption"),
+    GuardCase("rbac_catalog_parity", "check_rbac_catalog_parity.py", 120, "Python/Go RBAC 权限目录精确对账"),
 )
 
 
