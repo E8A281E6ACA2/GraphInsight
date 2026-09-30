@@ -111,4 +111,10 @@ study/
 
 # Go cross-compiled runtime binaries (rebuilt via scripts)
 go-backend/bin/
+
+# 回滚演练夹具状态文件（含低权限用户凭据）。run_rollback_drill.py 已经拒绝把状态文件
+# 写进仓库内，这里只是误写兜底，防止任何形态的演练凭据被提交。
+drill_state.json
+*.drill_state.json
+.gi_drill_state*
 !docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md

@@ -5,9 +5,16 @@ Release Gate R1 项3：版本级回滚演练探针（仅测试/本地隔离栈�
 
   setup  只在当前发布版本执行一次，用真实 HTTP API 建立回滚后仍可复用的夹具：
          第二个知识库 kb-b、低权限用户（仅 viewer@kb-b）。夹具凭据写入仓库外的
-         状态文件，绝不打印密码。
-  probe  任意版本都可执行：主链路（健康/登录/KB 目录/上传+问答）+ 三条安全不变量
-         （无默认 KB 兜底、无缺 kb_id 透传、无跨 KB 泄漏）。
+         状态文件（0600，落在 git 顶层目录之外会被硬拒绝），绝不打印密码。
+  probe  任意版本都可执行：主链路（健康/登录/KB 目录/上传+检索链路）+ 三条安全不变量
+         （无默认 KB 兜底、无缺 kb_id 透传、无跨 KB 泄漏）+ 伪造入站身份头拒绝。
+
+--authz-mode 记录本腿网关的授权配置形态（go_db=enforce / local_jwt_soft=soft）。
+断言集合不随模式变化：soft 是"RBAC 业务面放行"的部署形态，不是安全不变量的豁免；
+一条版本只有 enforce 与 soft 两腿都过，才算完成回滚验收（见 run_rollback_matrix.sh）。
+
+问答探针口径：无 embedding/LLM 配置的隔离栈里，docqa 只验证"作用域解析 + 检索/引用
+链路可用"（HTTP 200 且返回 citations 结构），不声明问答语义质量。
 
 退出码：0=全部通过；1=存在失败；2=前置缺失（夹具/凭据/服务不可达）。
 
@@ -27,6 +34,7 @@ import json
 import os
 import secrets
 import string
+import subprocess
 import sys
 import time
 import urllib.error
@@ -38,6 +46,51 @@ from typing import Optional
 SCOPE_REQUIRED = "KB_SCOPE_REQUIRED"
 ACCESS_DENIED = "KB_ACCESS_DENIED"
 UNAUTHORIZED = "UNAUTHORIZED"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _assert_outside_repo(path: str, label: str) -> Path:
+    """夹具与口令文件必须落在仓库外。
+
+    演练状态文件里含低权限用户密码，写进工作树就有被提交或被 upload-artifact 带走的
+    风险；这里用 git 顶层目录判定，命中仓库内直接硬失败，而不是静默换路径。
+    """
+    resolved = Path(path).resolve()
+    root = _repo_root()
+    try:
+        top = Path(subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        ).stdout.strip() or str(root))
+        root = top.resolve()
+    except (OSError, ValueError):
+        pass
+    if resolved == root or root in resolved.parents:
+        raise SystemExit(f"DRILL_PREREQ_INVALID {label} must live outside the repository: {resolved} under {root}")
+    return resolved
+
+
+def _write_private_file(path: Path, content: str, label: str) -> None:
+    resolved = _assert_outside_repo(str(path), label)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(str(resolved), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(descriptor, content.encode("utf-8"))
+    finally:
+        os.close(descriptor)
+    os.chmod(str(resolved), 0o600)
+    mode = resolved.stat().st_mode & 0o777
+    # Windows 的 st_mode 是模拟值（恒为 0o666 一类），权限由 ACL 决定，位检查只在 POSIX 上有效。
+    if os.name == "posix" and mode & 0o077:
+        raise SystemExit(f"DRILL_PREREQ_INVALID {label} is group/other readable: mode={oct(mode)}")
+    print(f"{label.upper()}_PROTECTED path={resolved} mode={oct(mode)} posix_enforced={int(os.name == 'posix')}")
 
 
 def _password_from_args(args: argparse.Namespace) -> str:
@@ -125,9 +178,10 @@ def _multipart(files: list[tuple[str, str, bytes]]) -> tuple[bytes, str]:
 
 
 class Drill:
-    def __init__(self, base_url: str, version_label: str) -> None:
+    def __init__(self, base_url: str, version_label: str, authz_mode: str = "unknown") -> None:
         self.base_url = base_url.rstrip("/")
         self.version_label = version_label
+        self.authz_mode = authz_mode
         self.passed = 0
         self.failed = 0
 
@@ -233,20 +287,25 @@ def run_setup(args: argparse.Namespace) -> int:
         "low_password": low_password,
         "created_at": int(time.time()),
     }
-    Path(args.state_file).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"SETUP_DONE state_file={args.state_file}")
+    _write_private_file(Path(args.state_file), json.dumps(state, indent=2, ensure_ascii=False), "state_file")
+    print("SETUP_DONE")
     return 0
 
 
 def run_probe(args: argparse.Namespace) -> int:
     base_url = args.base_url.rstrip("/")
-    drill = Drill(base_url, args.version_label)
-    state_path = Path(args.state_file)
+    drill = Drill(base_url, args.version_label, args.authz_mode)
+    state_path = _assert_outside_repo(args.state_file, "state_file")
     if not state_path.exists():
         print(f"DRILL_PREREQ_MISSING state_file={state_path}")
         return 2
+    mode = state_path.stat().st_mode & 0o777
+    if os.name == "posix" and mode & 0o077:
+        print(f"DRILL_PREREQ_INVALID state_file is group/other readable: mode={oct(mode)}")
+        return 2
     state = json.loads(state_path.read_text(encoding="utf-8"))
     kb_a, kb_b = state["kb_a"], state["kb_b"]
+    print(f"DRILL_MODE authz_mode={args.authz_mode} state_mode={oct(mode)}")
 
     # ---- 主链路（开工令项3：健康 / 登录 / KB 目录 / 上传+问答） ----
     status, body = _request("GET", f"{base_url}/health")
@@ -326,9 +385,12 @@ def run_probe(args: argparse.Namespace) -> int:
         served_in_scope,
         f"status={status} error_code={_error_code(status, body)} citations={len(data.get('citations') or [])}",
     )
-    # 语义命中需要 embedding/LLM 配置，隔离演练库默认无模型配置；此处只记录不判定，
-    # 避免把“检索为空但链路正常”报成语义问答通过。
-    print(f"NOTE main_docqa_retrieval_empty={int(not (data.get('citations') or []))}")
+    # 隔离演练库默认无 embedding/LLM 配置：本探针只判定"作用域解析 + 检索/引用链路可用"，
+    # 检索为空不判失败，也不得对外表述为问答语义质量通过。
+    print(
+        f"NOTE main_docqa_scope=link_smoke_only llm_configured=0 "
+        f"retrieval_empty={int(not (data.get('citations') or []))}"
+    )
 
     # ---- 不变量 1：无默认 KB 兜底（缺 kb_id 必须拒绝，不得服务任意 KB） ----
     # 各路由先校验请求体再解析作用域，因此探针必须携带合法 body，只省略 kb 作用域。
@@ -416,8 +478,8 @@ def run_probe(args: argparse.Namespace) -> int:
 def _finish(drill: Drill) -> int:
     result = "pass" if drill.failed == 0 else "fail"
     print(
-        f"ROLLBACK_DRILL_SUMMARY version={drill.version_label} result={result} "
-        f"passed={drill.passed} failed={drill.failed}"
+        f"ROLLBACK_DRILL_SUMMARY version={drill.version_label} authz_mode={drill.authz_mode} "
+        f"result={result} passed={drill.passed} failed={drill.failed}"
     )
     return 0 if drill.failed == 0 else 1
 
@@ -427,6 +489,13 @@ def main() -> int:
     parser.add_argument("--base-url", default=os.getenv("ADMIN_BASE_URL", "http://127.0.0.1:8081"))
     parser.add_argument("--phase", choices=("setup", "probe"), required=True)
     parser.add_argument("--version-label", default="unknown")
+    # 声明本腿网关是以哪种授权模式运行的，只影响汇总行的可读性：三条安全不变量在
+    # enforce 与 soft 下断言集合完全一致，模式不是放宽断言的理由。
+    parser.add_argument(
+        "--authz-mode",
+        choices=("enforce", "soft", "unknown"),
+        default=os.getenv("DRILL_AUTHZ_MODE", "unknown"),
+    )
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--admin-email", default=os.getenv("ADMIN_EMAIL", "e2e-admin@local.test"))
     parser.add_argument("--admin-password-file", default=os.getenv("ADMIN_PASSWORD_FILE"))
