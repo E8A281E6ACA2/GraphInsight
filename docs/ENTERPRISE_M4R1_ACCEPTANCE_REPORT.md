@@ -10,7 +10,7 @@
 
 strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜底，fail-closed 为唯一形态；第一阶段通用 RBAC soft 语义（store 不可用/错误/拒绝软放行、local_jwt_soft）按设计保留，不受第二阶段 KB 授权影响。该口径由 `backend/tests/check_migration_cleanup_guards.py::test_kb_scope_strict_mode_has_no_compat_toggle` 静态守卫防削弱。
 
-## 2. 提交清单（origin/main 已收至 `a268a1e`；下表末行为本报告所在提交，同样已推送）
+## 2. 提交清单（origin/main 与本地 main 已一致，远端哈希与核验判据见 §7.6；下表 16 个提交为 M4-R1 交付面）
 
 | 提交 | 说明 |
 |---|---|
@@ -29,7 +29,9 @@ strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜�
 | `3df2bd5` | docs(enterprise): 记录复审整改轮与复跑证据 |
 | `d392fb0` | docs(enterprise): 补记身份头剥离后的统一活栈与 E2E 复跑结果 |
 | `a268a1e` | docs(enterprise): 记录 push 出口复测与提交计数 |
-| 本次提交 | docs(enterprise): 记录 push 完成与远端一致性核验 |
+| `f8fbe29` | docs(enterprise): 记录 push 完成与远端一致性核验 |
+
+上表 16 个提交即 M4-R1 交付面。本报告的收口修订（把"待 push"改写为已核验状态）作为第 17 个提交随后推送，最终远端哈希以 §7.6 的 `git ls-remote` 记录为准。
 
 ## 3. 阻断项逐项证据
 
@@ -133,9 +135,11 @@ E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好�
 
 - 前置说明：7.4 记录过本机 `git ls-remote` / `git push --dry-run` 连不上 `github.com:443`（约 21s 超时）。实测该出口是**间歇可用**而非彻底不通——同一命令重试即可建立连接，因此"本机无出口"的旧判断已被证伪，报告以最终成功的核验为准。
 - 执行前确认：`git merge-base HEAD <远端 main>` 等于远端引用，push 为纯 fast-forward、不涉及强推与历史改写。
-- 执行：`git push origin refs/heads/main:refs/heads/main` → `a053532..a268a1e  main -> main`，`PUSH_EXIT=0`。
-- 一致性核验（整改要求的两条命令）：
-  - `git rev-parse HEAD` = `a268a1ebdf1bcd9d357adbc93afe99fded5608cd`
-  - `git ls-remote origin refs/heads/main` = `a268a1ebdf1bcd9d357adbc93afe99fded5608cd`
-  - `cmp` 逐字节相等 → `MATCH=yes`；`git rev-list --count origin/main..HEAD` = 0；工作树干净。
+- 执行（两次 fast-forward，均 `PUSH_EXIT=0`）：
+  1. `a053532..a268a1e`（整改 1–4 的全部代码、测试与验收记录，共 15 个提交）。
+  2. `a268a1e..f8fbe29`（本报告补记推送与核验结果）。
+- 一致性核验（整改要求的两条命令，逐字节 `cmp`）：
+  - 第一次推送后：`git rev-parse HEAD` 与 `git ls-remote origin refs/heads/main` 均为 `a268a1ebdf1bcd9d357adbc93afe99fded5608cd` → `MATCH=yes`。
+  - 第二次推送后：两者均为 `f8fbe294744862017404402c478d8842a6435c8e` → `MATCH=yes`；`git rev-list --count origin/main..HEAD` = 0；工作树干净。
+  - 本报告收口后若再产生文档提交，以同组命令重跑为准（判据不变：远端引用与 `git rev-parse HEAD` 逐字节相等且 ahead=0）。
 - 敏感面复查：推送区间 `a053532..a268a1e` 共 150 个文件，按 `\.env|token|secret|password|credential|dump|\.log$|\.py8001` 过滤仅命中 `backend/.env.example`，其新增键为 `EMBEDDING_PROVIDER/BASE_URL/API_KEY=` 空占位（模板文件，无真实凭据）。本地 `.e2e_token.tmp`、`.e2e_recheck.log`、`.py8001.*`、`go-backend/bin/` 均为未跟踪/忽略态，未进入任何提交。
