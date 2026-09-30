@@ -125,6 +125,7 @@ def _request_upload(
     timeout: float,
     filename: str,
     content: bytes,
+    kb_id: str = "",
 ) -> tuple[int, Any, Dict[str, str]]:
     boundary = "----GraphInsightSmoke" + uuid.uuid4().hex
     url = base_url.rstrip("/") + "/api/documents/upload"
@@ -143,6 +144,8 @@ def _request_upload(
     }
     if token.strip():
         headers["Authorization"] = f"Bearer {token.strip()}"
+    if kb_id.strip():
+        headers["x-kb-id"] = kb_id.strip()
 
     req = urllib.request.Request(url=url, data=bytes(body), method="POST", headers=headers)
     try:
@@ -187,6 +190,26 @@ def _as_json(payload: Any) -> str:
         return str(payload)
 
 
+def _discover_active_kb(base_url: str, token: str, timeout: float) -> str:
+    """返回调用账号可见的第一个 active kb_id；与 backend/tests/kb_scope.py 口径一致。"""
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/api/knowledge-bases",
+        method="GET",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, ValueError):
+        return ""
+    data = body.get("data") if isinstance(body, dict) else None
+    items = data.get("items") if isinstance(data, dict) else None
+    for item in items or []:
+        if isinstance(item, dict) and str(item.get("status")) == "active" and item.get("kb_id"):
+            return str(item["kb_id"])
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke test for Go orchestrated routes")
     parser.add_argument("--go-base-url", default=os.getenv("GO_BASE_URL", os.getenv("ADMIN_BASE_URL", "http://127.0.0.1:8081")))
@@ -206,6 +229,15 @@ def main() -> int:
         except Exception as exc:
             print(f"LOGIN_INIT_FAIL {exc}")
             return 1
+
+    kb_id = _discover_active_kb(args.go_base_url, token, args.timeout) if token else ""
+    if not kb_id:
+        print(
+            "KB_SCOPE_BLOCKED script=smoke_orchestrated_routes.py reason=no_visible_active_kb "
+            "hint=run backend/seed_e2e_local_stack.py"
+        )
+        return 1
+    print(f"KB_SCOPE_READY script=smoke_orchestrated_routes.py kb_id={kb_id} source=discover")
 
     results: list[StepResult] = []
 
@@ -237,6 +269,7 @@ def main() -> int:
         path="/api/documents",
         token=token,
         timeout=args.timeout,
+        headers={"x-kb-id": kb_id},
     )
     docs_owner = _route_owner(docs_headers)
     ok_docs = status == 200 and isinstance(docs, dict) and docs_owner == "go-native"
@@ -306,6 +339,7 @@ def main() -> int:
             timeout=args.timeout,
             filename="smoke_upload.txt",
             content=b"GraphInsight smoke upload test\n",
+            kb_id=kb_id,
         )
         upload_owner = _route_owner(upload_headers)
         ok_upload = status == 200 and isinstance(upload, dict) and upload_owner == "go-native"
@@ -320,6 +354,7 @@ def main() -> int:
                 path=f"/api/documents/{upload_doc_id}?purge_graph=false&soft_delete=false&dry_run=false&verify_after=false",
                 token=token,
                 timeout=args.timeout,
+                headers={"x-kb-id": kb_id},
             )
             delete_owner = _route_owner(delete_headers)
             ok_delete = delete_status == 200 and isinstance(delete_body, dict) and delete_owner == "go-native"
