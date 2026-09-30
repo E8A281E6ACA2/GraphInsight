@@ -193,6 +193,8 @@ ROLLBACK_DRILL_SUMMARY version=restored-live result=pass passed=15 failed=0
 
 ## §8 复现步骤
 
+> R1 轮的手工命令，保留作取证链。日常复现改用 §10 的执行器（一条命令跑满双模式，且缺 soft 腿会直接拒跑）。
+
 ```bash
 # 1. 取提交态源树并交叉编译（每个版本一次）
 mkdir -p /e/tmp/gi-drill-build/<sha>
@@ -223,5 +225,87 @@ docker rm -f gi-drill-gw-<sha>-<mode>
 - [x] 回滚下限判定：代码级下限 = `78b1f28`，`a053532` 与 `45db134` 均不可作为回滚目标
 - [x] 数据库无需 down-migration（§6）
 - [x] 恢复动作完成并复探全绿（§7）
-- [ ] 把 soft 模式腿固化进 CI（当前 CI 发布验收只跑 enforce），避免演练退化回单模式
+- [x] 双模式腿固化成可重复执行器并接入 CI（§10，2026-09-30 R2 轮）
+- [ ] CI `rollback-matrix` job 首跑取证（需 `workflow_dispatch`，本地已用同参数实跑一遍）
 - [ ] 按 §5/§7 口径把回滚下限写入 `docs/ENTERPRISE_OPERATIONS_RUNBOOK.md` 回滚章节
+
+## §10 R2 整改轮：可重复的双模式矩阵（2026-09-30）
+
+R1 轮的双模式演练是手工逐腿拼出来的（§8），存在两个退化风险：漏跑 soft 腿没人发现；
+夹具与 state 文件落在仓库里被误提交。本轮把它们固化成执行器 + CI job。
+
+### §10.1 执行器
+
+| 文件 | 职责 |
+|---|---|
+| `backend/tests/run_rollback_matrix.sh` | 编排：版本 × 授权模式全笛卡尔积、健康等待、身份链记录、腿级清理（`trap EXIT`）、汇总行 |
+| `backend/tests/run_rollback_leg.sh` | 单腿起停：把指定版本的网关二进制拉在独立端口上，只改该腿的 `RBAC_AUTHZ_MODE` / `RBAC_ENFORCE_BUSINESS_API` |
+| `backend/tests/run_rollback_drill.py` | 15 条探针断言（R1 轮已就位），本轮补 `--authz-mode` 与 state 文件保护 |
+
+硬约束（不满足直接 exit 2，不进入跑腿阶段）：
+
+1. `--modes` 必须同时含 `enforce` 与 `soft`，缺任一腿视为未演练；
+2. 口令必须由 `ADMIN_PASSWORD` 或 `--admin-password-file` 提供，命令行不出现明文；
+3. 模板占位符只认 `{version} {mode} {port} {authz_env} {base_url} {gw_log}`，
+   写错的裸 `{token}` 一律拒（`RENDER_CONTRACT_OK` 之前先自检）。
+
+第 3 条是被一次真实误判逼出来的：模板渲染在 `set -u` 下退化成空串时，`eval ""` 返回 0，
+六条腿会全部伪装成"起来了但没就绪"，看起来像环境问题而不是脚本问题。
+
+### §10.2 state 文件与隔离清理
+
+- `run_rollback_drill.py` 用 `git rev-parse --show-toplevel` 判定 state 路径，落在仓库内直接
+  `DRILL_PREREQ_INVALID`；写入走 `os.open(..., 0o600)` 并回读校验，POSIX 下组/其他可读即失败，
+  Windows 上 `st_mode` 是模拟值，因此位检查只在 `os.name == "posix"` 生效并打印
+  `posix_enforced=0` 说明实况（不假装 Windows 也 enforce 了权限位）。
+- 本仓库 `.gitignore` 同时挡 `drill_state.json` / `*.drill_state.json` / `.gi_drill_state*`，
+  作为手写路径的兜底。
+- 腿级清理由执行器 `trap` 负责；本轮复核：矩阵结束后
+  `docker ps -a --filter name=gi-drill-mx` = 0 个容器，18091–18096 端口无监听，
+  `git status --porcelain | grep drill_state` 无输出。
+
+### §10.3 本轮实跑（3 版本 × 2 模式 = 6 腿）
+
+夹具在发布版本 + enforce 腿上建立一次（`STATE_FILE_PROTECTED path=... mode=0o666 posix_enforced=0`），
+执行器不隐式跑 setup，避免把新 kb / 新用户写进旧版本。二进制身份链逐腿打印：
+
+| 版本 | `git rev-parse` | 二进制 sha256（前 16 位） | enforce | soft |
+|---|---|---|---|---|
+| `HEAD` = `fc1c59b` | `fc1c59b911109cc65216c5e106996b2fe9e0d8e1` | `e0d5fd13cd107b9a` | 15/0 pass | 15/0 pass |
+| `78b1f28` | `78b1f284ea2898dd91f2fc802fa876d60c913d6f` | `e0d5fd13cd107b9a` | 15/0 pass | 15/0 pass |
+| `45db134` | `45db1340e7e85b22024b774ea1be4fe7b6154cfa` | `cbbfb8763b4b6640` | 15/0 pass | **14/1 fail** |
+
+失败断言与 R1 轮同一条，且只出现在 soft 腿：
+
+```text
+45db134/soft     PROBE id=forged_identity_header_rejected verdict=FAIL status=200 error_code=HTTP_200
+45db134/enforce  PROBE id=forged_identity_header_rejected verdict=PASS status=401 error_code=UNAUTHORIZED
+HEAD/soft        PROBE id=forged_identity_header_rejected verdict=PASS status=401 error_code=UNAUTHORIZED
+```
+
+矩阵汇总行：`ROLLBACK_MATRIX_SUMMARY versions=3 modes=2 legs=6 legs_passed=5 legs_failed=1
+detail=HEAD/enforce=pass HEAD/soft=pass 78b1f28/enforce=pass 78b1f28/soft=pass
+45db134/enforce=pass 45db134/soft=fail`（exit 1）。
+
+注意 `HEAD` 与 `78b1f28` 的网关二进制 sha256 相同：`git diff 78b1f28..HEAD -- go-backend` 无产码改动
+（差异全在测试与文档），因此"回滚到 `78b1f28`"对网关侧而言是零行为变化，回滚下限与当前发布态一致。
+
+### §10.4 口径边界（不外推）
+
+- 探针在无 LLM、无 embedding 配置的栈上跑；`main_docqa` 只验证检索/引用链路可达与拒绝语义
+  （逐腿打印 `NOTE main_docqa_scope=link_smoke_only llm_configured=0`），**不构成问答质量结论**。
+- 本矩阵只覆盖代码级回滚（换二进制），不含库表 down-migration；库表/配置回滚见 §6 与
+  `run_migration_rollback_smoke.py`、`run_config_rollback_drill.py`。
+- 演练栈是隔离 Postgres（`127.0.0.1:5436`）与独立端口，共享库 `graphinsight-postgres:5434` 未被写入。
+- `go-backend` 含 `syscall.Statfs` 等 Linux 专属调用，**`GOOS=windows` 编译失败**（实测报
+  `internal/httpserver/admin_monitor_native.go: undefined: syscall.Statfs`）。候选版本二进制只能在
+  Linux（Docker 或 CI runner）上构建；本地 Windows 无法直接跑腿执行器，本轮用桩二进制验证其起停与
+  前置校验，真实网关行为由容器腿证明。
+
+### §10.5 CI 接入
+
+`.github/workflows/ci.yml` 新增 `rollback-matrix` job（`workflow_dispatch` + `run_rollback_matrix`，
+默认版本串 `HEAD,78b1f28`），步骤为：起统一栈 → 初始化库 + RBAC 迁移 → 建夹具 →
+`git archive` 各候选版本并 `go build` → 跑双模式矩阵 → 复核腿残留 → 产物扫描后才上传。
+该 job 本轮**尚未在 GitHub Actions 上首跑**（本地 `gh` 未登录，无 token），因此其状态记为
+"已接入待首跑"，不以本地结果冒充 CI 结果。

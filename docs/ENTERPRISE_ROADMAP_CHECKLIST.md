@@ -101,8 +101,16 @@
   回滚等于同时砍掉 KB 目录链路与全部作用域守卫。
 - [x] 恢复动作核验：一次性容器 `docker ps -a --filter name=gi-drill-gw` 计数 0；常驻网关 `RestartCount=0`、
   Cmd 未变；仓库数据文件与临时 worktree 未被改写。
-- [x] 完整记录见 [docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md)。
-- [ ] 遗留：把 soft 模式腿固化进 CI 发布验收；把回滚下限 `78b1f28` 写入 `ENTERPRISE_OPERATIONS_RUNBOOK.md` 回滚章节。
+- [x] 完整记录见 [docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md](ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md)。
+- [x] soft 模式腿已固化成可重复执行器并接入 CI：`backend/tests/run_rollback_matrix.sh`（缺 enforce 或
+  soft 任一腿即 `MATRIX_PREREQ_INVALID` 拒跑）+ `backend/tests/run_rollback_leg.sh`（单腿起停，
+  非法授权环境变量与模式错配均 exit 2）+ `rollback-matrix` job（`workflow_dispatch`）。
+  本地实跑 3 版本 × 2 模式：`legs=6 legs_passed=5 legs_failed=1`，唯一失败仍是
+  `45db134/soft` 的 `forged_identity_header_rejected status=200`，同版本 enforce 腿 401（§10）。
+  CI 首跑仍待 `workflow_dispatch`（本机 `gh` 未登录），不以本地结果冒充 CI 结果。
+- [x] 回滚 state 文件保护：`run_rollback_drill.py` 拒绝仓库内路径、以 `0o600` 写入并回读校验，
+  打印 `STATE_FILE_PROTECTED ... posix_enforced=`；`.gitignore` 兜底挡 `*drill_state*.json`。
+  矩阵结束后复核容器 0 个、演练端口无监听、`git status` 无 state 残留。
 - [x] soak/capacity 阈值与参数在执行前落档声明，执行后未回改：`preset=release`、`rounds=3`、
   `requests=20`、`concurrency=4`、`max_error_rate=0.0`（与发布验收同口径，不放宽）、
   `max_p95_ms=0`（沿用既有"0 即关闭"口径，本轮不新增延迟门禁）。
@@ -114,6 +122,28 @@
   带模型的容量口径需在配置真实模型凭据的栈上另跑一轮且先声明阈值。
 - [x] soak 运行器可跨平台复跑：`backend/tests/run_perf_soak.py` 不再硬依赖 `backend/.venv/bin/python`
   （缺失时回退当前解释器，可用 `--python`/`SOAK_PYTHON` 指定），子进程输出按 UTF-8 捕获。
+
+## Release Gate R2 整改记录（2026-09-30，上级 6 项）
+
+- [x] CI 敏感信息输出/上传整改：Playwright 在 CI 关闭 trace/video；scrub 覆盖
+  `frontend/playwright-report`（HTML 报告会复制 trace，只清 `test-results` 原件无效）；新增
+  `backend/tests/check_artifact_secrets.py` 作为上传前门禁，命中即 `clean=false` 且不发布产物；
+  `release-acceptance` 不再整文件 `cat logs/dev/runtime.env`，只回显 `*_BASE_URL`，并由
+  `check_dev_runtime_defaults.py` 断言该文件不得含其它键；两处失败消息不再回显带口令 DSN。
+- [x] Python/Go RBAC 权限目录精确对账：`backend/tests/check_rbac_catalog_parity.py`（16 条检查，
+  进统一边界守卫套件 `total=15 failed=0`）与 `go-backend/internal/adminstore/rbac_seed_parity_test.go`
+  （4 个测试，反向读 Python 种子，缺源文件即 `t.Fatalf`）双向覆盖 `graph:admin` 只授 super_admin 且
+  强制于 `/api/query`、预留 `kb:review/kb:manage/kb:publish` 注册但不授予不强制；两侧均做负向注入自证。
+- [x] 无 LLM 口径收敛：回滚探针逐腿打印 `NOTE main_docqa_scope=link_smoke_only llm_configured=0`，
+  所有 `docqa` 判据只声明为"检索/引用链路 smoke"，不宣称问答质量；回滚矩阵不产出性能判据。
+- [x] 临时性能阈值落档：`docs/ENTERPRISE_PERF_SOAK_2026_09_30.md` §6 台账写明 CI `llm_disabled`
+  档 `max_p95_ms=3000`、`llm_configured` 档 `20000` 均为临时值及其依据与复审触发；
+  `max_error_rate=0.0` 长期不放宽；阈值均在执行前声明，未在结果出来后回改。
+- [x] 新增限制记录：`go-backend` 含 Linux 专属调用（`syscall.Statfs`），`GOOS=windows` 编译失败，
+  候选版本二进制必须在 Linux 构建；本地 Windows 以桩二进制验证执行器起停与前置校验 6 个用例。
+- [ ] 遗留：CI `rollback-matrix` 与 `release-acceptance` 的 `workflow_dispatch` 首跑取证（受本机 `gh`
+  未登录阻塞）；把回滚下限 `78b1f28` 写入 `ENTERPRISE_OPERATIONS_RUNBOOK.md` 回滚章节；
+  配置真实 embedding/LLM 后按新声明口径复跑 soak 与 4→8→16 capacity 矩阵。
 - [ ] 遗留：并发 4→8→16 的 capacity 递增矩阵，用于定位真实上限（当前只有并发 4 单点）。
 
 ## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）

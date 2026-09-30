@@ -83,3 +83,23 @@ ADMIN_PASSWORD=*** python -X utf8 backend/tests/run_perf_soak.py \
 - [x] 限制条件已写明，不冒充模型链路容量（§4.3）
 - [ ] 带真实 embedding/LLM 配置再跑一轮 release soak，并按当轮实测 p95 另立延迟门禁口径（需先声明）
 - [ ] 更高并发 capacity 递增矩阵（4 → 8 → 16）以定位上限，当前只有并发 4 单点
+
+## §6 临时性能阈值台账（唯一事实源）
+
+开工令禁止"未说明就改验收阈值"，所以所有在用的阈值集中到这里，标明临时/长期与复审触发条件。
+
+| 场景 | 阈值 | 值 | 性质 | 依据与复审触发 |
+|---|---|---|---|---|
+| 发布验收（CI `release-acceptance`） | `PERF_PROBE_MAX_ERROR_RATE` | `0.0` | **长期** | 错误零容忍，不放宽 |
+| 发布验收（CI，`LLM_ENABLED=0`） | `PERF_PROBE_MAX_P95_MS` | `3000` | **临时** | 依据本文 §3 轮1 实测 p95（`health` 31.3 / `query` 42.1 / `docqa-health` 400.5 / `nl2cypher-status` 29.1 ms，20 请求 / 并发 4）取最大 400.5ms，再乘 9 倍余量覆盖冷共享 runner。**复审触发**：CI 累计 3 次成功发布验收后，用 CI 实测分布替换该余量系数；一旦配置真实模型即失效（见下一行） |
+| 发布验收（CI，`LLM_ENABLED=1`） | `PERF_PROBE_MAX_P95_MS` | `20000` | **临时** | 该档位 `docqa` 由生成时延主导，3000ms 不成立；20000ms 是先验宽档。**复审触发**：真实模型凭据下跑满 3 轮后重定为分位数阈值，不得沿用先验值 |
+| 本地 soak（§3） | `PERF_PROBE_MAX_P95_MS` | `0`（关闭） | 本轮口径 | `--max-p95-ms 0` 即 "0 disables"；soak 只观测趋势，避免把单机热身数据当 SLO |
+| 回滚矩阵（`rollback-matrix` job / 执行器） | 延迟阈值 | 无 | 明确不适用 | 该矩阵判据是安全不变量与拒绝语义，不产出性能结论；其上 `docqa` 同样只算"检索/引用链路 smoke" |
+
+两条红线：
+
+1. 临时阈值是在 `ci.yml` 的 "Declare performance thresholds for this regime" 步骤里**执行前**写入
+   `$GITHUB_ENV` 的，不在结果出来后反填；任何改动必须在同一提交里说明依据。
+2. 以上所有场景都未配置 embedding / LLM，p95 只覆盖"网关 → 编排 → Python 空检索返回"，
+   **不构成问答质量或模型容量结论**。无 LLM 口径统一表述为"检索/引用链路 smoke"，回滚探针逐腿打印
+   `NOTE main_docqa_scope=link_smoke_only llm_configured=0`。

@@ -193,3 +193,105 @@ E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好�
 - 为让 soak 能在本机复跑，修了 `backend/tests/run_perf_soak.py` 两处平台假设：不再硬要求
   `backend/.venv/bin/python`（缺失时回退当前解释器，支持 `--python` / `SOAK_PYTHON`），
   子进程输出显式按 UTF-8 捕获（沿用整改2 的口径，避免中文输出触发 cp936 解码失败）。
+
+## 9. Release Gate R2 整改轮（2026-09-30，上级 6 项）
+
+R1 轮不验收，按 6 项继续整改。本轮口径先说清楚：**所有 `docqa` 相关判据只声明为"检索/引用链路
+smoke"（无 embedding / LLM 配置），不构成问答质量结论**；CI 实跑类证据仍受 §8.2 的凭据阻塞，
+本轮不以本地结果冒充 CI 结果。
+
+### 9.1 项1：CI 敏感信息输出 / 上传整改
+
+泄露面审计结论：真正带凭据的产物是 **Playwright HTML 报告内嵌的 trace / video**（`admin-core.spec.ts`、
+`business-docqa-flow.spec.ts` 里有 `localStorage.setItem('admin_token', token)`，trace 会记录
+`addInitScript` 与登录请求体），而原 scrub 只删 `frontend/test-results` 原件，HTML 报告副本不受影响；
+`frontend-e2e`、`release-frontend-e2e` 两个 job 甚至完全没有 scrub。GitHub 只自动 mask 日志里的
+Secrets，**不 mask 二进制产物**。
+
+整改四层：
+
+1. `frontend/playwright.config.ts`：CI 下 `trace`/`video` 改为 `off`（本地仍 `retain-on-failure`）。
+2. `ci.yml` 所有报告类 job 的 scrub 扩到 `frontend/playwright-report`，并打印 `residual=` 复核计数。
+3. 新增 `backend/tests/check_artifact_secrets.py` 上传前门禁：扫 `jwt` / 带口令 DSN / 凭据赋值 /
+   bcrypt 哈希四类形状，并对本次 run 注入的口令做字面值比对；命中即 `clean=false`，对应
+   upload step 用 `if: always() && steps.secret_scan.outputs.clean == 'true'` 不发布产物
+   （失败仍可调试，含密产物不流出）。fixture 放行必须显式 `--allow-fixture` 声明并打进日志，
+   不静默放宽；扫描器只输出 `match_sha256` 与脱敏片段，不复读原文。
+4. `release-acceptance` 不再 `cat logs/dev/runtime.env`，只 `grep` `*_BASE_URL`；
+   "该文件只允许承载 `*_BASE_URL`"由 `check_dev_runtime_defaults.py` 断言（新增
+   `non_url_keys` 为空的前置检查）。`check_dual_kb_blackbox.py` 与 `check_dev_runtime_defaults.py`
+   的失败消息不再回显带口令的 DSN，改为 `_dsn_target()` / `_db_target_redacted()` 只留 `host:port/db`。
+
+实测：脏目录 4 条 finding（含 run 口令字面值与 JWT 形状）→ exit 1；干净目录 `findings=0 result=pass`
+→ exit 0；`ci.yml` 经 `yaml.safe_load` 解析为 11 个 job。
+
+### 9.2 项2：Python / Go RBAC 权限目录精确对账
+
+两侧各一条腿，任一侧漂移都能被判：
+
+| 文件 | 视角 | 覆盖 |
+|---|---|---|
+| `backend/tests/check_rbac_catalog_parity.py` | Python 读 Go 种子 | 16 条检查：权限码集合、字段、角色名、描述、逐角色授权、强制码必须是已注册码、`graph:admin` 只授 super_admin 且强制于 `/api/query`、预留 `kb:review/kb:manage/kb:publish` 在目录中但不授予也不强制 |
+| `go-backend/internal/adminstore/rbac_seed_parity_test.go` | Go 读 Python 种子 | 4 个测试，同一套判据反向自证；找不到 Python 源文件时 `t.Fatalf`，对账腿不允许静默跳过 |
+
+接入点：前者进 `run_unified_boundary_guards.py`（`SUMMARY total=15 failed=0`），后者进
+`go test ./...`。负向自证：改 role description、给 viewer 授 `kb:review`、把 `job:manage`
+换成 `screenshot:read`，Python 腿得到 4 条 FAIL / exit 1，Go 腿 3 个测试 FAIL，还原后复绿。
+
+### 9.3 项3：enforce + soft 双模式纳入可重复回滚验收
+
+新增 `backend/tests/run_rollback_matrix.sh`（编排）+ `backend/tests/run_rollback_leg.sh`（单腿起停），
+并接入 CI `rollback-matrix` job（`workflow_dispatch` + `run_rollback_matrix`，默认版本串 `HEAD,78b1f28`）。
+执行器前置硬门禁：缺任一授权模式直接 `MATRIX_PREREQ_INVALID`（exit 2）。
+
+本轮实跑 3 版本 × 2 模式 = 6 腿（隔离栈，明细见 `docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md` §10）：
+
+```text
+ROLLBACK_MATRIX_SUMMARY versions=3 modes=2 legs=6 legs_passed=5 legs_failed=1
+detail=HEAD/enforce=pass HEAD/soft=pass 78b1f28/enforce=pass 78b1f28/soft=pass
+45db134/enforce=pass 45db134/soft=fail
+```
+
+`45db134/soft` 唯一失败断言是 `forged_identity_header_rejected status=200`，同版本 enforce 腿为 401 ——
+即门禁确实能抓到"只在 soft 配置下泄漏"的一类缺陷，回滚下限 `78b1f28` 由此可重复成立。
+
+### 9.4 项4：rollback state 文件保护与隔离清理
+
+- 探针强制 state 路径在仓库外（`git rev-parse --show-toplevel` 判定），写入 `0o600` 并回读校验；
+  POSIX 下组/其他可读即失败，Windows 打印 `posix_enforced=0` 如实说明权限位不生效。
+  证据：`STATE_FILE_PROTECTED path=C:\...\gi_drill_state2.json mode=0o666 posix_enforced=0`；
+  Docker（POSIX）内实测 `POSIX_GATE_REJECTS_WORLD_READABLE exit=2`、仓库内路径被 `DRILL_PREREQ_INVALID` 拒。
+- `.gitignore` 补 `drill_state.json` / `*.drill_state.json` / `.gi_drill_state*` 兜底。
+- 腿级清理由执行器 `trap EXIT` 负责，矩阵结束后复核 `docker ps -a --filter name=gi-drill-mx` = 0、
+  18091–18096 无监听、`git status --porcelain` 无 state 残留；CI 侧 "Verify leg cleanup" step 以
+  `pgrep -f 'drill-build/.*/bin/api'` 必须为 0 作为硬失败条件。
+
+### 9.5 项5：无 LLM 口径收敛
+
+回滚探针逐腿打印 `NOTE main_docqa_scope=link_smoke_only llm_configured=0`；soak 文档 §6 与回滚文档
+§10.4 都把该口径写成"检索/引用链路 smoke，不宣称问答质量"，并声明回滚矩阵不产出性能判据。
+
+### 9.6 项6：临时性能阈值落档
+
+`docs/ENTERPRISE_PERF_SOAK_2026_09_30.md` 新增 §6 台账：CI `llm_disabled` 档 `max_p95_ms=3000`、
+`llm_configured` 档 `20000` 均标为**临时**，写明依据（本地实测 p95 最大值 × 9 冷 runner 余量 / 生成链路先验）
+与复审触发（CI 累计 3 轮成功后重定；配置真实模型后立即失效）。`max_error_rate=0.0` 保持长期不放宽。
+
+### 9.7 本轮新增限制
+
+`go-backend` 含 `syscall.Statfs` 等 Linux 专属调用，`GOOS=windows` 编译失败
+（`internal/httpserver/admin_monitor_native.go: undefined: syscall.Statfs`）。因此候选版本二进制必须在
+Linux 构建，本地 Windows 只能验证执行器起停编排（已用桩二进制跑通 START/STOP/前置校验 6 个用例），
+真实网关行为由容器腿证据承担。
+
+### 9.8 R2 状态
+
+- [x] 项1 CI 泄露面整改（配置 + scrub + 上传门禁 + runtime.env 最小回显）
+- [x] 项2 双语言 RBAC 目录对账（含负向自证）
+- [x] 项3 enforce+soft 双模式可重复矩阵（执行器 + CI job + 本地 6 腿实跑）
+- [x] 项4 state 保护与隔离清理（含 POSIX 实证与残留复核）
+- [x] 项5 无 LLM 口径统一为检索/引用链路 smoke
+- [x] 项6 临时性能阈值与复审触发落档
+- [ ] 项7 提交与 fast-forward push（见 §9.9）
+- [ ] 项8 CI 侧证据（workflow run URL、`ACCEPTANCE_SUMMARY`、Playwright exit、artifacts 链接、
+  敏感信息扫描结果）仍受 §8.2 凭据阻塞，未取得不申报
