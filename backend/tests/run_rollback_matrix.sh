@@ -46,7 +46,7 @@ cleanup_current_leg() {
   if [[ -n "$CURRENT_STOP" ]]; then
     local stop="$CURRENT_STOP"
     CURRENT_STOP=""
-    eval "$stop" >/dev/null 2>&1 || true
+    ( eval "$stop" ) >/dev/null 2>&1 || true
   fi
 }
 trap cleanup_current_leg EXIT
@@ -145,6 +145,15 @@ wait_ready() {
 IFS=',' read -r -a version_list <<< "$VERSIONS"
 IFS=',' read -r -a mode_list <<< "$MODES"
 
+# 版本令牌要和构建步骤用同一套去空格规则，否则 "HEAD, 78b1f28" 会让 leg 找不到 bin/api。
+normalized=()
+for token in "${version_list[@]}"; do
+  trimmed="$(printf '%s' "$token" | tr -d '[:space:]')"
+  [[ -n "$trimmed" ]] || die "empty version token in --versions=$VERSIONS"
+  normalized+=("$trimmed")
+done
+version_list=("${normalized[@]}")
+
 password_args=()
 [[ -z "$ADMIN_PASSWORD_FILE" ]] || password_args=(--admin-password-file "$ADMIN_PASSWORD_FILE")
 
@@ -186,8 +195,9 @@ for version in "${version_list[@]}"; do
       identity_out="$(eval "$(render "$IDENTITY_CMD" "$version" "$mode" "$port" "$authz_env" "$gw_log")" 2>&1 | tr '\n' ' ')"
       echo "LEG_IDENTITY version=$version mode=$mode ${identity_out:-identity_command_empty}"
     fi
-    eval "$start_cmd"
-    if [[ $? -ne 0 ]]; then
+    # 子 shell 隔离：start-cmd 引用到未导出变量时，set -u 只终止子 shell，本执行器
+    # 仍能给出 start_failed 的腿级结论，而不是整个矩阵无摘要中断。
+    if ! ( eval "$start_cmd" ); then
       echo "LEG_RESULT version=$version mode=$mode result=start_failed gw_log=$gw_log"
       legs_failed=$((legs_failed + 1))
       leg_lines+=("$version/$mode=start_failed")
