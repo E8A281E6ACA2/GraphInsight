@@ -9,6 +9,7 @@ BOUNDARY_GUARDS="$BACKEND_DIR/tests/run_unified_boundary_guards.py"
 MIGRATION_ROLLBACK_SMOKE="$BACKEND_DIR/tests/run_migration_rollback_smoke.py"
 SMOKE_SUITE="$BACKEND_DIR/tests/run_backend_smoke_suite.py"
 PERF_PROBE="$BACKEND_DIR/tests/run_perf_probe.py"
+PREFLIGHT="$BACKEND_DIR/tests/check_e2e_preflight.py"
 FRONTEND_E2E="$FRONTEND_DIR/tests/run_admin_e2e.sh"
 
 BASE_URL="${ADMIN_BASE_URL:-${GO_BASE_URL:-http://127.0.0.1:8081}}"
@@ -198,6 +199,14 @@ export E2E_SPEC
 export PERF_PROBE_PRESET="$PERF_PRESET"
 if [[ -n "$ADMIN_PASSWORD" ]]; then export ADMIN_PASSWORD; fi
 if [[ -n "$ADMIN_TOKEN" ]]; then export ADMIN_TOKEN; fi
+
+# Preflight gate: the acceptance chain is meaningless unless the test account can
+# really authenticate and really sees an active KB (no manual SQL allowed).
+if ! "$PYTHON_EXE" "$PREFLIGHT" --base-url "$BASE_URL" --email "$ADMIN_EMAIL"; then
+  echo "E2E_PREFLIGHT_BLOCKED base_url=$BASE_URL email=$ADMIN_EMAIL"
+  echo "Seed the stack with backend/scripts/seed_e2e_local_stack.py (it self-verifies login), then rerun."
+  exit 1
+fi
 
 failures=0
 
