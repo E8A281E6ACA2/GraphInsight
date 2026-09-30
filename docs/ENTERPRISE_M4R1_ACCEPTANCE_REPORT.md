@@ -127,9 +127,16 @@ strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜�
 
 E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好回跳），认证路径由 token 注入用例覆盖；与上一轮基线完全同集合，非新增回归。
 
-### 7.5 待办
+### 7.5 勘误：seed 脚本"密码哈希未落库"系本人误判（已排除）
 
-- 独立待办（与本轮整改无关）：`backend/scripts/seed_e2e_local_stack.py` 在本地活栈播种时打印 "admin user updated" 但新密码哈希实际未落库（`bcrypt.checkpw` 为 False），本轮靠手工 `UPDATE admin_users SET password_hash=...` 解除阻塞，需单独排查提交路径。
+7.5 原先记为独立待办的"播种未落库"经复查**不成立**，`backend/scripts/seed_e2e_local_stack.py` 行为正确，此处按事实更正：
+
+- 复现步骤：同一 shell 内连续两次以不同口令播种，逐次读取 `password_hash` 并输出其 sha256 前 12 位 → `b5a4a3fee95b` → `6980c1f1d430`，摘要变化即证明 UPDATE 已提交；随后 `bcrypt.checkpw(本轮口令)=True`、`checkpw(上一轮口令)=False`，与"最后一次播种生效"完全一致。
+- 端到端复核：播种后用该口令请求网关 `POST /api/v1/admin/auth/login` → HTTP 200、`code 200`、返回 JWT（非空）。
+- 误判根因（两条叠加，均为操作侧）：
+  1. 当时用 `substring(password_hash,1,7)` 比较前后两轮，得到恒定 `$2b$12$`——这是 bcrypt cost-12 的固定前缀，与内容无关，"前缀未变"不构成"未写入"的证据。
+  2. 随机口令在其中一次调用生成、登录在另一次调用使用；托管 Bash 跨调用不保留 shell 变量，登录用的是从未播种过的口令，于是 `checkpw` 为 False 并被误读为写库失败。当时的手工 `UPDATE` 只是把同一个新口令再写一遍并让我记住了它，掩盖了真实原因。
+- 结论与约束：脚本无需修改；`updated_at` 在播种后保持不变是预期行为（UPDATE 语句未更新该列）。活栈复跑取口令必须遵守"生成→播种→登录在同一条 shell 调用内完成"，且校验哈希变化要用整串或摘要比较，不得用 bcrypt 前缀。
 
 ### 7.6 整改 5：push 与远端一致性核验（2026-09-30，已完成）
 
