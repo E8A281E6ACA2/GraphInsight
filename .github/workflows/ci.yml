@@ -111,8 +111,10 @@ jobs:
             backend/tests/run_unified_boundary_guards.py \
             backend/tests/run_backend_smoke_suite.py \
             backend/tests/run_perf_probe.py \
+            backend/tests/run_perf_soak.py \
+            backend/tests/check_artifact_secrets.py \
             go-backend/scripts/smoke_orchestrated_routes.py
-          bash -n backend/tests/run_release_acceptance.sh frontend/tests/run_admin_e2e.sh
+          bash -n backend/tests/run_release_acceptance.sh frontend/tests/run_admin_e2e.sh backend/tests/run_rollback_matrix.sh
 
   backend-unified-guards:
     name: Backend unified boundary guards
@@ -299,8 +301,37 @@ jobs:
             --skip-backend-smoke \
             --skip-perf-probe
 
-      - name: Upload Playwright report
+      - name: Scrub credential-bearing Playwright artifacts
         if: always()
+        shell: bash
+        run: |
+          removed=0
+          while IFS= read -r file; do
+            rm -f "$file"
+            removed=$((removed + 1))
+          done < <(find frontend/test-results frontend/playwright-report -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null || true)
+          echo "TRACE_VIDEO_SCRUBBED removed=$removed"
+          find frontend/test-results frontend/playwright-report -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null | wc -l | sed 's/^/residual=/'
+
+      - name: Scan upload paths for credential material
+        if: always()
+        id: secret_scan
+        shell: bash
+        run: |
+          if python3 backend/tests/check_artifact_secrets.py \
+            --path frontend/playwright-report \
+            --path frontend/test-results \
+            --secret-env-var ADMIN_PASSWORD \
+            --secret-env-var ADMIN_TOKEN; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "::error::credential material found in upload paths; artifacts are withheld"
+            exit 1
+          fi
+
+      - name: Upload Playwright report
+        if: always() && steps.secret_scan.outputs.clean == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: release-frontend-e2e-report
@@ -408,8 +439,11 @@ jobs:
         shell: bash
         run: |
           scripts/dev-backend.sh up
-          echo "--- runtime.env ---"
-          cat logs/dev/runtime.env
+          # 只回显 *_BASE_URL，不再 cat 整个文件：runtime.env 一旦混入口令或带口令的 DSN，
+          # 明文 cat 会直接进 Actions 日志。"该文件只允许承载 *_BASE_URL"由
+          # check_dev_runtime_defaults.py 断言，扫描门禁再兜一遍上传路径。
+          echo "--- runtime.env (base urls only) ---"
+          grep -E '^[A-Z_]+_BASE_URL=' logs/dev/runtime.env || echo "no_base_url_keys"
 
       - name: Initialize fresh admin database
         shell: bash
@@ -452,22 +486,47 @@ jobs:
           # failing step instead of stopping at the first one.
           backend/tests/run_release_acceptance.sh 2>&1 | tee "$RELEASE_ACCEPTANCE_ARTIFACTS_DIR/acceptance-summary.log"
 
-      - name: Scrub credential-bearing Playwright traces
+      - name: Scrub credential-bearing Playwright artifacts
         if: always()
         shell: bash
         run: |
-          # playwright.config.ts records trace and video on failure; both replay the
-          # Authorization header, so they must not reach a public artifact.
+          # playwright.config.ts 在 CI 里已不生成 trace/video，这里仍兜底删一遍：
+          # HTML reporter 会把 trace/video 复制进 frontend/playwright-report/data，
+          # 只清 test-results 原件会让报告自带可回放的 Authorization 头。
           removed=0
           while IFS= read -r file; do
             rm -f "$file"
             removed=$((removed + 1))
-          done < <(find frontend/test-results -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null || true)
+          done < <(find frontend/test-results frontend/playwright-report -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null || true)
           echo "TRACE_VIDEO_SCRUBBED removed=$removed"
-          find frontend/test-results -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null | wc -l | sed 's/^/residual='
+          find frontend/test-results frontend/playwright-report -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null | wc -l | sed 's/^/residual=/'
+
+      - name: Scan upload paths for credential material
+        if: always()
+        id: secret_scan
+        shell: bash
+        run: |
+          # 上传路径必须过一次扫描：命中本次运行注入的凭据字面值或凭据形状就不发布产物。
+          if backend/.venv/bin/python backend/tests/check_artifact_secrets.py \
+            --path "$RELEASE_ACCEPTANCE_ARTIFACTS_DIR" \
+            --path logs/dev/python.log \
+            --path logs/dev/go.log \
+            --path frontend/playwright-report \
+            --secret-env-var ADMIN_PASSWORD \
+            --secret-env-var ADMIN_SECRET_KEY \
+            --secret-env-var ADMIN_TOKEN \
+            --allow-fixture graphinsight-dev-password \
+            --allow-fixture change-this-password \
+            --allow-fixture ci-internal-token; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "::error::credential material found in upload paths; artifacts are withheld"
+            exit 1
+          fi
 
       - name: Upload release acceptance artifacts
-        if: always()
+        if: always() && steps.secret_scan.outputs.clean == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: release-acceptance-artifacts
@@ -554,8 +613,37 @@ jobs:
             node node_modules/@playwright/test/cli.js test
           fi
 
-      - name: Upload Playwright report
+      - name: Scrub credential-bearing Playwright artifacts
         if: always()
+        shell: bash
+        run: |
+          removed=0
+          while IFS= read -r file; do
+            rm -f "$file"
+            removed=$((removed + 1))
+          done < <(find frontend/test-results frontend/playwright-report -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null || true)
+          echo "TRACE_VIDEO_SCRUBBED removed=$removed"
+          find frontend/test-results frontend/playwright-report -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null | wc -l | sed 's/^/residual=/'
+
+      - name: Scan upload paths for credential material
+        if: always()
+        id: secret_scan
+        shell: bash
+        run: |
+          if python3 backend/tests/check_artifact_secrets.py \
+            --path frontend/playwright-report \
+            --path frontend/test-results \
+            --secret-env-var ADMIN_PASSWORD \
+            --secret-env-var ADMIN_TOKEN; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "::error::credential material found in upload paths; artifacts are withheld"
+            exit 1
+          fi
+
+      - name: Upload Playwright report
+        if: always() && steps.secret_scan.outputs.clean == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: frontend-e2e-report
@@ -607,8 +695,22 @@ jobs:
             --output-json artifacts/perf-probe.json \
             --output-markdown artifacts/perf-probe.md
 
-      - name: Upload performance report
+      - name: Scan upload paths for credential material
         if: always()
+        id: secret_scan
+        shell: bash
+        run: |
+          if python3 backend/tests/check_artifact_secrets.py \
+            --path artifacts --secret-env-var ADMIN_PASSWORD --secret-env-var ADMIN_TOKEN; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "::error::credential material found in upload paths; artifacts are withheld"
+            exit 1
+          fi
+
+      - name: Upload performance report
+        if: always() && steps.secret_scan.outputs.clean == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: perf-probe-report
@@ -670,8 +772,22 @@ jobs:
             --sleep-seconds "$PERF_SOAK_SLEEP_SECONDS" \
             --output-dir artifacts/perf-soak
 
-      - name: Upload performance soak report
+      - name: Scan upload paths for credential material
         if: always()
+        id: secret_scan
+        shell: bash
+        run: |
+          if python3 backend/tests/check_artifact_secrets.py \
+            --path artifacts --secret-env-var ADMIN_PASSWORD --secret-env-var ADMIN_TOKEN; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+            echo "::error::credential material found in upload paths; artifacts are withheld"
+            exit 1
+          fi
+
+      - name: Upload performance soak report
+        if: always() && steps.secret_scan.outputs.clean == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: perf-soak-report

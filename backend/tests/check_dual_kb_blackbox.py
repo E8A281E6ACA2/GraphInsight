@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -193,6 +194,13 @@ def sandbox_storage():
 # ---------------------------------------------------------------- 服务可用性探测
 
 
+def _db_target_redacted(url: str) -> str:
+    """只保留 host:port/db，丢掉 userinfo，避免把带口令的 DSN 写进日志或产物。"""
+    if not url:
+        return "<unset>"
+    return re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/@]*@", "", url)
+
+
 def probe_postgres() -> bool:
     try:
         from sqlalchemy import text
@@ -203,7 +211,8 @@ def probe_postgres() -> bool:
             conn.execute(text("SELECT 1"))
         return True
     except Exception as exc:  # noqa: BLE001
-        skip(f"PostgreSQL 注册表不可用（ADMIN_DATABASE_URL={os.getenv('ADMIN_DATABASE_URL', '')!r}）：{type(exc).__name__}: {exc}")
+        # ADMIN_DATABASE_URL 里带口令，skip 说明只打主机与库名，避免把 DSN 写进日志/产物。
+        skip(f"PostgreSQL 注册表不可用（admin_database_url_target={_db_target_redacted(os.getenv('ADMIN_DATABASE_URL', ''))}）：{type(exc).__name__}: {exc}")
         return False
 
 

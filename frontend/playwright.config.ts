@@ -19,9 +19,12 @@ export default defineConfig({
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
     baseURL,
-    trace: 'retain-on-failure',
+    // CI 产物是公开可下载的：trace 会记录 addInitScript 参数与登录请求体（含 Bearer token），
+    // HTML 报告还会把 trace/video 复制进 playwright-report/data，光删 test-results 下的原件挡不住。
+    // 因此在 CI 里直接不生成，本地排障仍保留。截图保留（密码框是掩码输入，不含明文）。
+    trace: process.env.CI ? 'off' : 'retain-on-failure',
+    video: process.env.CI ? 'off' : 'retain-on-failure',
     screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
   },
   webServer: {
     command: `npm run dev -- --host ${host} --port ${port}`,
