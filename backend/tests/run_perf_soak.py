@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -17,15 +18,19 @@ PROBE = ROOT / "tests" / "run_perf_probe.py"
 PYTHON_EXE = ROOT / ".venv" / "bin" / "python"
 
 
-def _resolve_python() -> Path:
+def _resolve_python(explicit: str) -> str:
+    if explicit:
+        return explicit
     if PYTHON_EXE.exists():
-        return PYTHON_EXE
-    raise RuntimeError(f"backend Linux virtualenv python not found: {PYTHON_EXE}")
+        return str(PYTHON_EXE)
+    # Windows 开发机没有 backend/.venv（Linux 口径），退回当前解释器，
+    # 否则 soak 只能在单一平台跑，容量趋势无法在提交前复核。
+    return sys.executable
 
 
 def _build_probe_cmd(args: argparse.Namespace, output_json: Path, output_md: Path) -> list[str]:
     cmd = [
-        str(_resolve_python()),
+        _resolve_python(args.python),
         str(PROBE),
         "--base-url",
         args.base_url.rstrip("/"),
@@ -85,6 +90,7 @@ def main() -> int:
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--build-force", action="store_true")
     parser.add_argument("--skip-route-owner-check", action="store_true")
+    parser.add_argument("--python", default=os.getenv("SOAK_PYTHON", ""), help="Interpreter used to run each probe round")
     parser.add_argument("--output-dir", default="artifacts/perf-soak")
     args = parser.parse_args()
 
@@ -128,6 +134,7 @@ def main() -> int:
             cwd=str(ROOT.parent),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
         )
         stdout = (proc.stdout or "").strip()
