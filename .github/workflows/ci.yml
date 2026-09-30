@@ -565,8 +565,6 @@ jobs:
       NEO4J_PASSWORD: change-this-password
       PYTHON_BACKEND_BASE_URL: http://127.0.0.1:8001
       DRILL_PORT_BASE: '18091'
-      DRILL_BUILD_ROOT: ${{ runner.temp }}/drill-build
-      DRILL_PID_DIR: ${{ runner.temp }}/drill-pid
       ROLLBACK_MATRIX_ARTIFACTS_DIR: artifacts/rollback-matrix
     steps:
       - name: Checkout
@@ -638,8 +636,10 @@ jobs:
 
       - name: Build rollback candidate binaries
         shell: bash
+        env:
+          ROLLBACK_MATRIX_VERSIONS: ${{ inputs.rollback_matrix_versions }}
         run: |
-          IFS=',' read -r -a versions <<< "${{ inputs.rollback_matrix_versions }}"
+          IFS=',' read -r -a versions <<< "$ROLLBACK_MATRIX_VERSIONS"
           for version in "${versions[@]}"; do
             version="$(echo "$version" | xargs)"
             sha="$(git rev-parse "$version")"
@@ -662,14 +662,23 @@ jobs:
             --version-label HEAD \
             --state-file "$RUNNER_TEMP/gi_drill_state.json" \
             --admin-email "$ADMIN_EMAIL"
-          ls -l "$RUNNER_TEMP/gi_drill_state.json" | sed -E 's/.* [0-9]+ //'
+          stat -c 'STATE_FILE_MODE mode=%a %n' "$RUNNER_TEMP/gi_drill_state.json"
 
       - name: Run enforce + soft rollback matrix
         shell: bash
+        # The `runner` context is only legal in step-level env, not in the job-level
+        # env block, so the drill roots are declared here.
+        env:
+          DRILL_BUILD_ROOT: ${{ runner.temp }}/drill-build
+          DRILL_PID_DIR: ${{ runner.temp }}/drill-pid
+          ROLLBACK_MATRIX_VERSIONS: ${{ inputs.rollback_matrix_versions }}
         run: |
           mkdir -p "$ROLLBACK_MATRIX_ARTIFACTS_DIR"
+          # The {…} tokens are placeholders the runner script substitutes later, so
+          # they must stay single-quoted here.
+          # shellcheck disable=SC2016
           backend/tests/run_rollback_matrix.sh \
-            --versions "${{ inputs.rollback_matrix_versions }}" \
+            --versions "$ROLLBACK_MATRIX_VERSIONS" \
             --modes "enforce,soft" \
             --python "backend/.venv/bin/python" \
             --port-base "$DRILL_PORT_BASE" \
