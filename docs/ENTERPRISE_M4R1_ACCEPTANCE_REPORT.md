@@ -150,3 +150,33 @@ E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好�
   - 第二次推送后：两者均为 `f8fbe294744862017404402c478d8842a6435c8e` → `MATCH=yes`；`git rev-list --count origin/main..HEAD` = 0；工作树干净。
   - 本报告收口后若再产生文档提交，以同组命令重跑为准（判据不变：远端引用与 `git rev-parse HEAD` 逐字节相等且 ahead=0）。
 - 敏感面复查：推送区间 `a053532..a268a1e` 共 150 个文件，按 `\.env|token|secret|password|credential|dump|\.log$|\.py8001` 过滤仅命中 `backend/.env.example`，其新增键为 `EMBEDDING_PROVIDER/BASE_URL/API_KEY=` 空占位（模板文件，无真实凭据）。本地 `.e2e_token.tmp`、`.e2e_recheck.log`、`.py8001.*`、`go-backend/bin/` 均为未跟踪/忽略态，未进入任何提交。
+
+## 8. Release Gate R1 进度（2026-09-30）
+
+### 8.1 项3：版本级回滚演练（已完成，含独立复核）
+
+完整记录见 `docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md`。要点：
+
+- 八条腿（4 个版本 × enforce/soft 双模式）全部用 `git archive` 提交态源树 + 容器内交叉编译 +
+  `docker top` 进程核对建立二进制身份链；探针集合与判定阈值全程未改。
+- 结果：`4f4f205`、`78b1f28` 双模式 15/15；`45db134` enforce 15/15 但 soft 14/15（伪造 `x-auth-user-name`
+  未认证请求返回 200）；`a053532` enforce 6/15、soft 5/15。恢复态对常驻网关复探 15/15。
+- 结论口径：**代码级可回滚下限 = `78b1f28`**；`a053532` 与 `45db134` 不可作为回滚目标。
+  仅跑 enforce 会把下限误判为 `45db134`，因此门禁要求 enforce + soft 双模式各一腿。
+- 数据库侧：11 表 schema 两个二进制互用，八条腿零 DDL、网关零 ERROR → 本段改造代码回滚与库表回滚解耦，
+  无需 down-migration。
+- 恢复动作已复核：`docker ps -a --filter name=gi-drill-gw` 计数 0；常驻网关 `RestartCount=0` 且 Cmd 未变。
+
+本轮曾纠正一处自身失误：首次只跑 enforce 腿时差点把回滚下限写成 `45db134`，补 soft 腿后被黑盒探针证伪。
+另一次失误是腿执行器取错口令文件（`gi_fresh_pw` 而非 `gi_fresh_pw2`），表现为当前版本腿 `401`，
+经直接对常驻网关双口令比对定位为操作侧问题，与代码无关。
+
+### 8.2 项1/项2：CI `workflow_dispatch` 自包含发布验收（阻塞，需用户凭据）
+
+- `.github/workflows/ci.yml` 的 `workflow_dispatch` 入参与开工令要求一致
+  （`run_release_acceptance`、`frontend_e2e_spec=business-docqa-flow.spec.ts`、`perf_probe_preset=release`、
+  `perf_probe_requests=20`、`perf_probe_concurrency=4`），CI 侧自包含栈 job 已在 `66e1d18` 落地。
+- 实跑阻塞点：本机 `gh` 2.101.0 已安装但 `gh auth status` = "not logged into any GitHub hosts"，
+  环境变量 `GITHUB_TOKEN`/`GH_TOKEN` 均未设置，因此**无法在不获取用户凭据的前提下触发远端流水线**。
+  本项不做任何绕过（不改阈值、不改验收口径、不把本地结果冒充 CI 结果）。
+- 需要用户执行：`gh auth login`（或提供可用的 `GITHUB_TOKEN`），随后触发并回填 run 链接与产物。

@@ -77,8 +77,31 @@
 
 1. 在 CI 手动入口复跑完整 `release-acceptance`，确认新增数据库迁移回滚烟测与远端环境结果一致。
 2. 基于发布基线继续扩展容量上限与 soak 测试。
-3. 执行代码版本级回滚演练并写入发布记录。
+3. 执行代码版本级回滚演练并写入发布记录。（2026-09-30 已实跑并落档，见"版本级回滚演练"一节；遗留项是
+   把 soft 授权模式腿固化进 CI，并把回滚下限写入运维手册回滚章节。）
 4. 继续推进高价值控制面细节 Go 原生化，但不再恢复 Python public business/admin surface。
+
+## 最新联调记录（2026-09-30，Release Gate R1 项3：版本级回滚演练）
+
+- [x] 演练口径：夹具只在当前版本用真实 HTTP API 建立一次（第二个 KB + 仅绑 `viewer@kb-b` 的低权限用户），
+  探针断言在回滚前后完全不变，全程本地隔离栈（独立 Postgres + 一次性网关容器），未触碰生产、未 force push。
+- [x] 版本身份链已做实：`git archive <sha>` 取提交态源树 → 容器内 `GOOS=linux CGO_ENABLED=0 go build` →
+  宿主 `sha256sum` → `docker run` 一次性容器 → `docker top` 核对实际进程路径，避免"跑的不是那个版本"的伪证。
+- [x] enforce（`RBAC_AUTHZ_MODE=go_db`）结果：`4f4f205` 15/15、`78b1f28` 15/15、`45db134` 15/15、
+  `a053532` 6/15（9 条失败）；恢复态对常驻网关复探 15/15。
+- [x] soft（`local_jwt_soft` + `RBAC_ENFORCE_BUSINESS_API=false`）结果：`4f4f205` 15/15、`78b1f28` 15/15、
+  `45db134` 14/15（伪造 `x-auth-user-name` 未认证请求返回 200，即 `78b1f28` 关闭的旁路）、`a053532` 5/15。
+- [x] 回滚下限判定：**代码级可回滚下限 = `78b1f28`**；`a053532`（pre-M4-R1 基线）与 `45db134` 均不可作为回滚目标。
+  只跑 enforce 会误判 `45db134` 安全，必须 enforce + soft 双模式各一腿。
+- [x] 迁移状态：11 表 schema 在 `a053532` 与 `4f4f205` 两个二进制间可直接互用，八条腿零 DDL、网关零 ERROR，
+  即本段改造代码回滚与库表回滚解耦，无需 down-migration。
+- [x] `a053532` 失败根因（源码级）：该版本 `go-backend` 中 `KB_SCOPE_REQUIRED|KB_CROSS_SCOPE|KB_ACCESS_DENIED`
+  命中 0 条（`45db134`/`78b1f28` 各 34 条），且 Go 网关未注册 `/api/knowledge-bases`，
+  回滚等于同时砍掉 KB 目录链路与全部作用域守卫。
+- [x] 恢复动作核验：一次性容器 `docker ps -a --filter name=gi-drill-gw` 计数 0；常驻网关 `RestartCount=0`、
+  Cmd 未变；仓库数据文件与临时 worktree 未被改写。
+- [x] 完整记录见 [docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md)。
+- [ ] 遗留：把 soft 模式腿固化进 CI 发布验收；把回滚下限 `78b1f28` 写入 `ENTERPRISE_OPERATIONS_RUNBOOK.md` 回滚章节。
 
 ## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）
 
