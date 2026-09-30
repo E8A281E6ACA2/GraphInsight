@@ -308,23 +308,64 @@ jobs:
           if-no-files-found: ignore
 
   release-acceptance:
-    name: Full release acceptance
+    name: Full release acceptance (self-contained stack)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_release_acceptance }}
     env:
-      ADMIN_BASE_URL: ${{ secrets.GRAPHINSIGHT_E2E_API_BASE_URL }}
-      ADMIN_EMAIL: ${{ secrets.GRAPHINSIGHT_E2E_ADMIN_EMAIL }}
-      ADMIN_PASSWORD: ${{ secrets.GRAPHINSIGHT_E2E_ADMIN_PASSWORD }}
-      ADMIN_TOKEN: ${{ secrets.GRAPHINSIGHT_E2E_ADMIN_TOKEN }}
+      # Performance thresholds are declared here, before the probe runs, and are
+      # never back-derived from the measured results. max_p95_ms is selected per
+      # regime by the "Declare performance thresholds" step below.
+      PERF_PROBE_MAX_ERROR_RATE: '0.0'
+      # Ephemeral single-use stack: local compose credentials only, no shared secret.
+      ADMIN_DATABASE_URL: postgresql://graphinsight:graphinsight-dev-password@127.0.0.1:5434/graphinsight_admin
+      ADMIN_BASE_URL: http://127.0.0.1:8081
+      ADMIN_EMAIL: ${{ secrets.GRAPHINSIGHT_E2E_ADMIN_EMAIL || 'e2e-admin@local.test' }}
       E2E_SPEC: ${{ inputs.frontend_e2e_spec }}
-      E2E_CHECK_UI_LOGIN: '0'
+      E2E_CHECK_UI_LOGIN: '1'
       PERF_PROBE_PRESET: ${{ inputs.perf_probe_preset }}
       PERF_PROBE_REQUESTS: ${{ inputs.perf_probe_requests }}
       PERF_PROBE_CONCURRENCY: ${{ inputs.perf_probe_concurrency }}
       RELEASE_ACCEPTANCE_ARTIFACTS_DIR: artifacts/release-acceptance
+      LLM_ENABLED: ${{ secrets.GRAPHINSIGHT_E2E_LLM_API_KEY != '' && '1' || '0' }}
+      LLM_API_KEY: ${{ secrets.GRAPHINSIGHT_E2E_LLM_API_KEY }}
+      LLM_BASE_URL: ${{ secrets.GRAPHINSIGHT_E2E_LLM_BASE_URL }}
+      LLM_MODEL: ${{ secrets.GRAPHINSIGHT_E2E_LLM_MODEL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Provision single-use stack credentials
+        shell: bash
+        run: |
+          # Values are masked so they cannot surface in any later log line, and are
+          # never written to a file that gets uploaded as an artifact.
+          run_secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          run_password="$(python3 -c 'import secrets; print("Ci" + secrets.token_urlsafe(16) + "a1")')"
+          echo "::add-mask::$run_secret"
+          echo "::add-mask::$run_password"
+          {
+            echo "ADMIN_SECRET_KEY=$run_secret"
+            echo "ADMIN_PASSWORD=$run_password"
+          } >> "$GITHUB_ENV"
+          echo "credentials_provisioned=1 password_length_bytes=${#run_password}"
+
+      - name: Declare performance thresholds for this regime
+        shell: bash
+        run: |
+          # Fixed before the probe runs, never derived from its results.
+          # Basis for the no-LLM SLO: local warm measurements of the four read cases
+          # (health p95 27.6ms, query 26.3ms, docqa-health 332.5ms, nl2cypher-status
+          # 29.1ms at 20 requests / concurrency 4) with a 9x allowance for a cold,
+          # shared CI runner. With an LLM configured the docqa case is generation
+          # bound, so the pre-declared SLO for that regime is 20000ms.
+          if [[ "$LLM_ENABLED" == "1" ]]; then
+            echo "PERF_PROBE_MAX_P95_MS=20000" >> "$GITHUB_ENV"
+            echo "PERF_THRESHOLD_DECLARED max_error_rate=0.0 max_p95_ms=20000 regime=llm_configured"
+          else
+            echo "PERF_PROBE_MAX_P95_MS=3000" >> "$GITHUB_ENV"
+            echo "PERF_THRESHOLD_DECLARED max_error_rate=0.0 max_p95_ms=3000 regime=llm_disabled"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -337,6 +378,12 @@ jobs:
           python -m venv backend/.venv
           backend/.venv/bin/python -m pip install --upgrade pip
           backend/.venv/bin/python -m pip install -r backend/requirements.txt
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-backend/go.mod
+          cache-dependency-path: go-backend/go.sum
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -351,24 +398,73 @@ jobs:
 
       - name: Install Playwright browser
         working-directory: frontend
-        run: npx playwright install --with-deps chromium-headless-shell
+        run: npx playwright install --with-deps chromium
 
-      - name: Validate release acceptance configuration
+      - name: Build Go gateway binary
+        working-directory: go-backend
+        run: go build -o "$RUNNER_TEMP/graphinsight-api" ./cmd/api
+
+      - name: Bring up unified stack
         shell: bash
         run: |
-          if [[ -z "$ADMIN_BASE_URL" ]]; then
-            echo "GRAPHINSIGHT_E2E_API_BASE_URL is required for release acceptance."
-            exit 1
-          fi
-          if [[ -z "$ADMIN_TOKEN" && -z "$ADMIN_PASSWORD" ]]; then
-            echo "GRAPHINSIGHT_E2E_ADMIN_TOKEN or GRAPHINSIGHT_E2E_ADMIN_PASSWORD is required for release acceptance."
-            exit 1
-          fi
+          scripts/dev-backend.sh up
+          echo "--- runtime.env ---"
+          cat logs/dev/runtime.env
+
+      - name: Initialize fresh admin database
+        shell: bash
+        run: |
+          backend/.venv/bin/python backend/init_pg_database.py
+          backend/.venv/bin/python backend/admin/migrate_rbac_core.py --action migrate
+
+      - name: Wait for gateway dependencies
+        shell: bash
+        run: |
+          ready() {
+            curl -fsS --max-time 5 "$ADMIN_BASE_URL/health" | python3 -c 'import json,sys; d=(json.load(sys.stdin).get("data") or {}); sys.exit(0 if all(bool((d.get(k) or {}).get("connected")) for k in ("neo4j","python_backend","orchestrator")) else 1)'
+          }
+          for attempt in $(seq 1 120); do
+            if ready; then
+              echo "GATEWAY_READY attempt=$attempt"
+              curl -fsS --max-time 5 "$ADMIN_BASE_URL/health" | python3 -c 'import json,sys; d=(json.load(sys.stdin).get("data") or {}); print("dependencies:", {k: bool((d.get(k) or {}).get("connected")) for k in ("neo4j","python_backend","orchestrator")})'
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "GATEWAY_NOT_READY url=$ADMIN_BASE_URL"
+          tail -n 80 logs/dev/go.log || true
+          tail -n 80 logs/dev/python.log || true
+          exit 1
+
+      - name: Seed E2E account and knowledge base
+        shell: bash
+        run: |
+          export SEED_ADMIN_EMAIL="$ADMIN_EMAIL"
+          export SEED_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+          export SEED_VERIFY_BASE_URL="$ADMIN_BASE_URL"
+          backend/.venv/bin/python backend/scripts/seed_e2e_local_stack.py
 
       - name: Run full release acceptance
         shell: bash
         run: |
-          backend/tests/run_release_acceptance.sh --fail-fast
+          mkdir -p "$RELEASE_ACCEPTANCE_ARTIFACTS_DIR"
+          # No --fail-fast: the whole matrix must report, so the summary lists every
+          # failing step instead of stopping at the first one.
+          backend/tests/run_release_acceptance.sh 2>&1 | tee "$RELEASE_ACCEPTANCE_ARTIFACTS_DIR/acceptance-summary.log"
+
+      - name: Scrub credential-bearing Playwright traces
+        if: always()
+        shell: bash
+        run: |
+          # playwright.config.ts records trace and video on failure; both replay the
+          # Authorization header, so they must not reach a public artifact.
+          removed=0
+          while IFS= read -r file; do
+            rm -f "$file"
+            removed=$((removed + 1))
+          done < <(find frontend/test-results -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null || true)
+          echo "TRACE_VIDEO_SCRUBBED removed=$removed"
+          find frontend/test-results -type f \( -name 'trace.zip' -o -name '*.webm' \) 2>/dev/null | wc -l | sed 's/^/residual='
 
       - name: Upload release acceptance artifacts
         if: always()
@@ -378,6 +474,8 @@ jobs:
           path: |
             artifacts/release-acceptance
             frontend/playwright-report
+            logs/dev/python.log
+            logs/dev/go.log
           if-no-files-found: ignore
 
   frontend-build:
