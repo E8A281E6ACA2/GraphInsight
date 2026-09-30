@@ -35,6 +35,9 @@ class ProbeCase:
     path: str
     payload: Optional[dict[str, Any]]
     expected_owner: str
+    # 作用域强制（M4）：docqa / graph-build 必须携带 kb 作用域，否则网关返回
+    # 400 KB_SCOPE_REQUIRED，探针会把「契约要求」误报成「接口失败」。
+    scoped: bool = False
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ def _request(
     timeout: float,
     case: ProbeCase,
     check_route_owner: bool,
+    kb_id: str = "",
 ) -> ProbeResult:
     url = base_url.rstrip("/") + case.path
     body = None
@@ -72,6 +76,8 @@ def _request(
     }
     if token.strip():
         headers["Authorization"] = f"Bearer {token.strip()}"
+    if case.scoped and kb_id:
+        headers["x-kb-id"] = kb_id
     if case.payload is not None:
         body = json.dumps(case.payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -165,6 +171,23 @@ def _login(base_url: str, username: str, password: str, timeout: float) -> str:
     return str(token)
 
 
+def _discover_active_kb(base_url: str, token: str, timeout: float) -> str:
+    """取调用账号真实可见的第一个 active KB，避免探针依赖人工指定作用域。"""
+    req = urllib.request.Request(
+        url=base_url.rstrip("/") + "/api/knowledge-bases",
+        method="GET",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token.strip()}"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = _json_or_raw(resp.read().decode("utf-8", errors="replace"))
+    data = body.get("data") if isinstance(body, dict) else None
+    items = data.get("items") if isinstance(data, dict) else None
+    for item in items or []:
+        if isinstance(item, dict) and str(item.get("status")) == "active" and item.get("kb_id"):
+            return str(item["kb_id"])
+    return ""
+
+
 def _issue_local_token(email: str) -> str:
     sys.path.insert(0, str(ROOT))
     from admin.database import SessionLocal
@@ -236,8 +259,8 @@ def _build_cases(args: argparse.Namespace) -> list[ProbeCase]:
         "query": ProbeCase("query", "POST", "/api/query", payload_query, "go-native"),
         "docqa-health": ProbeCase("docqa-health", "GET", "/api/docqa/health?probe_llm=false", None, "go-orchestrator"),
         "nl2cypher-status": ProbeCase("nl2cypher-status", "GET", "/api/nl2cypher/status", None, "go-native"),
-        "docqa": ProbeCase("docqa", "POST", "/api/docqa", payload_docqa, "go-orchestrator"),
-        "graph-build": ProbeCase("graph-build", "POST", "/api/graph/build", payload_build, "go-native"),
+        "docqa": ProbeCase("docqa", "POST", "/api/docqa", payload_docqa, "go-orchestrator", scoped=True),
+        "graph-build": ProbeCase("graph-build", "POST", "/api/graph/build", payload_build, "go-native", scoped=True),
     }
     if args.case:
         selected = args.case
@@ -263,6 +286,7 @@ def _write_markdown_report(path: str, report: dict[str, Any]) -> None:
         f"- requests_per_case: `{report['requests_per_case']}`",
         f"- concurrency: `{report['concurrency']}`",
         f"- preset: `{report['preset']}`",
+        f"- kb_id: `{report.get('kb_id') or '<none>'}`",
         f"- max_error_rate: `{report['thresholds']['max_error_rate']}`",
         f"- max_p95_ms: `{report['thresholds']['max_p95_ms']}`",
         "",
@@ -297,6 +321,11 @@ def main() -> int:
     parser.add_argument("--token", default=os.getenv("ADMIN_TOKEN", ""))
     parser.add_argument("--admin-email", default=os.getenv("ADMIN_EMAIL", "yh@qs.al"))
     parser.add_argument("--admin-password", default=os.getenv("ADMIN_PASSWORD", ""))
+    parser.add_argument(
+        "--kb-id",
+        default=os.getenv("PERF_PROBE_KB_ID", ""),
+        help="KB scope for scoped cases; empty means discover from the caller's visible active KBs",
+    )
     parser.add_argument(
         "--preset",
         choices=["readonly", "release"],
@@ -338,10 +367,25 @@ def main() -> int:
             print(f"LOCAL_TOKEN_INIT_SKIP {exc}")
 
     cases = _build_cases(args)
+    kb_id = args.kb_id.strip()
+    kb_source = "env"
+    if any(case.scoped for case in cases):
+        if not kb_id and token:
+            try:
+                kb_id = _discover_active_kb(args.base_url, token, args.timeout)
+                kb_source = "discover"
+            except Exception as exc:  # noqa: BLE001
+                print(f"KB_DISCOVERY_FAIL {exc.__class__.__name__}")
+        if not kb_id:
+            print("PERF_PROBE_BLOCKED reason=no_visible_active_kb scoped_cases=1")
+            return 1
+        print(f"PERF_PROBE_KB kb_id={kb_id} source={kb_source}")
+
     report: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_url": args.base_url.rstrip("/"),
         "preset": args.preset,
+        "kb_id": kb_id,
         "requests_per_case": args.requests,
         "concurrency": args.concurrency,
         "route_owner_check": not args.skip_route_owner_check,
@@ -368,6 +412,7 @@ def main() -> int:
                     timeout=args.timeout,
                     case=case,
                     check_route_owner=not args.skip_route_owner_check,
+                    kb_id=kb_id,
                 )
                 for _ in range(args.requests)
             ]
