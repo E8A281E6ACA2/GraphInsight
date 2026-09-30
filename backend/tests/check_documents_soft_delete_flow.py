@@ -1,12 +1,19 @@
 """
 Documents soft-delete flow smoke check.
 
-Validates:
-1) delete dry-run preview
-2) soft delete into trash
-3) list deleted documents
-4) restore from trash
-5) cleanup temp file
+Validates (all requests carry an explicit KB scope, contract §2/§3):
+1) upload a smoke document into the active knowledge base
+2) delete dry-run preview
+3) soft delete into trash
+4) list deleted documents
+5) restore from trash
+6) hard delete cleanup
+
+Usage:
+    ADMIN_BASE_URL=http://127.0.0.1:8081 \
+    ADMIN_EMAIL=yh@qs.al \
+    ADMIN_PASSWORD=*** \
+    python backend/tests/check_documents_soft_delete_flow.py
 """
 from __future__ import annotations
 
@@ -16,7 +23,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+import uuid
+
+from kb_scope import require_active_kb
 
 
 def _request(
@@ -24,15 +33,25 @@ def _request(
     url: str,
     *,
     token: str | None = None,
+    kb_id: str | None = None,
     payload: dict | None = None,
+    raw_body: bytes | None = None,
+    content_type: str | None = None,
 ) -> tuple[int, dict | str]:
-    headers = {"Content-Type": "application/json"}
+    headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    if kb_id:
+        headers["x-kb-id"] = kb_id
+    body = raw_body
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif content_type:
+        headers["Content-Type"] = content_type
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             raw = resp.read().decode("utf-8")
             try:
                 return resp.status, json.loads(raw)
@@ -66,8 +85,45 @@ def _login(base: str, username: str, password: str) -> str:
     return str(data["token"])
 
 
-def _list_documents(base: str, token: str) -> list[dict]:
-    status, body = _request("GET", f"{base}/api/documents", token=token)
+def _multipart_upload(filename: str, content: bytes) -> tuple[str, bytes]:
+    boundary = f"----GraphInsightSmoke{uuid.uuid4().hex}"
+    parts = [
+        f"--{boundary}\r\n".encode("utf-8"),
+        (
+            f'Content-Disposition: form-data; name="files"; filename="{filename}"\r\n'
+        ).encode("utf-8"),
+        b"Content-Type: text/plain\r\n\r\n",
+        content,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode("utf-8"),
+    ]
+    return boundary, b"".join(parts)
+
+
+def _upload_document(base: str, token: str, kb_id: str, filename: str, content: bytes) -> str:
+    boundary, body = _multipart_upload(filename, content)
+    status, resp = _request(
+        "POST",
+        f"{base}/api/documents/upload",
+        token=token,
+        kb_id=kb_id,
+        raw_body=body,
+        content_type=f"multipart/form-data; boundary={boundary}",
+    )
+    if status != 200:
+        raise RuntimeError(f"UPLOAD_FAIL status={status} body={resp}")
+    data = _extract_data(resp)
+    uploaded = data.get("uploaded", []) if isinstance(data, dict) else []
+    if not uploaded or not isinstance(uploaded[0], dict):
+        raise RuntimeError(f"UPLOAD_EMPTY body={resp}")
+    doc_id = str(uploaded[0].get("doc_id") or uploaded[0].get("id") or "")
+    if not doc_id:
+        raise RuntimeError(f"UPLOAD_DOC_ID_MISSING body={resp}")
+    return doc_id
+
+
+def _list_documents(base: str, token: str, kb_id: str) -> list[dict]:
+    status, body = _request("GET", f"{base}/api/documents", token=token, kb_id=kb_id)
     if status != 200:
         raise RuntimeError(f"LIST_DOCS_FAIL status={status} body={body}")
     data = _extract_data(body)
@@ -75,8 +131,8 @@ def _list_documents(base: str, token: str) -> list[dict]:
     return items if isinstance(items, list) else []
 
 
-def _list_deleted_documents(base: str, token: str) -> list[dict]:
-    status, body = _request("GET", f"{base}/api/documents/deleted", token=token)
+def _list_deleted_documents(base: str, token: str, kb_id: str) -> list[dict]:
+    status, body = _request("GET", f"{base}/api/documents/deleted", token=token, kb_id=kb_id)
     if status != 200:
         raise RuntimeError(f"LIST_DELETED_FAIL status={status} body={body}")
     data = _extract_data(body)
@@ -87,6 +143,7 @@ def _list_deleted_documents(base: str, token: str) -> list[dict]:
 def _delete_document(
     base: str,
     token: str,
+    kb_id: str,
     doc_id: str,
     *,
     purge_graph: bool,
@@ -106,6 +163,7 @@ def _delete_document(
         "DELETE",
         f"{base}/api/documents/{doc_id}?{query}",
         token=token,
+        kb_id=kb_id,
     )
     if status != 200:
         raise RuntimeError(f"DELETE_DOC_FAIL status={status} body={body}")
@@ -115,21 +173,19 @@ def _delete_document(
     return data
 
 
-def _restore_document(base: str, token: str, doc_id: str) -> dict:
-    status, body = _request("POST", f"{base}/api/documents/{doc_id}/restore", token=token)
+def _restore_document(base: str, token: str, kb_id: str, doc_id: str) -> dict:
+    status, body = _request(
+        "POST",
+        f"{base}/api/documents/{doc_id}/restore",
+        token=token,
+        kb_id=kb_id,
+    )
     if status != 200:
         raise RuntimeError(f"RESTORE_FAIL status={status} body={body}")
     data = _extract_data(body)
     if not isinstance(data, dict):
         raise RuntimeError(f"RESTORE_INVALID body={body}")
     return data
-
-
-def _find_doc_by_name(items: list[dict], name: str) -> dict | None:
-    for item in items:
-        if str(item.get("name")) == name:
-            return item
-    return None
 
 
 def main() -> int:
@@ -143,87 +199,103 @@ def main() -> int:
             print("MISSING_ADMIN_PASSWORD")
             return 1
         token = _login(base, username, password)
-    docs = _list_documents(base, token)
-    print(f"DOCS_BEFORE count={len(docs)}")
 
-    if docs:
-        first_path = Path(str(docs[0].get("path") or "")).resolve()
-        target_dir = first_path.parent if first_path.exists() else (Path(__file__).resolve().parents[1] / "documents")
-    else:
-        target_dir = Path(__file__).resolve().parents[1] / "documents"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    kb_id = require_active_kb("check_documents_soft_delete_flow.py", base, token)
 
     stamp = int(time.time() * 1000)
-    test_name = f"codex_soft_delete_smoke_{stamp}.txt"
-    test_path = target_dir / test_name
-    test_path.write_text("codex soft delete smoke file\n", encoding="utf-8")
-    print(f"TEMP_FILE_CREATED path={test_path}")
-
-    docs = _list_documents(base, token)
-    target_doc = _find_doc_by_name(docs, test_name)
-    if not target_doc:
-        print("TEMP_DOC_NOT_FOUND_IN_LIST")
-        return 1
-    doc_id = str(target_doc.get("id"))
-    print(f"TEMP_DOC_ID id={doc_id}")
-
-    preview = _delete_document(
+    test_name = f"gi_soft_delete_smoke_{stamp}_{uuid.uuid4().hex[:8]}.txt"
+    doc_id = _upload_document(
         base,
         token,
-        doc_id,
-        purge_graph=False,
-        soft_delete=True,
-        dry_run=True,
-        verify_after=False,
+        kb_id,
+        test_name,
+        f"GraphInsight soft delete smoke document {stamp}\n".encode("utf-8"),
     )
-    if not bool(preview.get("dry_run")):
-        print(f"DRY_RUN_FLAG_INVALID data={preview}")
-        return 1
-    print("DRY_RUN_OK")
+    print(f"UPLOAD_OK doc_id={doc_id} name={test_name}")
 
-    deleted = _delete_document(
-        base,
-        token,
-        doc_id,
-        purge_graph=False,
-        soft_delete=True,
-        dry_run=False,
-        verify_after=True,
-    )
-    if str(deleted.get("file_action")) != "soft_deleted":
-        print(f"SOFT_DELETE_ACTION_INVALID data={deleted}")
-        return 1
-    print("SOFT_DELETE_OK")
+    try:
+        docs = _list_documents(base, token, kb_id)
+        print(f"DOCS_AFTER_UPLOAD count={len(docs)}")
+        if not any(str(item.get("id")) == doc_id for item in docs):
+            print(f"UPLOADED_DOC_NOT_IN_LIST doc_id={doc_id}")
+            return 1
 
-    deleted_items = _list_deleted_documents(base, token)
-    if not any(str(item.get("doc_id")) == doc_id for item in deleted_items):
-        print("DELETED_LIST_MISSING_DOC")
-        return 1
-    print(f"DELETED_LIST_OK count={len(deleted_items)}")
+        preview = _delete_document(
+            base,
+            token,
+            kb_id,
+            doc_id,
+            purge_graph=False,
+            soft_delete=True,
+            dry_run=True,
+            verify_after=False,
+        )
+        if not bool(preview.get("dry_run")):
+            print(f"DRY_RUN_FLAG_INVALID data={preview}")
+            return 1
+        print("DRY_RUN_OK")
 
-    restored = _restore_document(base, token, doc_id)
-    restored_doc_id = str(restored.get("doc_id") or "")
-    if not restored_doc_id:
-        print(f"RESTORE_DOC_ID_INVALID data={restored}")
-        return 1
-    print(f"RESTORE_OK new_doc_id={restored_doc_id}")
+        deleted = _delete_document(
+            base,
+            token,
+            kb_id,
+            doc_id,
+            purge_graph=False,
+            soft_delete=True,
+            dry_run=False,
+            verify_after=True,
+        )
+        if str(deleted.get("file_action")) != "soft_deleted":
+            print(f"SOFT_DELETE_ACTION_INVALID data={deleted}")
+            return 1
+        print("SOFT_DELETE_OK")
 
-    cleanup = _delete_document(
-        base,
-        token,
-        restored_doc_id,
-        purge_graph=False,
-        soft_delete=False,
-        dry_run=False,
-        verify_after=False,
-    )
-    if str(cleanup.get("file_action")) != "hard_deleted":
-        print(f"CLEANUP_ACTION_INVALID data={cleanup}")
-        return 1
-    print("CLEANUP_OK")
+        deleted_items = _list_deleted_documents(base, token, kb_id)
+        if not any(str(item.get("doc_id")) == doc_id for item in deleted_items):
+            print("DELETED_LIST_MISSING_DOC")
+            return 1
+        print(f"DELETED_LIST_OK count={len(deleted_items)}")
 
-    print("DOCUMENTS_SOFT_DELETE_FLOW_OK")
-    return 0
+        restored = _restore_document(base, token, kb_id, doc_id)
+        restored_doc_id = str(restored.get("doc_id") or "")
+        if not restored_doc_id:
+            print(f"RESTORE_DOC_ID_INVALID data={restored}")
+            return 1
+        print(f"RESTORE_OK new_doc_id={restored_doc_id}")
+
+        cleanup = _delete_document(
+            base,
+            token,
+            kb_id,
+            restored_doc_id,
+            purge_graph=False,
+            soft_delete=False,
+            dry_run=False,
+            verify_after=False,
+        )
+        if str(cleanup.get("file_action")) != "hard_deleted":
+            print(f"CLEANUP_ACTION_INVALID data={cleanup}")
+            return 1
+        print("CLEANUP_OK")
+
+        print("DOCUMENTS_SOFT_DELETE_FLOW_OK")
+        return 0
+    finally:
+        # 失败路径也不能把夹具留在活动知识库里；成功路径此处是幂等补刀，明确打印结果。
+        try:
+            _delete_document(
+                base,
+                token,
+                kb_id,
+                doc_id,
+                purge_graph=False,
+                soft_delete=False,
+                dry_run=False,
+                verify_after=False,
+            )
+            print("CLEANUP_SWEEP_DONE")
+        except Exception as exc:  # noqa: BLE001
+            print(f"CLEANUP_SWEEP_NOOP detail={exc}")
 
 
 if __name__ == "__main__":

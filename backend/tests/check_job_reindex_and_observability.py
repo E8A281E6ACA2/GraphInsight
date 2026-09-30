@@ -15,11 +15,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from kb_scope import require_active_kb
 
-def _request(method: str, url: str, *, token: str | None = None, payload: dict | None = None) -> tuple[int, dict | str]:
+
+def _request(
+    method: str,
+    url: str,
+    *,
+    token: str | None = None,
+    kb_id: str | None = None,
+    payload: dict | None = None,
+) -> tuple[int, dict | str]:
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if kb_id:
+        headers["x-kb-id"] = kb_id
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
@@ -66,8 +77,17 @@ def main() -> int:
             print(f"LOGIN_NO_TOKEN body={b}")
             return 1
 
-    create_payload = {"tenant_id": "t-slo", "project_id": "p-slo", "payload": {"index_name": "chunkText"}}
-    s, b = _request("POST", f"{base}/api/v1/admin/jobs/reindex", token=token, payload=create_payload)
+    kb_id = require_active_kb("check_job_reindex_and_observability.py", base, token)
+
+    # reindex 创建本身允许 kb 可选，但任务的读取（detail/logs）强制 kb 作用域且要求任务归属
+    # 该 kb（jobBelongsToKB），所以创建时显式带 kb_id，否则作用域读取会 404。
+    create_payload = {
+        "tenant_id": "t-slo",
+        "project_id": "p-slo",
+        "kb_id": kb_id,
+        "payload": {"index_name": "chunkText"},
+    }
+    s, b = _request("POST", f"{base}/api/v1/admin/jobs/reindex", token=token, kb_id=kb_id, payload=create_payload)
     if s not in {200, 201}:
         print(f"REINDEX_CREATE_FAIL status={s} body={b}")
         return 1
@@ -81,7 +101,7 @@ def main() -> int:
     deadline = time.time() + 30
     final_status = ""
     while time.time() < deadline:
-        s, b = _request("GET", f"{base}/api/v1/admin/jobs/{job_id}", token=token)
+        s, b = _request("GET", f"{base}/api/v1/admin/jobs/{job_id}", token=token, kb_id=kb_id)
         if s != 200:
             print(f"REINDEX_GET_FAIL status={s} body={b}")
             return 1
@@ -96,7 +116,7 @@ def main() -> int:
         return 1
 
     qs = urllib.parse.urlencode({"page": 1, "page_size": 100})
-    s, b = _request("GET", f"{base}/api/v1/admin/jobs/{job_id}/logs?{qs}", token=token)
+    s, b = _request("GET", f"{base}/api/v1/admin/jobs/{job_id}/logs?{qs}", token=token, kb_id=kb_id)
     if s != 200:
         print(f"JOB_LOGS_FAIL status={s} body={b}")
         return 1

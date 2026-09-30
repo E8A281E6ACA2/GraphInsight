@@ -390,6 +390,7 @@ def _check_extraction_planner_selects_high_value_chunks() -> None:
 
 
 def _check_graph_extractors_use_runtime_model_config() -> None:
+    from config import get_settings
     from services.llm_entity_extractor import LLMEntityExtractor
     from services.llm_relation_extractor import LLMRelationExtractor
 
@@ -404,23 +405,28 @@ def _check_graph_extractors_use_runtime_model_config() -> None:
         "temperature": 0.2,
     }
 
-    with patch("services.llm_entity_extractor.get_ai_runtime_config", return_value=runtime), patch(
-        "services.llm_entity_extractor.build_openai_client", return_value=_FakeClient()
-    ):
-        extractor = LLMEntityExtractor()
-        extractor._refresh_runtime_config()
-        _assert(extractor.enabled is True, extractor.enabled)
-        _assert(extractor.model == "runtime-model", extractor.model)
-        _assert(extractor._resolved_model == "runtime-model", extractor._resolved_model)
+    # 本用例只验证"运行时模型配置能被抽取器采用"。抽取器的 enabled 还合取了全局开关
+    # settings.llm_enabled / llm_relation_enabled（CI 发布验收按无 LLM 口径跑，
+    # LLM_ENABLED=0），不显式隔离就会把开关关掉的预期行为误报成回归。
+    cfg = get_settings()
+    with patch.object(cfg, "llm_enabled", True), patch.object(cfg, "llm_relation_enabled", True):
+        with patch("services.llm_entity_extractor.get_ai_runtime_config", return_value=runtime), patch(
+            "services.llm_entity_extractor.build_openai_client", return_value=_FakeClient()
+        ):
+            entity = LLMEntityExtractor()
+            entity._refresh_runtime_config()
+            _assert(entity.enabled is True, entity.enabled)
+            _assert(entity.model == "runtime-model", entity.model)
+            _assert(entity._resolved_model == "runtime-model", entity._resolved_model)
 
-    with patch("services.llm_relation_extractor.get_ai_runtime_config", return_value=runtime), patch(
-        "services.llm_relation_extractor.build_openai_client", return_value=_FakeClient()
-    ):
-        extractor = LLMRelationExtractor()
-        extractor._refresh_runtime_config()
-        _assert(extractor.enabled is True, extractor.enabled)
-        _assert(extractor.model == "runtime-model", extractor.model)
-        _assert(extractor._resolved_model == "runtime-model", extractor._resolved_model)
+        with patch("services.llm_relation_extractor.get_ai_runtime_config", return_value=runtime), patch(
+            "services.llm_relation_extractor.build_openai_client", return_value=_FakeClient()
+        ):
+            relation = LLMRelationExtractor()
+            relation._refresh_runtime_config()
+            _assert(relation.enabled is True, relation.enabled)
+            _assert(relation.model == "runtime-model", relation.model)
+            _assert(relation._resolved_model == "runtime-model", relation._resolved_model)
 
 
 def _check_graph_extractor_reasoning_is_bounded() -> None:

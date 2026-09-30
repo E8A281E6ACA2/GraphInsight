@@ -27,6 +27,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from kb_scope import require_active_kb
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -124,8 +126,10 @@ def _build_multipart(file_path: Path, field_name: str = "files") -> tuple[str, b
     return boundary, b"".join(payload)
 
 
-def _list_documents(base_url: str, token: str) -> list[dict]:
-    status, body = _request("GET", f"{base_url}/api/documents", token=token, timeout=30)
+def _list_documents(base_url: str, token: str, kb_id: str) -> list[dict]:
+    status, body = _request(
+        "GET", f"{base_url}/api/documents", token=token, headers={"x-kb-id": kb_id}, timeout=30
+    )
     if status != 200:
         raise RuntimeError(f"LIST_DOCS_FAIL status={status} body={body}")
     data = _extract_data(body)
@@ -140,7 +144,7 @@ def _find_doc(items: list[dict], file_name: str) -> Optional[dict]:
     return None
 
 
-def _delete_document(base_url: str, token: str, doc_id: str) -> dict:
+def _delete_document(base_url: str, token: str, kb_id: str, doc_id: str) -> dict:
     query = urllib.parse.urlencode(
         {
             "purge_graph": "true",
@@ -153,6 +157,7 @@ def _delete_document(base_url: str, token: str, doc_id: str) -> dict:
         "DELETE",
         f"{base_url}/api/documents/{doc_id}?{query}",
         token=token,
+        headers={"x-kb-id": kb_id},
         timeout=120,
     )
     if status != 200:
@@ -163,9 +168,11 @@ def _delete_document(base_url: str, token: str, doc_id: str) -> dict:
     return data
 
 
-def _verify_trace(base_url: str, token: str, trace_id: str) -> dict:
+def _verify_trace(base_url: str, token: str, kb_id: str, trace_id: str) -> dict:
     list_url = f"{base_url}/api/v1/admin/qa-traces?trace_id={trace_id}&page=1&page_size=5"
-    status, body = _request("GET", list_url, token=token, timeout=30)
+    status, body = _request(
+        "GET", list_url, token=token, headers={"x-kb-id": kb_id}, timeout=30
+    )
     if status != 200 or not isinstance(body, dict):
         raise RuntimeError(f"TRACE_LIST_FAIL status={status} body={body}")
     data = _extract_data(body)
@@ -177,6 +184,7 @@ def _verify_trace(base_url: str, token: str, trace_id: str) -> dict:
         "GET",
         f"{base_url}/api/v1/admin/qa-traces/{trace_id}",
         token=token,
+        headers={"x-kb-id": kb_id},
         timeout=30,
     )
     if detail_status != 200 or not isinstance(detail_body, dict):
@@ -246,13 +254,17 @@ def main() -> int:
     created_doc_id: Optional[str] = None
     created_doc_name: Optional[str] = None
     try:
+        kb_id = require_active_kb("check_docqa_full_chain.py", base_url, token)
         print(f"STEP upload file={temp_doc.name}")
         boundary, form_body = _build_multipart(temp_doc)
         upload_status, upload_body = _request(
             "POST",
             f"{base_url}/api/documents/upload",
             token=token,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "x-kb-id": kb_id,
+            },
             data=form_body,
             timeout=120,
         )
@@ -273,7 +285,7 @@ def main() -> int:
             return 1
 
         print("STEP list documents")
-        docs = _list_documents(base_url, token)
+        docs = _list_documents(base_url, token, kb_id)
         print(f"LIST_STATUS 200 count={len(docs)}")
         target = None
         for item in docs:
@@ -289,13 +301,16 @@ def main() -> int:
         create_payload = {
             "tenant_id": "t-docqa-chain",
             "project_id": "p-docqa-chain",
-            "payload": {"source": "documents", "force": True},
+            "kb_id": kb_id,
+            # build_graph 契约要求显式 doc_ids（禁止目录扫描），且必须归属当前 kb。
+            "payload": {"doc_ids": [created_doc_id], "force": True},
             "max_retries": 0,
         }
         create_status, create_body = _request(
             "POST",
             f"{base_url}/api/v1/admin/jobs/build-graph",
             token=token,
+            headers={"x-kb-id": kb_id},
             payload=create_payload,
             timeout=30,
         )
@@ -318,6 +333,7 @@ def main() -> int:
                 "GET",
                 f"{base_url}/api/v1/admin/jobs/{job_id}",
                 token=token,
+                headers={"x-kb-id": kb_id},
                 timeout=30,
             )
             if get_status != 200:
@@ -347,11 +363,13 @@ def main() -> int:
             "question": "这份文档主要是用来验证什么？",
             "top_k": 2,
             "require_citation": True,
+            "kb_id": kb_id,
         }
         qa_status, qa_body = _request(
             "POST",
             f"{base_url}/api/docqa",
             token=token,
+            headers={"x-kb-id": kb_id},
             payload=qa_payload,
             timeout=180,
         )
@@ -369,7 +387,7 @@ def main() -> int:
         print(f"DOCQA_ANSWER_PREVIEW {answer[:120]}")
 
         print("STEP verify qa trace")
-        detail = _verify_trace(base_url, token, trace_id)
+        detail = _verify_trace(base_url, token, kb_id, trace_id)
         print(f"TRACE_QA_TYPE {detail.get('qa_type')}")
         print(f"TRACE_STATUS {detail.get('status')}")
         if detail.get("qa_type") != "docqa":
@@ -380,14 +398,14 @@ def main() -> int:
             return 1
 
         print("STEP delete document")
-        deleted = _delete_document(base_url, token, created_doc_id)
+        deleted = _delete_document(base_url, token, kb_id, created_doc_id)
         print("DELETE_STATUS 200")
         if str(deleted.get("file_action")) != "hard_deleted":
             print(f"DELETE_ACTION_INVALID data={deleted}")
             return 1
 
         print("STEP verify delete")
-        docs_after = _list_documents(base_url, token)
+        docs_after = _list_documents(base_url, token, kb_id)
         if any(str(item.get("id")) == created_doc_id for item in docs_after):
             print("DELETE_VERIFY_FAIL_DOC_STILL_EXISTS")
             return 1
@@ -400,9 +418,9 @@ def main() -> int:
     finally:
         try:
             if created_doc_id:
-                _delete_document(base_url, token, created_doc_id)
-        except Exception:
-            pass
+                _delete_document(base_url, token, kb_id, created_doc_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"CLEANUP_SWEEP_NOOP detail={exc}")
         try:
             temp_doc.unlink(missing_ok=True)
         except Exception:

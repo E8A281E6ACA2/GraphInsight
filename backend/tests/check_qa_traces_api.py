@@ -22,6 +22,8 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
+from kb_scope import require_active_kb
+
 
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     value = os.getenv(name)
@@ -37,11 +39,14 @@ def _request(
     *,
     token: Optional[str] = None,
     payload: Optional[dict] = None,
+    kb_id: Optional[str] = None,
 ) -> tuple[int, dict | str]:
     body = None
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if kb_id:
+        headers["x-kb-id"] = kb_id
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -93,6 +98,7 @@ def _verify_trace(
     *,
     base_url: str,
     token: str,
+    kb_id: str,
     trace_id: str,
     qa_type: str,
     expected_status: str,
@@ -101,6 +107,7 @@ def _verify_trace(
         "GET",
         f"{base_url}/api/v1/admin/qa-traces?trace_id={trace_id}&page=1&page_size=5",
         token=token,
+        kb_id=kb_id,
     )
     if list_status != 200 or not isinstance(list_body, dict):
         raise RuntimeError(f"查询追踪列表失败: status={list_status}, body={list_body}")
@@ -120,6 +127,7 @@ def _verify_trace(
         "GET",
         f"{base_url}/api/v1/admin/qa-traces/{trace_id}",
         token=token,
+        kb_id=kb_id,
     )
     if detail_status != 200 or not isinstance(detail_body, dict):
         raise RuntimeError(f"查询追踪详情失败: status={detail_status}, body={detail_body}")
@@ -154,6 +162,8 @@ def main() -> int:
             print(f"获取 admin_token 失败: {exc}")
             return 1
 
+    kb_id = require_active_kb("check_qa_traces_api.py", base_url, token)
+
     cases = [
         (
             "docqa",
@@ -162,6 +172,7 @@ def main() -> int:
                 "question": "请概述当前知识库的核心主题",
                 "top_k": 2,
                 "require_citation": True,
+                "kb_id": kb_id,
             },
         ),
         (
@@ -171,13 +182,16 @@ def main() -> int:
                 "question": "请总结当前知识库文档的核心主题，并给出风险与下一步建议",
                 "top_k": 8,
                 "max_sub_questions": 4,
+                "kb_id": kb_id,
             },
         ),
     ]
 
     failed = 0
     for qa_type, path, payload in cases:
-        status, body = _request("POST", f"{base_url}{path}", token=token, payload=payload)
+        status, body = _request(
+            "POST", f"{base_url}{path}", token=token, payload=payload, kb_id=kb_id
+        )
         trace_id = _extract_trace_id(body)
         expected_trace_status = "success" if status == 200 else "failed"
 
@@ -194,6 +208,7 @@ def main() -> int:
             _verify_trace(
                 base_url=base_url,
                 token=token,
+                kb_id=kb_id,
                 trace_id=trace_id,
                 qa_type=qa_type,
                 expected_status=expected_trace_status,
