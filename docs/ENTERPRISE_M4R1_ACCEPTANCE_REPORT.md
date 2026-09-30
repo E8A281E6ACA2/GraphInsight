@@ -292,6 +292,28 @@ Linux 构建，本地 Windows 只能验证执行器起停编排（已用桩二�
 - [x] 项4 state 保护与隔离清理（含 POSIX 实证与残留复核）
 - [x] 项5 无 LLM 口径统一为检索/引用链路 smoke
 - [x] 项6 临时性能阈值与复审触发落档
-- [ ] 项7 提交与 fast-forward push（见 §9.9）
+- [x] 项7 提交与 fast-forward push（见 §9.9）
 - [ ] 项8 CI 侧证据（workflow run URL、`ACCEPTANCE_SUMMARY`、Playwright exit、artifacts 链接、
   敏感信息扫描结果）仍受 §8.2 凭据阻塞，未取得不申报
+
+### 9.9 R2 收口提交（2026-09-30，已 fast-forward push 并权威源核验）
+
+本地提交四个，均基于上一轮 `3dac3e1`，push 为 fast-forward
+（`3dac3e1..def7bf9 main -> main`），核验结果与权威源一致：
+
+- `080fdfe` fix(ci): seed E2E account before rollback fixtures and fix residual scans
+- `380a169` test(rbac): thread explicit KB scope through backend smoke scripts
+- `d02591b` fix(admin): project only bound columns in first-user migration
+- `def7bf9` fix(e2e): fall back to real gateway URL for same-origin/auto base
+
+本地基线确认：`git rev-parse HEAD == git ls-remote origin refs/heads/main == def7bf9273ceaad6b18da17600532e0a24e5d485`。
+
+push 后 run#24（event=push，sha=def7bf9）自动 CI 全绿：
+Backend smoke script syntax、Go backend tests、Backend unified boundary guards、
+Frontend build 均 `conclusion=success`；发布验收类 job 依赖
+`run_release_acceptance=true` dispatch 输入，push 路径按设计 skip。
+
+run#23 失败根因已定位并修复：rollback matrix `Establish drill fixtures` 腿
+`SETUP_BLOCKED login status=401 error_code=INVALID_CREDENTIALS`，因为夹具阶段先于
+E2E 账号 seed 执行；`080fdfe` 在夹具前插入 seed 步骤。新 dispatch 未跑前，
+run#23/#22 失败不作为通过证据，项8 不申报完成。
