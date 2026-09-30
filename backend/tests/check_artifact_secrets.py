@@ -27,8 +27,10 @@ PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("dsn_with_credentials", re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]{1,64}:[^\s/:@]{3,128}@[0-9a-zA-Z.-]+")),
     (
         "credential_assignment",
+        # 值字符集排除 ; { }：minified JS 里 o.password=null;const 之类的结构赋值
+        # 会把 JS 语法片段当成凭据值误报；真实凭据通常带引号，仍能被捕获。
         re.compile(
-            r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b\s*[:=]\s*[\"']?([^\s\"',}]{6,})"
+            r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b\s*[:=]\s*[\"']?([^\s\"',;{}]{6,})"
         ),
     ),
     ("bcrypt_hash", re.compile(r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")),
