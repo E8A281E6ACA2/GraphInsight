@@ -293,8 +293,8 @@ Linux 构建，本地 Windows 只能验证执行器起停编排（已用桩二�
 - [x] 项5 无 LLM 口径统一为检索/引用链路 smoke
 - [x] 项6 临时性能阈值与复审触发落档
 - [x] 项7 提交与 fast-forward push（见 §9.9）
-- [ ] 项8 CI 侧证据（workflow run URL、`ACCEPTANCE_SUMMARY`、Playwright exit、artifacts 链接、
-  敏感信息扫描结果）仍受 §8.2 凭据阻塞，未取得不申报
+- [x] 项8 CI 侧证据（workflow run URL、`ACCEPTANCE_SUMMARY`、Playwright exit、artifacts 链接、
+  敏感信息扫描结果）run#26 全绿取得并留档（见 §9.10）
 
 ### 9.9 R2 收口提交（2026-09-30，已 fast-forward push 并权威源核验）
 
@@ -317,3 +317,61 @@ run#23 失败根因已定位并修复：rollback matrix `Establish drill fixture
 `SETUP_BLOCKED login status=401 error_code=INVALID_CREDENTIALS`，因为夹具阶段先于
 E2E 账号 seed 执行；`080fdfe` 在夹具前插入 seed 步骤。新 dispatch 未跑前，
 run#23/#22 失败不作为通过证据，项8 不申报完成。
+
+### 9.10 run#26 发布验收全绿与独立复核（2026-09-30）
+
+**基准与推送**：run#26 基于 `03475e6`（`628c879` 单测隔离 / `52d3c52` go smoke KB
+作用域 / `03475e6` secret-scan 误报修复，均 fast-forward `28e7fbb..03475e6 main -> main`）。
+本机出口对 github.com 间歇可用，远端核验同时使用 `git ls-remote` 与 `gh api` 两个权威源，
+验收链路不依赖单条命令成功。
+
+**Workflow run**：https://github.com/E8A281E6ACA2/GraphInsight/actions/runs/36715834244
+- event=workflow_dispatch；inputs：`run_release_acceptance=true` `run_rollback_matrix=true`
+  `frontend_e2e_spec=business-docqa-flow.spec.ts` `perf_probe_preset=release`
+  `perf_probe_requests=20` `perf_probe_concurrency=4`（rollback 版本走默认 HEAD,78b1f28）
+- 无 LLM 口径：`LLM_ENABLED=0`；结论 `completed/success`，`--log-failed` 为空
+
+**Job 构成（写实：6 success + 5 skipped-by-design）**
+- success：Backend unified boundary guards (54s) / Backend smoke script syntax (6s) /
+  Go backend tests (13s) / Full release acceptance self-contained (3m29s) /
+  Rollback acceptance matrix enforce+soft (2m4s) / Frontend build (47s)
+- skipped（各自 dispatch input 门控，等价内容已在 release-acceptance 内以步骤执行）：
+  Release frontend DocQA E2E / Performance probe / Backend release smoke suite /
+  Frontend DocQA E2E / Performance soak
+
+**步骤级证据**：`ACCEPTANCE_STEP_OK` ×5（unified-boundary-guards 13s /
+migration-rollback-smoke 13s / backend-smoke 10s / frontend-e2e 17s 含 Playwright
+`2 passed (15.5s)` / perf-probe 2s）；`ACCEPTANCE_SUMMARY failures=0`。
+
+**回滚矩阵（enforce + soft × HEAD/78b1f28，四条腿）**
+- `ROLLBACK_MATRIX_SUMMARY versions=2 modes=2 legs=4 legs_passed=4 legs_failed=0`
+- HEAD/enforce=pass、HEAD/soft=pass、78b1f28/enforce=pass、78b1f28/soft=pass，
+  每条腿 `ROLLBACK_DRILL_SUMMARY passed=15 failed=0 exit=0`
+- `CANDIDATE_BUILT`：HEAD(03475e6) 与 78b1f28 的 go-api 二进制 sha256 相同
+  （bb88b2de…）。区间 `78b1f28..03475e6` 的 go-backend 仅含
+  `internal/adminstore/rbac_seed_parity_test.go`（_test.go，不进 `go build`）与
+  `scripts/smoke_orchestrated_routes.py`（Python），无非测试 Go 源码变更，二进制
+  相同与结论一致。
+
+**敏感扫描**：release-acceptance job `SECRET_SCAN_SUMMARY paths=4 files=6 bytes=687785
+credential_env_vars=2 allowed_fixtures=3 findings=0 result=pass`；rollback-matrix job
+`SECRET_SCAN_SUMMARY paths=2 files=10 bytes=24895 credential_env_vars=2
+allowed_fixtures=3 findings=0 result=pass`；全 run 无真实 `SECRET_FINDING`。
+
+**性能（无 LLM 口径，事前声明临时 SLO）**：`PERF_THRESHOLD_DECLARED max_error_rate=0.0
+max_p95_ms=3000 regime=llm_disabled`；6 探针 `error_rate=0.00%`，p95：health 17.2ms /
+query 36.4ms / docqa-health 278.0ms / nl2cypher-status 4.0ms / docqa 195.2ms /
+graph-build 199.2ms。
+
+**Artifacts**：release-acceptance-artifacts（220084 B）、rollback-matrix-artifacts（6885 B）。
+
+**已知残留风险（secret scan 形状层盲区，3 项；其中 1 项为本轮正则改动引入）**
+1. 值内前 6 字符含 `;`/`{` 的未加引号凭据漏检（如 `password=ab;cdefghij`）。本轮为消除
+   minified JS 误报在值字符集排除 `;{` 引入；缓解：真实凭据走 `--secret-env-var` 字面值层仍
+   会被捕获，后续优先改为路径排除（playwright-report/、第三方 bundle、`*.min.js`）而非全局
+   放宽字符集。
+2. `\b` 键锚点不命中下划线前缀键（如 `ADMIN_PASSWORD=xxx`），既有盲区。
+3. `password={...}` JSON 对象值不命中，既有盲区。
+
+跟进立项：secret scan 补正样本自检（喂已知凭据断言 `findings>0`、minified 样本断言不命中）
+并评估路径排除改造，见任务清单。
