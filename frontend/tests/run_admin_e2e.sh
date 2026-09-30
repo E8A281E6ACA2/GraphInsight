@@ -173,6 +173,13 @@ resolve_admin_token() {
     return 1
   fi
 
+  # same-origin/auto 是浏览器侧的哨兵值（由 vite 代理解析），不是可 curl 的地址。
+  # 服务端预检必须落到真实网关地址，否则 curl 会拿 "same-origin/..." 当 URL 直接失败。
+  case "$base_url" in
+    http://*|https://*) ;;
+    *) base_url="$BACKEND_HEALTH_URL" ;;
+  esac
+
   response="$(
     curl -fsS \
       -H 'Content-Type: application/json' \
