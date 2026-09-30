@@ -124,10 +124,19 @@ jobs:
             backend/tests/run_perf_soak.py \
             backend/tests/check_artifact_secrets.py \
             backend/tests/check_rbac_catalog_parity.py \
+            backend/tests/check_workflow_contexts.py \
             backend/tests/run_rollback_drill.py \
             go-backend/scripts/smoke_orchestrated_routes.py
           bash -n backend/tests/run_release_acceptance.sh frontend/tests/run_admin_e2e.sh \
             backend/tests/run_rollback_matrix.sh backend/tests/run_rollback_leg.sh
+
+      - name: Check workflow expression contexts
+        run: |
+          # Actions 只在 push 之后才报 "workflow is not valid"，而且这个 run 没有日志、
+          # 没有 job、没有 check-run。位置非法的 context（如 job 级 env 用 runner.temp）
+          # 必须在合并前静态判掉。
+          python -m pip install --quiet pyyaml
+          python backend/tests/check_workflow_contexts.py --path .github/workflows
 
   backend-unified-guards:
     name: Backend unified boundary guards
