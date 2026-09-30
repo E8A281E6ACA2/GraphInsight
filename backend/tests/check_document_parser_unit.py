@@ -523,48 +523,54 @@ def _check_relation_prompt_budget() -> None:
 
 
 def _check_relation_timeout_circuit_breaker() -> None:
+    from config import get_settings
     from services.llm_relation_extractor import LLMRelationExtractor
 
-    calls = {"count": 0}
+    # 抽取器的 enabled 合取全局 settings.llm_enabled / llm_relation_enabled
+    # （CI 发布验收按无 LLM 口径跑 LLM_ENABLED=0），不显式隔离就会把"开关关闭
+    # 时短路"的预期行为误报成断路器回归。
+    cfg = get_settings()
+    with patch.object(cfg, "llm_enabled", True), patch.object(cfg, "llm_relation_enabled", True):
+        calls = {"count": 0}
 
-    class _FakeModel:
-        id = "runtime-model"
+        class _FakeModel:
+            id = "runtime-model"
 
-    class _FakeModels:
-        def list(self):
-            return type("ModelList", (), {"data": [_FakeModel()]})()
+        class _FakeModels:
+            def list(self):
+                return type("ModelList", (), {"data": [_FakeModel()]})()
 
-    class _FakeCompletions:
-        def create(self, **_kwargs):
-            calls["count"] += 1
-            raise TimeoutError("Request timed out.")
+        class _FakeCompletions:
+            def create(self, **_kwargs):
+                calls["count"] += 1
+                raise TimeoutError("Request timed out.")
 
-    class _FakeChat:
-        completions = _FakeCompletions()
+        class _FakeChat:
+            completions = _FakeCompletions()
 
-    class _FakeClient:
-        models = _FakeModels()
-        chat = _FakeChat()
+        class _FakeClient:
+            models = _FakeModels()
+            chat = _FakeChat()
 
-    runtime = {
-        "enabled": True,
-        "api_key": "test-key",
-        "base_url": "https://runtime.example/v1",
-        "model": "runtime-model",
-        "temperature": 0.1,
-    }
+        runtime = {
+            "enabled": True,
+            "api_key": "test-key",
+            "base_url": "https://runtime.example/v1",
+            "model": "runtime-model",
+            "temperature": 0.1,
+        }
 
-    with patch("services.llm_relation_extractor.get_ai_runtime_config", return_value=runtime), patch(
-        "services.llm_relation_extractor.build_openai_client", return_value=_FakeClient()
-    ):
-        extractor = LLMRelationExtractor()
-        text = "125g/L氟环唑SC用于防治小麦条锈病。"
-        entities = ["125g/L氟环唑SC", "小麦条锈病"]
-        _assert(extractor.extract(text, entities, reasoning_profile="balanced") == [], "first timeout should fallback")
-        _assert(extractor.extract(text, entities, reasoning_profile="balanced") == [], "second timeout should fallback")
-        _assert(extractor._disabled_until > 0, "timeout circuit should open after repeated timeouts")
-        _assert(extractor.extract(text, entities, reasoning_profile="balanced") == [], "cooldown should short-circuit")
-        _assert(calls["count"] == 2, calls)
+        with patch("services.llm_relation_extractor.get_ai_runtime_config", return_value=runtime), patch(
+            "services.llm_relation_extractor.build_openai_client", return_value=_FakeClient()
+        ):
+            extractor = LLMRelationExtractor()
+            text = "125g/L氟环唑SC用于防治小麦条锈病。"
+            entities = ["125g/L氟环唑SC", "小麦条锈病"]
+            _assert(extractor.extract(text, entities, reasoning_profile="balanced") == [], "first timeout should fallback")
+            _assert(extractor.extract(text, entities, reasoning_profile="balanced") == [], "second timeout should fallback")
+            _assert(extractor._disabled_until > 0, "timeout circuit should open after repeated timeouts")
+            _assert(extractor.extract(text, entities, reasoning_profile="balanced") == [], "cooldown should short-circuit")
+            _assert(calls["count"] == 2, calls)
 
 
 def _check_high_value_experiment_fact_rules() -> None:
