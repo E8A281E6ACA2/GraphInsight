@@ -657,8 +657,19 @@ jobs:
             mkdir -p "$build_dir"
             git archive "$sha" go-backend | tar -x -C "$RUNNER_TEMP/drill-build/$version"
             (cd "$build_dir" && CGO_ENABLED=0 go build -trimpath -o bin/api ./cmd/api)
-            echo "CANDIDATE_BUILT version=$version sha=$sha sha256=$(sha256sum bin/api | cut -c1-64)"
+            # subshell 的 cd 不持久，sha256sum 必须在构建目录内跑，否则证据里是空哈希。
+            (cd "$build_dir" && echo "CANDIDATE_BUILT version=$version sha=$sha sha256=$(sha256sum bin/api | cut -c1-64)")
           done
+
+      - name: Seed E2E account and knowledge base
+        shell: bash
+        run: |
+          # 夹具阶段要用真实登录取 token，而本 job 的口令是每次运行现生成的随机值，
+          # 没有这一步就没有对应账号，run #23 就是这样在 setup 腿报 401 INVALID_CREDENTIALS 的。
+          export SEED_ADMIN_EMAIL="$ADMIN_EMAIL"
+          export SEED_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+          export SEED_VERIFY_BASE_URL="$ADMIN_BASE_URL"
+          backend/.venv/bin/python backend/scripts/seed_e2e_local_stack.py
 
       - name: Establish drill fixtures on the release version
         shell: bash
@@ -704,9 +715,13 @@ jobs:
         if: always()
         shell: bash
         run: |
-          residual="$(pgrep -f 'drill-build/.*/bin/api' | wc -l | tr -d ' ')"
+          # 两个坑：pgrep 无命中返回 1，会被步骤默认的 `bash -e` 当成失败（而那恰好是"零残留"
+          # 的健康态）；同时包装 shell 的命令行里带着这个字面量，pgrep -f 会把它自己数进去。
+          # 用字符类打断字面量自匹配，并用 || true 收掉无命中的退出码。
+          residual="$(pgrep -f '[d]rill-build/.*/bin/api' | grep -c . || true)"
+          state_files="$(find . -name '*drill_state*.json' -not -path './backend/.venv/*' | grep -c . || true)"
           echo "LEG_CLEANUP_RESIDUAL processes=$residual"
-          echo "REPO_STATE_RESIDUAL files=$(find . -name '*drill_state*.json' -not -path './backend/.venv/*' | wc -l | tr -d ' ')"
+          echo "REPO_STATE_RESIDUAL files=$state_files"
           [[ "$residual" == "0" ]] || { echo "::error::rollback legs still running after the matrix"; exit 1; }
 
       - name: Scan upload paths for credential material
