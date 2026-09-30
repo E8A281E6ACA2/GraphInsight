@@ -93,7 +93,13 @@ def grant_super_admin_to_first_user() -> None:
 
     db = SessionLocal()
     try:
-        first_user = db.query(AdminUser).order_by(AdminUser.id.asc()).first()
+        # 只投影绑定角色所需的列：legacy admin_users 可能缺后续迁移新增的列
+        # （如 preferred_home_path），整行加载会让本迁移在老库上因无关列缺失而失败。
+        first_user = (
+            db.query(AdminUser.id, AdminUser.username)
+            .order_by(AdminUser.id.asc())
+            .first()
+        )
         if not first_user:
             print("! 未找到管理员用户，跳过默认角色绑定")
             return
