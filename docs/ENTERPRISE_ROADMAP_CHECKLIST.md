@@ -76,12 +76,13 @@
 ## 当前优先级（下一步）
 
 1. 在 CI 手动入口复跑完整 `release-acceptance`，确认新增数据库迁移回滚烟测与远端环境结果一致。
-2. 基于发布基线继续扩展容量上限与 soak 测试。
+2. 基于发布基线继续扩展容量上限与 soak 测试。（2026-09-30 已跑通 release soak 3 轮并落档，遗留：并发
+   4→8→16 递增 capacity 矩阵、带真实 embedding/LLM 配置的同口径复跑。）
 3. 执行代码版本级回滚演练并写入发布记录。（2026-09-30 已实跑并落档，见"版本级回滚演练"一节；遗留项是
    把 soft 授权模式腿固化进 CI，并把回滚下限写入运维手册回滚章节。）
 4. 继续推进高价值控制面细节 Go 原生化，但不再恢复 Python public business/admin surface。
 
-## 最新联调记录（2026-09-30，Release Gate R1 项3：版本级回滚演练）
+## 最新联调记录（2026-09-30，Release Gate R1 项3/项4：回滚演练与 soak）
 
 - [x] 演练口径：夹具只在当前版本用真实 HTTP API 建立一次（第二个 KB + 仅绑 `viewer@kb-b` 的低权限用户），
   探针断言在回滚前后完全不变，全程本地隔离栈（独立 Postgres + 一次性网关容器），未触碰生产、未 force push。
@@ -102,6 +103,18 @@
   Cmd 未变；仓库数据文件与临时 worktree 未被改写。
 - [x] 完整记录见 [docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md)。
 - [ ] 遗留：把 soft 模式腿固化进 CI 发布验收；把回滚下限 `78b1f28` 写入 `ENTERPRISE_OPERATIONS_RUNBOOK.md` 回滚章节。
+- [x] soak/capacity 阈值与参数在执行前落档声明，执行后未回改：`preset=release`、`rounds=3`、
+  `requests=20`、`concurrency=4`、`max_error_rate=0.0`（与发布验收同口径，不放宽）、
+  `max_p95_ms=0`（沿用既有"0 即关闭"口径，本轮不新增延迟门禁）。
+- [x] release soak 实跑全绿：360 请求（6 用例 × 20 × 3 轮）零失败，`SOAK_SUMMARY rounds=3 failed_rounds=0`，
+  `route_owner_check=true`；表内数值逐个与 `summary.json` 复核一致。最慢一环是 `docqa-health`
+  （p50 270-350ms，串到 Python 能力层），`docqa` 轮1 p95=310ms 后收敛到 85-90ms（热身效应）。
+- [x] 已写明容量结论的边界：隔离栈未配置 embedding/LLM，`docqa` 返回 200 但检索为空（`citations=0`），
+  故本轮 p95 不代表真实模型生成时延；`graph-build` 走"提交即取消"，只测任务受理路径。
+  带模型的容量口径需在配置真实模型凭据的栈上另跑一轮且先声明阈值。
+- [x] soak 运行器可跨平台复跑：`backend/tests/run_perf_soak.py` 不再硬依赖 `backend/.venv/bin/python`
+  （缺失时回退当前解释器，可用 `--python`/`SOAK_PYTHON` 指定），子进程输出按 UTF-8 捕获。
+- [ ] 遗留：并发 4→8→16 的 capacity 递增矩阵，用于定位真实上限（当前只有并发 4 单点）。
 
 ## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）
 

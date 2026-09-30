@@ -180,3 +180,16 @@ E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好�
   环境变量 `GITHUB_TOKEN`/`GH_TOKEN` 均未设置，因此**无法在不获取用户凭据的前提下触发远端流水线**。
   本项不做任何绕过（不改阈值、不改验收口径、不把本地结果冒充 CI 结果）。
 - 需要用户执行：`gh auth login`（或提供可用的 `GITHUB_TOKEN`），随后触发并回填 run 链接与产物。
+
+### 8.3 项4：soak / capacity（2026-09-30 已跑单点，阈值先声明）
+
+- 阈值与参数在执行前写入 `docs/ENTERPRISE_PERF_SOAK_2026_09_30.md` §1 并声明"事后不回改"：
+  `preset=release`、`rounds=3`、`requests=20`、`concurrency=4`、`max_error_rate=0.0`（与发布验收同口径）、
+  `max_p95_ms=0`（沿用"0 即关闭"，本轮不新增延迟门禁）。
+- 实跑（隔离统一栈 `127.0.0.1:18090`，Go 代码与 HEAD 等价）：360 请求零失败，
+  `SOAK_SUMMARY rounds=3 failed_rounds=0`、`route_owner_check=true`；表内数值逐个与 `summary.json` 复核一致。
+- 如实记录的限制：隔离栈无 embedding/LLM 配置，`docqa` 检索为空（`citations=0`），故 p95 不代表真实模型
+  生成时延；`graph-build` 为"提交即取消"，只测受理路径。真实模型容量与 4→8→16 递增 capacity 仍待补。
+- 为让 soak 能在本机复跑，修了 `backend/tests/run_perf_soak.py` 两处平台假设：不再硬要求
+  `backend/.venv/bin/python`（缺失时回退当前解释器，支持 `--python` / `SOAK_PYTHON`），
+  子进程输出显式按 UTF-8 捕获（沿用整改2 的口径，避免中文输出触发 cp936 解码失败）。
