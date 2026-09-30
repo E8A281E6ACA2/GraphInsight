@@ -10,7 +10,7 @@
 
 strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜底，fail-closed 为唯一形态；第一阶段通用 RBAC soft 语义（store 不可用/错误/拒绝软放行、local_jwt_soft）按设计保留，不受第二阶段 KB 授权影响。该口径由 `backend/tests/check_migration_cleanup_guards.py::test_kb_scope_strict_mode_has_no_compat_toggle` 静态守卫防削弱。
 
-## 2. 提交清单（本地 main，领先 origin/main 跟踪引用 15 个提交，待 push）
+## 2. 提交清单（origin/main 已收至 `a268a1e`；下表末行为本报告所在提交，同样已推送）
 
 | 提交 | 说明 |
 |---|---|
@@ -27,7 +27,9 @@ strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜�
 | `6705e25` | fix(tests): 统一边界守卫子进程输出按 UTF-8 捕获 |
 | `e4eccd8` | chore(repo): 忽略 Python 能力层 8001 运行态输出文件 |
 | `3df2bd5` | docs(enterprise): 记录复审整改轮与复跑证据 |
-| 本次提交 | docs(enterprise): 补记身份头剥离后的统一活栈与 E2E 复跑结果 |
+| `d392fb0` | docs(enterprise): 补记身份头剥离后的统一活栈与 E2E 复跑结果 |
+| `a268a1e` | docs(enterprise): 记录 push 出口复测与提交计数 |
+| 本次提交 | docs(enterprise): 记录 push 完成与远端一致性核验 |
 
 ## 3. 阻断项逐项证据
 
@@ -73,7 +75,7 @@ strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜�
 
 - 3 个 UI 登录 E2E 用例 skip（需人工密码），认证路径由 token 注入用例覆盖。
 - 嵌入端点 `api.vectorgate.ai` TLS SSL 错误为外部网络问题；检索走关键词模式，不影响本轮验收面。
-- push 尚待执行（本机无 GitHub 网络出口），复审可先基于本地提交或待 push 后以远端为准。
+- push 已完成并通过远端一致性核验（见 §7.6）；GitHub 出口在本机是间歇可用，命令超时需重试而非判定"无出口"。
 
 ## 7. 复审整改轮（2026-09-30，专家 5 项）
 
@@ -125,5 +127,15 @@ E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好�
 
 ### 7.5 待办
 
-- push 与 `git rev-parse HEAD` / `git ls-remote origin refs/heads/main` 一致性核验仍需在有 GitHub 出口的环境执行。2026-09-30 再次实测：`git ls-remote origin` 与 `git push --dry-run origin refs/heads/main:refs/heads/main` 均 `Failed to connect to github.com:443`（约 21s 超时），本机无出口；本地 main 领先 `origin/main` 跟踪引用（`a053532`）15 个提交，且 `git merge-base` 确认该跟踪引用是 HEAD 祖先，push 为纯 fast-forward、无冲突风险。**远端实际状态未经权威核验**：本轮出现一次 `ls-remote` 返回 `a053532`、紧随其后的重复 `ls-remote` 与 `push --dry-run` 均连接失败，前后矛盾，不能据此断言远端仍停在 `a053532`；必须在有出口的环境按 §7.5 首条命令核验。
 - 独立待办（与本轮整改无关）：`backend/scripts/seed_e2e_local_stack.py` 在本地活栈播种时打印 "admin user updated" 但新密码哈希实际未落库（`bcrypt.checkpw` 为 False），本轮靠手工 `UPDATE admin_users SET password_hash=...` 解除阻塞，需单独排查提交路径。
+
+### 7.6 整改 5：push 与远端一致性核验（2026-09-30，已完成）
+
+- 前置说明：7.4 记录过本机 `git ls-remote` / `git push --dry-run` 连不上 `github.com:443`（约 21s 超时）。实测该出口是**间歇可用**而非彻底不通——同一命令重试即可建立连接，因此"本机无出口"的旧判断已被证伪，报告以最终成功的核验为准。
+- 执行前确认：`git merge-base HEAD <远端 main>` 等于远端引用，push 为纯 fast-forward、不涉及强推与历史改写。
+- 执行：`git push origin refs/heads/main:refs/heads/main` → `a053532..a268a1e  main -> main`，`PUSH_EXIT=0`。
+- 一致性核验（整改要求的两条命令）：
+  - `git rev-parse HEAD` = `a268a1ebdf1bcd9d357adbc93afe99fded5608cd`
+  - `git ls-remote origin refs/heads/main` = `a268a1ebdf1bcd9d357adbc93afe99fded5608cd`
+  - `cmp` 逐字节相等 → `MATCH=yes`；`git rev-list --count origin/main..HEAD` = 0；工作树干净。
+- 敏感面复查：推送区间 `a053532..a268a1e` 共 150 个文件，按 `\.env|token|secret|password|credential|dump|\.log$|\.py8001` 过滤仅命中 `backend/.env.example`，其新增键为 `EMBEDDING_PROVIDER/BASE_URL/API_KEY=` 空占位（模板文件，无真实凭据）。本地 `.e2e_token.tmp`、`.e2e_recheck.log`、`.py8001.*`、`go-backend/bin/` 均为未跟踪/忽略态，未进入任何提交。
