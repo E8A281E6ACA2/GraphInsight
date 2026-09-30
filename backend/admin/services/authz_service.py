@@ -36,9 +36,15 @@ SYSTEM_ROLES = {
 PERMISSION_DEFS = [
     {"code": "graph:read", "resource_type": "graph", "action": "read", "description": "图谱查询与查看"},
     {"code": "graph:build", "resource_type": "graph", "action": "build", "description": "图谱构建与重建"},
+    # 与 go-backend/internal/adminstore/rbac_seed.go 保持一致：/api/query 强制 graph:admin。
+    {"code": "graph:admin", "resource_type": "graph", "action": "admin", "description": "原始 Cypher 诊断查询（受限）"},
     {"code": "kb:read", "resource_type": "kb", "action": "read", "description": "知识库读取"},
     {"code": "kb:write", "resource_type": "kb", "action": "write", "description": "知识库写入"},
     {"code": "kb:delete", "resource_type": "kb", "action": "delete", "description": "知识库删除"},
+    # 预留权限码：仅注册进目录，不参与任何强制校验，也不授予任何角色。
+    {"code": "kb:review", "resource_type": "kb", "action": "review", "description": "知识库审核（预留）"},
+    {"code": "kb:manage", "resource_type": "kb", "action": "manage", "description": "知识库治理（预留）"},
+    {"code": "kb:publish", "resource_type": "kb", "action": "publish", "description": "知识库发布（预留）"},
     {"code": "qa:ask", "resource_type": "qa", "action": "ask", "description": "文档问答"},
     {"code": "nl2cypher:use", "resource_type": "nl2cypher", "action": "use", "description": "自然语言转 Cypher"},
     {"code": "config:read", "resource_type": "config", "action": "read", "description": "配置读取"},
@@ -52,7 +58,26 @@ PERMISSION_DEFS = [
 ]
 
 ROLE_PERMISSION_CODES = {
-    "super_admin": [item["code"] for item in PERMISSION_DEFS],
+    # super_admin 显式列权限码而不是"目录全集"，否则预留码会被隐式授予，
+    # 与 Go 侧 rbac_seed.go 的授予口径产生分歧。
+    "super_admin": [
+        "graph:read",
+        "graph:build",
+        "graph:admin",
+        "kb:read",
+        "kb:write",
+        "kb:delete",
+        "qa:ask",
+        "nl2cypher:use",
+        "config:read",
+        "config:write",
+        "logs:read",
+        "logs:clean",
+        "monitor:read",
+        "user:manage",
+        "job:read",
+        "job:manage",
+    ],
     "project_admin": [
         "graph:read",
         "graph:build",
