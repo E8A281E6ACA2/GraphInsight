@@ -164,8 +164,18 @@
 - [x] 接线与取证：`run_unified_boundary_guards.py` 新增 case `secret_scanner_selftest`
   （本地复跑 `SUMMARY total=16 failed=0`）；`ci.yml` `backend-scripts` py_compile 清单加入该文件；
   CI 实际扫描范围（playwright-report/test-results/artifacts/logs/dev）新旧均 `findings=0`。
-- [ ] 遗留：本轮未 push（github.com 出口连接超时），CI 实跑证据待下轮有出口时补；已知代价两条
-  （`Pa(ss)word` 形态不报、排除路径不扫赋值形状）详见 `docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md` §9.11。
+- [x] 出口恢复后补证（2026-10-02）：github.com 仍只解析到被丢包的 `20.205.243.166`（4 次 ls-remote
+  均 21s 超时），改走 GitHub 官方 SSH-over-443 入口 fast-forward push 9 笔——推送前远端
+  `main=cae11831`（经 `merge-base --is-ancestor` 验证为首父），推送后远端 `main=c9433ef`
+  与本地 HEAD 逐字节一致；未 force、未改 hosts、未关证书校验、未改 `remote.origin.url`。
+  push 档 CI run#36937457198 结论 success，并以 `commits/c9433ef/check-suites` 独立复核 Actions
+  = completed/success；CI 日志含 `SECRET_SCAN_SELFTEST_SUMMARY assertions=42 failed=0 result=pass`、
+  `[OK] secret_scanner_selftest`、`SUMMARY total=16 failed=0`，与本地计数一致。详见报告 §9.11.1。
+- [ ] 遗留：`SECRET_SCAN_SUMMARY` 新增三键（`shape_scanned_files`/`shape_excluded_files`/
+  `exclude_rules`）的 **CI 实跑取值仍未取到**——6 个 scanner step 全在 `workflow_dispatch` 档 job，
+  push 档一条不执行，且 `perf-probe` 腿只扫 `artifacts` 不覆盖 minified 产物；要补这条需触发一次
+  扫描 `frontend/playwright-report` 的真实 dispatch 运行。已知代价两条（`Pa(ss)word` 形态不报、
+  排除路径不扫赋值形状）详见 `docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md` §9.11。
 
 ## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）
 

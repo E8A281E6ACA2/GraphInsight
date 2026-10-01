@@ -440,10 +440,63 @@ old=10 → new=9（本门禁职责不含源码树，该数值只用于说明字�
 3. 键后缀只放行 `_key/_hash/_token/_value/_secret`：`password_hint=` 有意不报；
    反向 `password_reset_token=` 会报。
 4. CI 现有 3 个 `--allow-fixture` 值都已在内置占位表内，flag 属冗余（历史遗留，不影响判定）。
+5. 本验收文档与 roadmap checklist 自身写的示例凭据形状会被赋值规则命中（当前两份文档共 10 条
+   `findings=10 result=fail`，全部是文档化的合成样本，无真凭据）。这两份文档不在 CI 扫描路径内，
+   故不影响门禁；但**若将来把 `docs/` 纳入扫描范围，必须先为示例样本建 fixture 放行表或改写示例写法**，
+   否则会立刻红。补证轮已用 HEAD 版本对照：同样 10 条、命中 sha256 一致，本轮新增文字 **0 新增命中**
+   （文件字节 81571 → 86372）。
 
 **接线**：`run_unified_boundary_guards.py` 新增 case `secret_scanner_selftest`，本地复跑
 `SUMMARY total=16 failed=0`（该 case 3.5s）；`.github/workflows/ci.yml` 的
 `backend-scripts` job py_compile 清单加入自检文件。
 
 **本轮未做**：github.com 出口当时连接超时，未 push、未取 CI 实跑证据；§9.10 的历史表述未改动。
+（出口恢复后的补证见 §9.11.1；本行保留为当轮事实记录。）
+
+#### 9.11.1 push 与 CI 实跑补证（2026-10-02）
+
+**传输路径（先取证再动手，未改 hosts、未关证书校验）**：`github.com` 当时只解析到被丢包的
+A 记录 `20.205.243.166`，4 次 `git ls-remote` 均 21s 超时；同时 `140.82.116.4` 等 GitHub IP
+0.2s 内可握手、`curl --resolve` 走 TLS 返回 200，`api.github.com` 亦 200 —— 结论是出口本身可达，
+只有该条 DNS 记录被丢包。因此改用 GitHub 官方 SSH-over-443 入口
+`ssh://git@ssh.github.com:443/E8A281E6ACA2/GraphInsight.git`（临时 URL，未改
+`remote.origin.url`）完成推送。
+
+**推送前后各取一次权威远端 SHA**：推送前远端 `main = cae11831e21b…`，经
+`git merge-base --is-ancestor` 验证恰为 9 笔新提交的首父（`42b0b35^`），即纯 fast-forward，
+未使用 `--force`；推送后远端 `main = c9433ef6fb54…`，与本地 HEAD 逐字节一致（`MATCH=YES`）。
+
+**CI 档位**：run `36937457198`（event=push，headSha=`c9433ef`）结论 **success**；
+GitHub API `commits/c9433ef/check-suites` 独立复核 GitHub Actions = completed/success，
+不以本地 tracking ref 为准。push 档 4 个 job 全 success（Go backend tests、
+Backend unified boundary guards、Frontend build、Backend smoke script syntax），
+dispatch 档 7 个 job skipped（本次未触发）。
+
+**关键日志行（Backend unified boundary guards / Run unified boundary guard suite）**：
+
+```text
+CASE secret_scanner_selftest: 敏感信息扫描器正样本自检与路径排除守卫
+SECRET_SCAN_SELFTEST_SUMMARY assertions=42 failed=0 result=pass
+[OK] secret_scanner_selftest duration=1.3s
+SUMMARY total=16 failed=0
+```
+
+Linux runner 上的断言数与本地 Windows（系统 Python 3.14 + `PYTHONUTF8=1`）完全一致：
+42/0，矩阵口径 16/0 未变。`Backend smoke script syntax` 的
+`Compile smoke and perf scripts` step 命令行已含
+`backend/tests/check_artifact_secrets_selftest.py` 且该 job 通过，即自检文件在 CI 侧可编译。
+
+**这条腿仍未闭合（不得写成"CI 已验证"）**：`SECRET_SCAN_SUMMARY` 的新增三键
+`shape_scanned_files` / `shape_excluded_files` / `exclude_rules` 在 CI 里的实跑取值仍未取到——
+调用 `check_artifact_secrets.py` 的 6 个 step 全在 `workflow_dispatch` 档 job
+（release-frontend-e2e、release-acceptance、rollback-matrix、frontend-e2e、perf-probe、perf-soak），
+push 档一条都不执行；其中 `perf-probe` 只扫 `artifacts`（perf JSON/MD），不覆盖 minified 产物，
+即便触发也证明不了排除路径。要拿到这条证据必须触发一次真实 dispatch 档运行（依赖外部可达网关
+或自包含栈，耗时显著更长），且应选扫描 `frontend/playwright-report` 的腿。
+
+因此本轮表述边界固定为：**自检套件与守卫接线已有 CI 实跑证据；排除范围的新 SUMMARY 键仅有本地
+取证**。另需注意：CI 各扫描步骤的目标目录（`frontend/playwright-report`、`frontend/test-results`）
+本身就在默认排除清单内，故这些腿上 `shape_scanned_files` 预期为 0、赋值形状层不参与判定，
+实际拦截力全押在 `run_credential` 字面值与 jwt/dsn/bcrypt 三形状 + `--secret-env-var` 上
+（与上文已知代价 2 同一口径）。
 
