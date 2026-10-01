@@ -27,7 +27,38 @@ const (
 	CodeStoragePathInvalid    = "KB_STORAGE_PATH_INVALID"
 	CodeScopeInvalid          = "SCOPE_INVALID"
 	CodeChunkRevisionConflict = "CHUNK_REVISION_CONFLICT"
+	CodeChunkNotFound         = "CHUNK_NOT_FOUND"
+	CodeChunkContentEmpty     = "CHUNK_CONTENT_EMPTY"
+	CodeReindexScopeRequired  = "REINDEX_SCOPE_REQUIRED"
+	CodeIndexUnavailable      = "INDEX_UNAVAILABLE"
 )
+
+// ChunkRevision 是 Chunk 版本契约（§2.6，M5 落库），与 Python scope_contract.ChunkRevision 字段逐字一致。
+type ChunkRevision struct {
+	RevisionID            string  `json:"revision_id"`
+	KBID                  string  `json:"kb_id"`
+	TenantID              string  `json:"tenant_id"`
+	ProjectID             string  `json:"project_id"`
+	DocID                 string  `json:"doc_id"`
+	ChunkID               string  `json:"chunk_id"`
+	SourceContent         string  `json:"source_content"`
+	SourceContentHash     string  `json:"source_content_hash"`
+	Content               string  `json:"content"`
+	ContentHash           string  `json:"content_hash"`
+	ContentRevision       int64   `json:"content_revision"`
+	RevisionStatus        string  `json:"revision_status"`
+	GraphStatus           string  `json:"graph_status"`
+	VectorStatus          string  `json:"vector_status"`
+	GraphContentRevision  *int64  `json:"graph_content_revision,omitempty"`
+	VectorContentRevision *int64  `json:"vector_content_revision,omitempty"`
+	RevisionSource        string  `json:"revision_source"`
+	SourceVersion         *string `json:"source_version,omitempty"`
+	ParserVersion         *string `json:"parser_version,omitempty"`
+	EditedBy              *int64  `json:"edited_by,omitempty"`
+	EditedAt              string  `json:"edited_at"`
+	Reason                *string `json:"reason,omitempty"`
+	TraceID               string  `json:"trace_id,omitempty"`
+}
 
 // Error 是带统一错误码的 scope 错误，handler 直接映射进统一响应体。
 type Error struct {
@@ -43,12 +74,14 @@ func (e *Error) Error() string {
 // HTTP 状态映射（契约 §2.9）。
 func httpStatusFor(code string) int {
 	switch code {
-	case CodeKBNotFound:
+	case CodeKBNotFound, CodeChunkNotFound:
 		return http.StatusNotFound
 	case CodeAccessDenied:
 		return http.StatusForbidden
 	case CodeArchived, CodeDuplicateName, CodeChunkRevisionConflict:
 		return http.StatusConflict
+	case CodeIndexUnavailable:
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusBadRequest
 	}

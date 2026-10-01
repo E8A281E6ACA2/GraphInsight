@@ -190,17 +190,37 @@ class KBGrant:
 
 @dataclass
 class ChunkRevision:
-    """Chunk 版本（契约 §2.6，M5 落库）。source_content 不可变；并发编辑返回 CHUNK_REVISION_CONFLICT。"""
+    """Chunk 版本（契约 §2.6，M5 落库，字段与 Go scope.ChunkRevision 逐字一致）。
+
+    source_content 不可变；并发编辑返回 CHUNK_REVISION_CONFLICT。
+    revision_status: current | superseded
+    graph_status/vector_status: pending | stale | indexed | skipped | failed
+    revision_source: system_initial | system_reparse | human_edit | rollback
+    """
 
     revision_id: str
     kb_id: str
+    tenant_id: str
+    project_id: str
+    doc_id: str
     chunk_id: str
     source_content: str
+    source_content_hash: str  # sha256(source_content)，重新解析幂等判断（v3.2）
     content: str
+    content_hash: str
     content_revision: int
-    edited_by: Optional[str] = None
+    edited_at: str  # 真正必填（DB NOT NULL DEFAULT now()），禁止空串/None 默认（v3.2 收口）
+    revision_status: str = "current"
+    graph_status: str = "pending"
+    vector_status: str = "pending"
+    graph_content_revision: Optional[int] = None
+    vector_content_revision: Optional[int] = None
+    revision_source: str = "system_initial"
+    source_version: Optional[str] = None
+    parser_version: Optional[str] = None
+    edited_by: Optional[int] = None
     reason: Optional[str] = None
-    status: str = "active"
+    trace_id: Optional[str] = None
 
 
 @dataclass

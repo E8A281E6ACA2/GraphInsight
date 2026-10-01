@@ -120,14 +120,18 @@ effective_kb_ids
 
 实现映射：**复用现有 `admin_user_role_bindings`（scope_type=kb）**，P0 不新建表。Go 鉴权在请求开始时解析出已验证的 grant 集合，handler 只消费解析结果。`kb:review / kb:manage / kb:publish` 三个新权限码注册进权限种子，P0 只启用 `kb:read/write/delete` 的强制校验，其余为预留。
 
-### 2.6 ChunkRevision（M5 实现，契约现在冻结）
+### 2.6 ChunkRevision（M5 实现，契约现在冻结，v3.1 字段集）
 
 ```text
-chunk_revision: { revision_id, kb_id, chunk_id, source_content, content, content_revision,
-                  edited_by, edited_at, reason, status }
+chunk_revisions: { revision_id, kb_id, tenant_id, project_id, doc_id, chunk_id,
+                   source_content, source_content_hash, content, content_hash, content_revision,
+                   revision_status, graph_status, vector_status,
+                   graph_content_revision, vector_content_revision,
+                   revision_source, source_version, parser_version,
+                   edited_by, edited_at, reason, trace_id }
 ```
 
-规则：`source_content` 为解析产出，不可变；`content` 为当前可编辑内容；同一 `content_revision` 并发编辑 → `CHUNK_REVISION_CONFLICT`；revision 历史不可变；编辑后受影响 chunk 的 `graph_status / vector_status` 置 `stale`，只重建 stale 索引。
+规则：`source_content` 为解析产出，不可变；`source_content_hash` = sha256(source_content)，重新解析幂等判断基于它（不基于可被人工编辑的 `content_hash`，v3.2）；`content` 为当前可编辑内容；同一 `content_revision` 并发编辑 → `CHUNK_REVISION_CONFLICT`（409，响应带 `current_revision`）；revision 历史不可变；`revision_status` 取值 `current|superseded`，每 `(kb_id, chunk_id)` 至多一个 current 行（数据库部分唯一索引强制，见 M5 设计 §15.1）；编辑后受影响 chunk 的 `graph_status / vector_status` 置 `stale`，只重建 stale 索引；`graph_status / vector_status` 取值 `pending|stale|indexed|skipped|failed`，`skipped` 表示能力未配置（LLM/embedding 关闭），**不伪装 indexed**；`graph_content_revision / vector_content_revision` 记录投影实际对应版本，stale 期间保留旧值。完整字段语义、唯一约束与状态机见 `docs/ENTERPRISE_M5_CHUNK_REVISION_DESIGN.md` §3/§15/§16/§17。
 
 ### 2.7 PipelineRun / StepRun（契约冻结，M5 起落库）
 
@@ -163,7 +167,11 @@ KB_CROSS_SCOPE           header/query/body 作用域不一致
 KB_DUPLICATE_NAME        同 project 内知识库重名
 KB_STORAGE_PATH_INVALID  存储前缀非法或路径逃逸
 SCOPE_INVALID            tenant_id/project_id/kb_id 格式非法（见 §2.1 作用域格式）
-CHUNK_REVISION_CONFLICT  Chunk 并发编辑冲突（M5）
+CHUNK_REVISION_CONFLICT  Chunk 并发编辑冲突（M5，409，响应带 current_revision）
+CHUNK_NOT_FOUND          chunk 不存在 / 不属于该 kb（M5，404）
+CHUNK_CONTENT_EMPTY      content 为空或超长（M5，400）
+REINDEX_SCOPE_REQUIRED   重建目标缺失或跨知识库（M5，400）
+INDEX_UNAVAILABLE        索引迁移写冻结/降级期间写入口拒绝（M5，503）
 ```
 
 ### 2.10 审计字段与事件

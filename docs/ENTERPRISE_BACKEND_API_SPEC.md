@@ -118,6 +118,63 @@
 1. `POST /api/v1/admin/knowledge-bases/{kb_id}/documents:delete-preview`
 2. `POST /api/v1/admin/knowledge-bases/{kb_id}/documents:restore`
 
+### 3.3 Chunk 版本与索引状态（M5）
+
+作用域纪律：路径 `kb_id` 与 header/query/body 出现的作用域值必须一致，任一不一致 → 400 `KB_CROSS_SCOPE`（P0 契约 §2.11）；`chunk_id` 必须属于路径 `kb_id`，任一不属于 → 404 `CHUNK_NOT_FOUND`，不部分执行。字段语义与状态机见 `docs/ENTERPRISE_M5_CHUNK_REVISION_DESIGN.md` §3/§16。
+
+1. `GET /api/v1/admin/knowledge-bases/{kb_id}/chunks/{chunk_id}`（`kb:read`）
+
+返回当前 `content` + `content_revision` + `revision_status` + `graph_status/vector_status` + `graph_content_revision/vector_content_revision` + revisions 历史（`limit/offset` 倒序，默认 50）。
+
+```json
+{
+  "code": 200, "message": "ok",
+  "data": {
+    "kb_id": "kb-01", "chunk_id": "doc-01-000", "doc_id": "doc-01",
+    "content": "...", "content_revision": 2, "revision_status": "current",
+    "graph_status": "indexed", "graph_content_revision": 2,
+    "vector_status": "stale", "vector_content_revision": 1,
+    "revisions": [
+      { "revision_id": 12, "content_revision": 2, "revision_source": "human_edit",
+        "edited_by": 7, "edited_at": "...", "reason": null }
+    ]
+  },
+  "timestamp": "...", "trace_id": "..."
+}
+```
+
+chunk 不存在 → 404 `CHUNK_NOT_FOUND`。
+
+2. `PATCH /api/v1/admin/knowledge-bases/{kb_id}/chunks/{chunk_id}`（`kb:write`）
+
+请求体：`{ "expected_revision": int, "content": str, "reason": str? }`。
+
+成功：插入新 revision（`content_revision=旧值+1`，`revision_source=human_edit`，`revision_status=current`），旧行置 `superseded`，graph/vector 投影置 `stale`，事务内自动入队 reindex-chunks（`targets_hash` 去重），审计 `kb_chunk_updated`。
+
+冲突：`expected_revision != 当前 current.content_revision` → 409 `CHUNK_REVISION_CONFLICT`，响应 `data` 携带 `current_revision` 供客户端重读重试。空 content / 超长 → 400 `CHUNK_CONTENT_EMPTY`。
+
+```json
+{
+  "code": 409, "message": "Chunk 并发编辑冲突",
+  "data": { "current_revision": 3, "expected_revision": 2 },
+  "timestamp": "...", "trace_id": "..."
+}
+```
+
+3. `POST /api/v1/admin/knowledge-bases/{kb_id}/revisions/{revision_id}/rollback`（`kb:write`）
+
+请求体：`{ "reason": str? }`。复制目标 revision 的 `content` 为新行（`content_revision=当前+1`，`revision_source=rollback`），历史行全部不变（历史不可变）；投影置 stale；审计 `kb_chunk_rolled_back`。目标 revision 必须属于该 kb，否则 404 `CHUNK_NOT_FOUND`。
+
+4. `POST /api/v1/admin/jobs/reindex-chunks`（`kb:write`）
+
+请求体：`{ "kb_id": "...", "chunk_ids": ["..."] }`。`chunk_ids` 非空且全部属于 `kb_id`；服务端读取每个 chunk 当前 current 行生成 `targets:[{chunk_id, target_revision}]` 快照并落库，客户端不指定 revision。任一 chunk 无 current 行 → 404 `CHUNK_NOT_FOUND`，不部分执行；空 `chunk_ids` → 400 `REINDEX_SCOPE_REQUIRED`。返回 `job_id`。
+
+5. `POST /api/v1/admin/jobs/reindex-document`（`kb:write`）
+
+请求体：`{ "kb_id": "...", "doc_id": "..." }`。服务端枚举该 kb+doc 下全部 `revision_status='current'` 且 `graph_status/vector_status != indexed` 的 chunk 生成 targets（v3.2：只枚举 current 行，superseded 历史行不参与；非隐式扩层）。返回 `job_id`。
+
+权限：读取 `kb:read`，编辑/回滚/重建写路径统一 `kb:write`；拒绝路径（`KB_CROSS_SCOPE / KB_ACCESS_DENIED`）同样写审计（P0 契约 §2.10）。
+
 ## 4. 任务中心
 
 ### 4.1 任务创建
@@ -125,6 +182,8 @@
 1. `POST /api/v1/admin/jobs/build-graph`
 2. `POST /api/v1/admin/jobs/clear-kb`
 3. `POST /api/v1/admin/jobs/reindex`
+4. `POST /api/v1/admin/jobs/reindex-chunks`（M5：显式 chunk 范围重建，契约见 §3.3，payload 走 `targets` 形态）
+5. `POST /api/v1/admin/jobs/reindex-document`（M5：显式文档范围重建，契约见 §3.3，payload 走 `targets` 形态）
 
 统一请求体：
 
@@ -230,6 +289,14 @@
 5. `JOB_409`：任务冲突
 6. `DB_503`：数据库不可用
 7. `LLM_503`：模型服务不可用
+
+M5 新增（与 P0 契约 §2.9 一致，字符串 code 进统一响应体）：
+
+8. `CHUNK_NOT_FOUND`（404）：chunk 不存在 / 不属于该 kb
+9. `CHUNK_REVISION_CONFLICT`（409）：并发编辑版本冲突，响应 `data.current_revision` 携带当前版本
+10. `CHUNK_CONTENT_EMPTY`（400）：content 为空或超长
+11. `REINDEX_SCOPE_REQUIRED`（400）：重建目标（chunk_ids/targets）缺失或跨知识库
+12. `INDEX_UNAVAILABLE`（503）：索引迁移写冻结/降级期间写入口拒绝（M5）
 
 ## 8. 发布前检查
 
