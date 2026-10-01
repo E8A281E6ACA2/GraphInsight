@@ -52,6 +52,8 @@ def _insert_revision(
     vector_status: str = "pending",
     vector_rev=None,
     revision_source: str = "system_reparse",
+    tenant: str = "t1",
+    project: str = "p1",
 ) -> None:
     with engine.begin() as conn:
         conn.execute(
@@ -60,11 +62,13 @@ def _insert_revision(
                 "source_content, source_content_hash, content, content_hash, content_revision, "
                 "revision_status, graph_status, vector_status, graph_content_revision, vector_content_revision, "
                 "revision_source, reason, trace_id) VALUES "
-                "(:kb, 't1', 'p1', :doc, :chunk, :content, :sighash, :content, :contenthash, :rev, "
+                "(:kb, :tenant, :project, :doc, :chunk, :content, :sighash, :content, :contenthash, :rev, "
                 ":status, :gstatus, :vstatus, :grev, :vrev, :source, 'test_fixture', 'test')"
             ),
             {
                 "kb": kb,
+                "tenant": tenant,
+                "project": project,
                 "doc": doc_id,
                 "chunk": chunk_id,
                 "content": content,
@@ -77,6 +81,29 @@ def _insert_revision(
                 "grev": graph_rev,
                 "vrev": vector_rev,
                 "source": revision_source,
+            },
+        )
+
+
+def _ensure_kb_table(kb_id: str, tenant_id: str, project_id: str) -> None:
+    """播种 knowledge_bases 行，作为作用域一致性校验的权威来源。"""
+    from admin.database import Base
+    from admin.models import KnowledgeBase
+
+    Base.metadata.create_all(bind=engine, tables=[KnowledgeBase.__table__])
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO knowledge_bases (id, tenant_id, project_id, name, status, storage_prefix) "
+                "VALUES (:kb, :tenant, :project, :name, 'active', :prefix) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {
+                "kb": kb_id,
+                "tenant": tenant_id,
+                "project": project_id,
+                "name": f"fixture {kb_id}",
+                "prefix": f"kb/{kb_id}",
             },
         )
 
@@ -240,6 +267,37 @@ def s_unrecoverable_dry():
     return bf.run("kb-a", dry_run=True)
 
 
+def s_scope_unresolved():
+    # 活栈实测纠偏：解析产物有文本（内容可恢复）但 KB 未登记、索引侧无证据，
+    # 三件套不全必须单独计为 SCOPE_UNRESOLVED，不得混进 UNRECOVERABLE_MISMATCH。
+    parsed = {"kb-missing": {"s1": {"doc_id": "d7", "text": "S-有内容"}}}
+    _patch_sources(parsed=parsed, graph=True, vector=False)
+    code = bf.run("kb-missing", dry_run=True)
+    _dump_state()
+    return code
+
+
+def s_collection_resolution():
+    """backfill 必须共用 services.vector_store 的 collection 归一化（活栈纠偏的可重复版）。
+
+    只替换 runtime 配置读取（数据源），不替换 vector_store.config() 的归一化分支本身。
+    """
+    import services.vector_store as vs
+
+    original = vs.get_vector_store_runtime_config
+    resolved: dict = {}
+    try:
+        for label, name in (("legacy", "graphinsight_chunks"), ("explicit", "kb_scope_coll_1536")):
+            vs.get_vector_store_runtime_config = lambda _n=name: {"enabled": True, "collection": _n, "provider": "milvus"}
+            resolved[label] = bf._milvus_collection_name()
+    finally:
+        vs.get_vector_store_runtime_config = original
+    print("__COLL_LEGACY__" + str(resolved.get("legacy")))
+    print("__COLL_EXPLICIT__" + str(resolved.get("explicit")))
+    ok = resolved.get("legacy") == "graphinsight_chunks_v2" and resolved.get("explicit") == "kb_scope_coll_1536"
+    return 0 if ok else 1
+
+
 def s_dual_kb():
     # kb-b 已有 current 行；跑 kb-a backfill 不得触碰 kb-b（即使注入相同 chunk_id 也不串写）
     _insert_revision("kb-b", "z9", "db1", "B-keep", graph_status="indexed", graph_rev=1, vector_status="skipped", vector_rev=None)
@@ -277,11 +335,67 @@ def s_current_unique():
 
 def s_rfa_run():
     # §8.5：vector 能力开启但 collection 无 content_revision 字段 → pending + MILVUS_REVISION_FIELD_ABSENT
+    # 同时锁住活栈取证发现的静默漏排：本轮新写入但 pending 的 chunk 必须同一轮排入 reindex job，
+    # 重复调用（rfa_rerun 场景）复用同一 targets_hash 不新建 job。
     parsed = {"kb-a": {"f1": {"doc_id": "d1", "text": "内容一"}}}
     neo = {"kb-a": {"f1": {"doc_id": "d1", "text": "内容一", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
     _patch_sources(neo=neo, parsed=parsed, graph=True, vector=True)
     code = bf.run("kb-a", dry_run=False)
     _dump_state()
+    return code
+
+
+def s_orphan_gate():
+    """审计修复 #1：PG 有 current 行但 Neo4j/Milvus 均无该 chunk，必须显式阻断而非静默跳过。"""
+    _insert_revision(
+        "kb-a", "o1", "d7", "O-orphan",
+        graph_status="indexed", graph_rev=1, vector_status="indexed", vector_rev=1,
+    )
+    _patch_sources(neo={}, mil={}, parsed={}, graph=False, vector=False)
+    code = bf.run("kb-a", dry_run=False)
+    _dump_state()
+    return code
+
+
+def s_orphan_converged():
+    """孤儿行补齐索引证据后，不再计为 orphan，门可关闭。"""
+    parsed = {"kb-a": {"o1": {"doc_id": "d7", "text": "O-orphan"}}}
+    neo = {"kb-a": {"o1": {"doc_id": "d7", "text": "O-orphan", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
+    mil = {"kb-a": {"o1": {"doc_id": "d7", "text": "O-orphan", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
+    _patch_sources(neo=neo, mil=mil, parsed=parsed, graph=False, vector=False)
+    code = bf.run("kb-a", dry_run=False)
+    _dump_state()
+    return code
+
+
+def s_unrecoverable_neo_only():
+    """审计修复 #2：只有 Neo4j 残留文本、无解析产物且无 Milvus 记录 = UNRECOVERABLE。"""
+    neo = {"kb-a": {"n9": {"doc_id": "d8", "text": "N-only", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
+    _patch_sources(neo=neo, mil={}, parsed={}, graph=True, vector=True)
+    code = bf.run("kb-a", dry_run=True)
+    _dump_state()
+    return code
+
+
+def s_scope_conflict_new():
+    """审计修复 #4：new_chunk 的 tenant 与 knowledge_bases 登记冲突 → 零写入 fail-closed。"""
+    _ensure_kb_table("kb-a", "t1", "p1")
+    parsed = {"kb-a": {"g1": {"doc_id": "d9", "text": "G-conflict"}}}
+    neo = {"kb-a": {"g1": {"doc_id": "d9", "text": "G-conflict", "tenant_id": "t9", "project_id": "p1", "content_revision": 1}}}
+    calls = _patch_sources(neo=neo, parsed=parsed, graph=True, vector=False)
+    code = bf.run("kb-a", dry_run=False)
+    _dump_state(calls)
+    return code
+
+
+def s_scope_conflict_row():
+    """审计修复 #4：已有 revision 行 project 与 KB 登记冲突 → 零写入 fail-closed。"""
+    _ensure_kb_table("kb-a", "t1", "p1")
+    _insert_revision("kb-a", "g2", "d10", "G-row-conflict", graph_status="pending", vector_status="pending", project="pX")
+    parsed = {"kb-a": {"g2": {"doc_id": "d10", "text": "G-row-conflict"}}}
+    calls = _patch_sources(parsed=parsed, graph=True, vector=False)
+    code = bf.run("kb-a", dry_run=False)
+    _dump_state(calls)
     return code
 
 
@@ -300,6 +414,14 @@ SCENARIOS = {
     "dual_kb": s_dual_kb,
     "current_unique": s_current_unique,
     "rfa_run": s_rfa_run,
+    "rfa_rerun": lambda: s_rfa_run(),
+    "orphan_gate": s_orphan_gate,
+    "orphan_converged": s_orphan_converged,
+    "unrecoverable_neo_only": s_unrecoverable_neo_only,
+    "scope_conflict_new": s_scope_conflict_new,
+    "scope_conflict_row": s_scope_conflict_row,
+    "scope_unresolved": s_scope_unresolved,
+    "collection_resolution": s_collection_resolution,
 }
 
 

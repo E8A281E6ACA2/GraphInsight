@@ -139,6 +139,21 @@ def bootstrap_admin_jobs(h: Harness) -> tuple:
     )
 
 
+def prep_db(h: Harness, name: str) -> None:
+    """切到独立 SQLite 库并完成三件套建表：chunk_revisions / admin_jobs / targets_hash。
+
+    每个场景组必须有独立库：backfill 的 universe 现在包含该 kb 全部 current 行，
+    共库会让前一场景的行被后续场景判为孤儿 revision，污染断言。
+    """
+    h.use_db(name)
+    code, out = h.run(str(Path("admin") / "migrate_chunk_revisions.py"), ["--action", "migrate"])
+    step(f"{name}：迁移 chunk_revisions", code == 0, f"exit={code} " + out[-300:])
+    code, out = bootstrap_admin_jobs(h)
+    step(f"{name}：引导 admin_jobs", code == 0 and "bootstrap ok" in out, f"exit={code} " + out[-300:])
+    code, out = h.run(str(Path("admin") / "migrate_jobs_targets_hash.py"), ["--action", "migrate"])
+    step(f"{name}：迁移 targets_hash", code == 0, f"exit={code} " + out[-300:])
+
+
 # ---------------------------------------------------------------------------
 # A. chunk_revisions 迁移
 # ---------------------------------------------------------------------------
@@ -161,8 +176,33 @@ def section_a(h: Harness) -> None:
 
     code, out = h.run(script, ["--action", "migrate"])
     step("首次 migrate", code == 0 and "table is ready" in out, out[-300:])
+    step(
+        "迁移后自动结构校验：列/约束/索引全项通过",
+        code == 0 and "[schema-check] chunk_revisions" in out and "✗" not in out.split("[schema-check]")[1],
+        out[-400:],
+    )
+    step("结构校验覆盖 UNIQUE 约束与部分唯一索引谓词", "✓ UNIQUE 约束 uq_chunk_revisions_rev" in out and "✓ 索引 uq_chunk_revisions_current 部分谓词" in out, out[-400:])
     code, out = h.run(script, ["--action", "migrate"])
     step("重复 migrate 幂等", code == 0 and "already exists" in out and "indexes ensured" in out, out[-300:])
+
+    # 负向自证：人为删除一个索引后，独立结构校验必须失败（否则校验等于没做）
+    code, out = h.run_python_code(
+        "from admin.database import engine\n"
+        "from sqlalchemy import text\n"
+        "with engine.begin() as c:\n"
+        "    c.execute(text('DROP INDEX idx_chunk_rev_kb_doc_graph'))\n"
+        "engine.dispose()\n"
+        "print('dropped')\n"
+    )
+    step("负向铺垫：删除 idx_chunk_rev_kb_doc_graph", code == 0 and "dropped" in out, out[-300:])
+    code, out = h.run(str(Path("admin") / "m5a_schema_check.py"), ["chunk_revisions"])
+    step("结构校验能抓到缺失索引（exit 1）", code == 1 and "idx_chunk_rev_kb_doc_graph 存在" in out and "FAILED" in out, f"exit={code} " + out[-400:])
+    code, out = h.run(script, ["--action", "migrate"])
+    step(
+        "补齐缺失索引后校验恢复全绿",
+        code == 0 and "✗" not in out and "✓ 索引 idx_chunk_rev_kb_doc_graph 列顺序" in out,
+        f"exit={code} " + out[-400:],
+    )
 
     code, out = h.run(str(Path("tests") / "m5a_backfill_driver.py"), ["--scenario", "current_unique"])
     rows = parse_marker(out, "__ROWS__")
@@ -198,6 +238,17 @@ def section_b(h: Harness) -> None:
     step("dry-run", code == 0 and "dry-run completed" in out, out[-300:])
     code, out = h.run(script, ["--action", "migrate"])
     step("首次 migrate 加列+索引", code == 0 and "added column" in out and "ensured index" in out, out[-300:])
+    step(
+        "targets_hash 结构校验：列类型/可空 + 部分唯一索引全绿",
+        code == 0
+        and "[schema-check] admin_jobs.targets_hash" in out
+        and "✓ 列 targets_hash 类型 varchar" in out
+        and "✓ 列 targets_hash 可空" in out
+        and "✓ 索引 targets_hash 列顺序" in out
+        and "✓ 索引 targets_hash 部分谓词" in out
+        and "✗" not in out.split("[schema-check]")[1],
+        out[-500:],
+    )
     code, out = h.run(script, ["--action", "migrate"])
     step("重复 migrate 幂等", code == 0 and "targets_hash already exists" in out and "index uq_admin_jobs_targets_hash already exists" in out, out[-300:])
 
@@ -237,16 +288,9 @@ def section_b(h: Harness) -> None:
 
 def section_c(h: Harness) -> None:
     print("[C] backfill_chunk_revisions 场景矩阵")
-    h.use_db("backfill.db")
-    code, out = h.run(str(Path("admin") / "migrate_chunk_revisions.py"), ["--action", "migrate"])
-    step("backfill 库迁移 chunk_revisions", code == 0, out[-300:])
-    code, out = bootstrap_admin_jobs(h)
-    step("backfill 库引导 admin_jobs", code == 0 and "bootstrap ok" in out, out[-300:])
-    code, out = h.run(str(Path("admin") / "migrate_jobs_targets_hash.py"), ["--action", "migrate"])
-    step("backfill 库迁移 targets_hash", code == 0, out[-300:])
-
     driver = str(Path("tests") / "m5a_backfill_driver.py")
 
+    prep_db(h, "bf_new.db")
     code, out = h.run(driver, ["--scenario", "new_and_degraded"])
     rows = parse_marker(out, "__ROWS__")
     r = row_of(rows, "kb-a", "c1")
@@ -254,10 +298,14 @@ def section_c(h: Harness) -> None:
     step("新 chunk：graph indexed/1，vector skipped/NULL", r.get("graph_status") == "indexed" and r.get("graph_content_revision") == 1 and r.get("vector_status") == "skipped" and r.get("vector_content_revision") is None, str(r))
     step("新 chunk：system_initial + backfill_m5a + 中文内容 UTF-8", r.get("revision_source") == "system_initial" and r.get("reason") == "backfill_m5a" and r.get("content") == "内容一", str(r))
     step("降级门：DEGRADED_SKIPPED + CLOSED_DEGRADED + 不得宣布完整验收", "DEGRADED_SKIPPED" in out and "CLOSED_DEGRADED" in out and "不得宣布完整索引验收通过" in out, out[-400:])
+    step("rows_skipped_existing 输出存在（新库首轮为 0）", "rows_skipped_existing=0" in out and "insert_conflicts_skipped=0" in out, out[-300:])
 
     code, out = h.run(driver, ["--scenario", "new_and_degraded_rerun"])
     step("幂等重跑：rows_new=0 且门状态不变", code == 0 and "rows_new=0" in out and "CLOSED_DEGRADED" in out, f"exit={code} " + out[-300:])
+    step("幂等重跑：rows_skipped_existing=1（决策时已有行）且不重复插入（insert_conflicts_skipped=0）",
+         "rows_skipped_existing=1" in out and "insert_conflicts_skipped=0" in out, out[-300:])
 
+    prep_db(h, "bf_nd.db")
     code, out = h.run(driver, ["--scenario", "no_downgrade"])
     rows = parse_marker(out, "__ROWS__")
     calls = parse_marker(out, "__CALLS__")
@@ -266,7 +314,9 @@ def section_c(h: Harness) -> None:
     step("已有 revision 不降级：索引侧仅触碰新 chunk", code == 0 and calls == ["n1"], f"exit={code} calls={calls}")
     step("已有行原样保留（indexed/1、内容不变）", e1.get("graph_status") == "indexed" and e1.get("graph_content_revision") == 1 and e1.get("vector_content_revision") == 1 and e1.get("content") == "E-keep" and e1.get("doc_id") == "d9", str(e1))
     step("新行 n1 正常落库", n1.get("content") == "N-new" and n1.get("graph_status") == "indexed", str(n1))
+    step("已有 revision 行计入 rows_skipped_existing=1", "rows_skipped_existing=1" in out, out[-300:])
 
+    prep_db(h, "bf_nr.db")
     code, out = h.run(driver, ["--scenario", "nr_setup"])
     step("needs_reindex 场景播种", code == 0, out[-300:])
     code, out = h.run(driver, ["--scenario", "nr_dry_preview"])
@@ -284,12 +334,15 @@ def section_c(h: Harness) -> None:
     code, out = h.run(driver, ["--scenario", "nr_converged"])
     step("收敛后前置门 CLOSED（exit 0）", code == 0 and "gate] CLOSED" in out, f"exit={code}")
 
+    prep_db(h, "bf_blocked.db")
     code, out = h.run(driver, ["--scenario", "blocked_gate"])
     step("blocked：能力关闭+pending 阻断（exit 3，blocked=1）", code == 3 and "blocked=1" in out and "needs_reindex=0" in out, f"exit={code} " + out[-300:])
 
+    prep_db(h, "bf_unrec.db")
     code, out = h.run(driver, ["--scenario", "unrecoverable_dry"])
     step("UNRECOVERABLE_MISMATCH：dry-run 拒绝（exit 2）", code == 2 and "UNRECOVERABLE_MISMATCH" in out, f"exit={code} " + out[-300:])
 
+    prep_db(h, "bf_dual.db")
     code, out = h.run(driver, ["--scenario", "dual_kb"])
     rows = parse_marker(out, "__ROWS__")
     b = row_of(rows, "kb-b", "z9")
@@ -299,11 +352,78 @@ def section_c(h: Harness) -> None:
     jobs = parse_marker(out, "__JOBS__")
     step("双 KB 隔离：无 kb-b 任务写入", all(str(j[1]) == "kb-a" for j in jobs), str(jobs))
 
+    prep_db(h, "bf_rfa.db")
     code, out = h.run(driver, ["--scenario", "rfa_run"])
     rows = parse_marker(out, "__ROWS__")
     rfa = row_of(rows, "kb-a", "f1")
     step("§8.5 REVISION_FIELD_ABSENT：vector 保持 pending 不伪标", "MILVUS_REVISION_FIELD_ABSENT" in out and rfa.get("vector_status") == "pending" and rfa.get("vector_content_revision") is None, f"exit={code} {rfa}")
     step("§8.5 pending 转 needs_reindex 阻断门（exit 3）", code == 3 and "needs_reindex=1" in out, f"exit={code}")
+    rfa_jobs = parse_marker(out, "__JOBS__")
+    step(
+        "同一轮必须为未收敛的新 chunk 排队（禁止报告 needs_reindex 却零 job）",
+        "jobs_enqueued=1" in out and "targets_total=1" in out and len(rfa_jobs) == 1 and "f1" in str(rfa_jobs),
+        f"jobs={rfa_jobs}",
+    )
+    code, out = h.run(driver, ["--scenario", "rfa_rerun"])
+    rfa_jobs = parse_marker(out, "__JOBS__")
+    step(
+        "pending 目标重跑复用 targets_hash 不新建 job",
+        code == 3 and "jobs_reused=1" in out and len(rfa_jobs) == 1,
+        f"exit={code} jobs={len(rfa_jobs)}",
+    )
+
+    prep_db(h, "bf_orphan.db")
+    code, out = h.run(driver, ["--scenario", "orphan_gate"])
+    rows = parse_marker(out, "__ROWS__")
+    o1 = row_of(rows, "kb-a", "o1")
+    step("修复#1 孤儿 revision 纳入 inventory：exit 3 且 orphan_revisions=1", code == 3 and "orphan_revisions=1" in out, f"exit={code} " + out[-400:])
+    step("修复#1 孤儿 revision 显式列名且计入 blocked（非静默跳过）", "ORPHAN_REVISION chunk_ids" in out and "o1" in out and "blocked=1" in out, out[-400:])
+    step("修复#1 孤儿行仍计入 rows_skipped_existing=1", "rows_skipped_existing=1" in out and o1.get("chunk_id") == "o1", out[-300:])
+    code, out = h.run(driver, ["--scenario", "orphan_converged"])
+    step("修复#1 补回索引证据后 orphan 归零、门可关闭（exit 0）", code == 0 and "orphan_revisions=0" in out and "gate] CLOSED" in out, f"exit={code} " + out[-400:])
+
+    prep_db(h, "bf_uno.db")
+    code, out = h.run(driver, ["--scenario", "unrecoverable_neo_only"])
+    rows = parse_marker(out, "__ROWS__")
+    step("修复#2 仅 Neo4j 有文本判 UNRECOVERABLE（exit 2）", code == 2 and "UNRECOVERABLE_MISMATCH" in out and "n9" in out, f"exit={code} " + out[-400:])
+    step("修复#2 拒绝路径零写入", rows == [], str(rows))
+
+    prep_db(h, "bf_scope1.db")
+    code, out = h.run(driver, ["--scenario", "scope_conflict_new"])
+    rows = parse_marker(out, "__ROWS__")
+    jobs = parse_marker(out, "__JOBS__")
+    calls = parse_marker(out, "__CALLS__")
+    step("修复#4 新 chunk tenant 与 KB 登记冲突 → fail-closed（exit 2）", code == 2 and "SCOPE_MISMATCH" in out, f"exit={code} " + out[-400:])
+    step("修复#4 冲突明细含 expected/actual", "chunk_id=g1" in out and "field=tenant_id" in out and "expected=t1" in out and "actual=t9" in out, out[-400:])
+    step("修复#4 冲突时零写入（PG 行、job、索引调用全空）", rows == [] and jobs == [] and calls == [], f"rows={rows} jobs={jobs} calls={calls}")
+
+    prep_db(h, "bf_scope2.db")
+    code, out = h.run(driver, ["--scenario", "scope_conflict_row"])
+    rows = parse_marker(out, "__ROWS__")
+    calls = parse_marker(out, "__CALLS__")
+    step("修复#4 已有行 project 与 KB 登记冲突 → fail-closed（exit 2）", code == 2 and "SCOPE_MISMATCH" in out and "field=revision.project_id" in out and "expected=p1" in out and "actual=pX" in out, f"exit={code} " + out[-400:])
+    step("修复#4 已有行冲突同样零新增写入", all(r[1] == "g2" for r in rows) and len(rows) == 1 and calls == [], f"rows={rows} calls={calls}")
+
+    prep_db(h, "bf_scope3.db")
+    code, out = h.run(driver, ["--scenario", "new_and_degraded"])
+    step("无 KB 登记时不误判冲突（SCOPE_WARNING 降级但正常执行）", code == 0 and "SCOPE_WARNING" in out, f"exit={code} " + out[-300:])
+
+    # 活栈纠偏 1：作用域三件套不全必须独立成 SCOPE_UNRESOLVED，不混进 UNRECOVERABLE_MISMATCH
+    prep_db(h, "bf_scope4")
+    code, out = h.run(driver, ["--scenario", "scope_unresolved"])
+    rows = parse_marker(out, "__ROWS__")
+    step("活栈纠偏：三件套不全判 SCOPE_UNRESOLVED 且 fail-closed（exit 2）",
+         code == 2 and "SCOPE_UNRESOLVED" in out and "scope_unresolved=1" in out, f"exit={code} " + out[-300:])
+    step("活栈纠偏：内容可恢复的 chunk 不再误标 UNRECOVERABLE_MISMATCH",
+         "unrecoverable=0" in out and "UNRECOVERABLE_MISMATCH chunk_ids" not in out, out[-300:])
+    step("活栈纠偏：SCOPE_UNRESOLVED 同样零写入", rows == [], str(rows))
+
+    # 活栈纠偏 2：collection 名必须共用 services.vector_store 的归一化（配置历史名指向不存在的库）
+    code, out = h.run(driver, ["--scenario", "collection_resolution"])
+    step("backfill 归一化历史 collection 名 graphinsight_chunks → _v2",
+         code == 0 and "__COLL_LEGACY__graphinsight_chunks_v2" in out, f"exit={code} " + out[-200:])
+    step("显式非历史 collection 名保持原样（不擅自改写）",
+         "__COLL_EXPLICIT__kb_scope_coll_1536" in out, out[-200:])
 
 
 # ---------------------------------------------------------------------------
