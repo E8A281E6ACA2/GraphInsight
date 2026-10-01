@@ -410,10 +410,12 @@ jwt / dsn / bcrypt 三个高置信形状照常扫描，因此打包产物里的�
 并对每个被排除文件打印 `SECRET_SCAN_NOTE shape_assignment_skipped_files=... layers_still_scanned=...`
 使范围可审计。
 
-**自检层**：新增 `backend/tests/check_artifact_secrets_selftest.py`，42 项断言
-（`grep -c "^  ✓"` = 42，与 `SECRET_SCAN_SELFTEST_SUMMARY assertions=42 failed=0` 同口径）。
-分五组：正样本 11（含 §9.10 三条盲区与本轮 JSON 引号键）、负样本 12（结构性与代码形态）、
-字面值与 fixture 放行 6、排除范围 7、输出与退出码契约 6。每个样本单独落文件单独跑一次 CLI，
+**自检层**：新增 `backend/tests/check_artifact_secrets_selftest.py`，43 项断言
+（`grep -c "^  ✓"` = 43，与 `SECRET_SCAN_SELFTEST_SUMMARY assertions=43 failed=0` 同口径；
+§9.11.2 之前该数是 42，第 43 项是那次 CI 变红后补的回归守卫）。
+分六组：正样本 11（含 §9.10 三条盲区与本轮 JSON 引号键）、负样本 12（结构性与代码形态）、
+字面值与 fixture 放行 6、排除范围 7、输出与退出码契约 6、步骤名回显守卫 1。
+每个样本单独落文件单独跑一次 CLI，
 失败可直接指到具体形状，不看总数。
 
 **守卫有效性负向对照**：把 `scan()` 的形状循环改成空迭代（扫描器"永远干净"），
@@ -444,7 +446,12 @@ old=10 → new=9（本门禁职责不含源码树，该数值只用于说明字�
    `findings=10 result=fail`，全部是文档化的合成样本，无真凭据）。这两份文档不在 CI 扫描路径内，
    故不影响门禁；但**若将来把 `docs/` 纳入扫描范围，必须先为示例样本建 fixture 放行表或改写示例写法**，
    否则会立刻红。补证轮已用 HEAD 版本对照：同样 10 条、命中 sha256 一致，本轮新增文字 **0 新增命中**
-   （文件字节 81571 → 86372）。
+   （扫描器 `bytes=` 字段口径，下同：81571 → 86372）。
+   §9.11.2 轮次复测：写初稿时一度把"键名冒号 + 双引号包值"那条正样本**原样贴进正文**，本报告自身命中
+   由 9 升到 10、两份文档合计 10 升到 12；发现后把该处改写为形状描述、不保留字面量，复测回到
+   本报告 9 + roadmap 1 = `findings=10`，两份文档扫描字节 86574 → 93318。
+   同轮把 M5-A 修复验收报告一并纳入对照（该文档自身 1 条），三份文档合计 `findings=12`——
+   数字上升全部来自文档化的合成样本，无真凭据，且这三份文档都不在 CI 扫描路径内。
 
 **接线**：`run_unified_boundary_guards.py` 新增 case `secret_scanner_selftest`，本地复跑
 `SUMMARY total=16 failed=0`（该 case 3.5s）；`.github/workflows/ci.yml` 的
@@ -499,4 +506,67 @@ push 档一条都不执行；其中 `perf-probe` 只扫 `artifacts`（perf JSON/
 本身就在默认排除清单内，故这些腿上 `shape_scanned_files` 预期为 0、赋值形状层不参与判定，
 实际拦截力全押在 `run_credential` 字面值与 jwt/dsn/bcrypt 三形状 + `--secret-env-var` 上
 （与上文已知代价 2 同一口径）。
+
+#### 9.11.2 dispatch 实跑：门禁判红自己的测试夹具（我的回归，已修并复现取证）
+
+**触发与结果**：为取 §9.11.1 未闭合的那条腿，主动触发一次 `workflow_dispatch`
+（run `36939737132`，headSha=`0c18cb6`，`run_release_acceptance=true`）。结果 **失败**：
+step 16「Scan upload paths for credential material」报
+`SECRET_SCAN_SUMMARY paths=4 files=6 bytes=690633 shape_scanned_files=5 shape_excluded_files=1
+exclude_rules=8 credential_env_vars=2 allowed_fixtures=3 findings=7 result=fail`，
+产物被 withhold，整条 release-acceptance 判红。
+
+**性质认定（先认账）**：这是我在 `0c18cb6` 引入的回归，不是环境抖动，也不是门禁误报。
+根因链条只有一环：**自检套件的步骤名里直接写了样本凭据字面量**（评审指定的那条引号键正样本，
+键名冒号 + 双引号包值的形状被原样写进了步骤名），而 release-acceptance 会把统一守卫的 stdout 落成
+`artifacts/release-acceptance/acceptance-summary.log`，该路径本身就在扫描范围内。
+于是扫描器扫到的是**自己测试夹具的文本**，而不是产物里的真凭据。
+教训固化成一条铁律：**门禁必须对自己的测试输出保持安静**——任何会被落进扫描路径的 stdout，
+都不允许出现凭据形状字面量。
+
+**逐条定位（不靠猜）**：`match_sha256` 的口径是对**整段 match token**（`match.group(0)`）取
+sha256 前 12 位，不是对被捕获的 `value` 取（backend/tests/check_artifact_secrets.py:184）。
+按该口径把 CI 报的 7 条逐一回映，全部落在旧自检的步骤名上，验收链路自身打印的凭据形状为 0 条。
+
+**端到端复现（sha 集合逐字节相同）**：在临时沙箱里用 `0c18cb6` 的旧自检 + 旧扫描器
+（`git diff 0c18cb6 HEAD -- backend/tests/check_artifact_secrets.py` 为空，与 HEAD 逐字节相同）
+跑旧自检，把它的 stdout 落成同名日志文件，再用 CI 同款参数（三个 `--allow-fixture`）扫描：
+
+```text
+修前：findings=7 result=fail
+      match_sha256 = dcc4b2a6f3e1 / 7433b91c7e0b / 53883c1e64a9 / 86cd51a4eed9
+                     / dfa61c5dae47 / 58db693c7363 / 677a9029b08c
+      —— 与 run 36939737132 step 16 的 7 条完全一致
+修后：同一扫描器、同一参数，扫新自检 stdout → findings=0 result=pass
+      （新自检自身 assertions=43 failed=0 result=pass）
+```
+
+顺带勘误：先前一次中间尝试里出现的 `fa725dc736a9` 是我用 grep 重拼 CI 日志产生的**伪命中**，
+CI 真实命中集合里没有它。
+
+**修复方式（先让守卫变红，再改文本）**：按 TDD 顺序做，避免"改完才发现没修对"：
+1. 先加第 43 条断言 `label_echo_guard()`——把全部步骤名回写成一份日志交给扫描器，要求
+   `findings=0`。在旧标签下实测**红**（`assertions=43 failed=1`），证明这条守卫真能抓住本次回归。
+2. 再把 11 条正样本 / 12 条负样本的步骤名改成**描述形状而不写样本字面量**
+   （例：「引号值正样本（键名冒号加双引号包值，评审指定）」）；样本内容仍然写进临时文件喂给扫描器，
+   断言语义一条都没变，只是标签文本对门禁安静。
+3. 复跑：`assertions=43 failed=0 result=pass`；守卫套件 `SUMMARY total=16 failed=0`；
+   并额外把守卫自己的 stdout 落盘复扫 → `findings=0 result=pass`。
+
+**仍未闭合（不得提前写成"CI 已验证"）**：run `36939737132` 虽然是唯一一次拿到
+`SECRET_SCAN_SUMMARY` 新键实跑取值的运行（`shape_scanned_files=5 / shape_excluded_files=1 /
+exclude_rules=8`），但那次运行整体是**红的**，因此这组数值**只能作为"扫描器在 CI 里确实按新参数
+执行并计数"的证据，不能作为"门禁绿灯"的证据**。绿态取值必须在修复推送后重新触发 dispatch 获取，
+取到之前 §9.11.1 的边界表述维持不变。
+
+另需注意：`shape_scanned_files=5` 与"CI 扫描目标目录全在排除清单内"的推论并不矛盾——那 5 个参与
+赋值形状扫描的文件来自 `artifacts/release-acceptance/`（含被 withholds 的守卫 stdout），
+而 `frontend/playwright-report` 内的产物走的是排除分支（`shape_excluded_files=1`）。
+换言之：**这次意外把"排除层之外还有真实扫描面"这件事证明了**，也正好是已知代价 2 的反面案例。
+
+**M5-A 契约矩阵的复跑口径补充**：本轮首次运行 `backend/tests/check_m5a_revision_backfill.py`
+得 `108 pass / 2 fail`，失败用例的报错是子进程 `importlib.get_data` 抛 `MemoryError` 后建表未完成，
+级联 `no such table: admin_jobs`；原地复跑两次得 `110 pass / 0 fail`（`EXIT=0`），
+同路径 `bf_scope1/3/4` 均通过。判定为环境瞬时抖动，非代码回归；但该口径目前只有本地一次性证据，
+未进 CI，审计方按"未闭环"处理。
 

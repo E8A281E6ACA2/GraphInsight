@@ -158,7 +158,8 @@
   （playwright-report/、test-results/、node_modules/、dist/、build/、`*.min.js`、`*.min.css`、`*.map`），
   排除只关闭赋值形状一档，字面值与 jwt/dsn/bcrypt 照常扫；`--exclude` / `--no-default-excludes`
   可控，SUMMARY 增 `shape_scanned_files`/`shape_excluded_files`/`exclude_rules` 并逐次打印排除 NOTE。
-- [x] 正样本自检套件 `backend/tests/check_artifact_secrets_selftest.py`：42 项断言全绿，逐样本单文件
+- [x] 正样本自检套件 `backend/tests/check_artifact_secrets_selftest.py`：43 项断言全绿（初版 42 项，
+  第 43 项是 §9.11.2 那次 CI 变红后补的步骤名回显守卫），逐样本单文件
   单进程；负向对照（把扫描器形状循环去势）→ `assertions=37 failed=14` 变红，sha256 逐字节还原后复绿，
   证明"门禁永远干净"这种失效无法躲过自检。
 - [x] 接线与取证：`run_unified_boundary_guards.py` 新增 case `secret_scanner_selftest`
@@ -171,10 +172,20 @@
   push 档 CI run#36937457198 结论 success，并以 `commits/c9433ef/check-suites` 独立复核 Actions
   = completed/success；CI 日志含 `SECRET_SCAN_SELFTEST_SUMMARY assertions=42 failed=0 result=pass`、
   `[OK] secret_scanner_selftest`、`SUMMARY total=16 failed=0`，与本地计数一致。详见报告 §9.11.1。
+- [x] dispatch 实跑暴露并闭环一次**我自己引入的回归**（2026-10-02，报告 §9.11.2）：触发 run#36939737132
+  （headSha=`0c18cb6`）取新 SUMMARY 取值，结果 step 16 报 `findings=7 result=fail`、产物被 withhold。
+  根因是自检套件的**步骤名里写了样本凭据字面量**，而 release-acceptance 会把守卫 stdout 落成
+  `artifacts/release-acceptance/acceptance-summary.log`——该路径在扫描范围内，于是门禁判红自己的夹具。
+  修复按 TDD：先加第 43 条 `label_echo_guard`（旧标签下实测红 `assertions=43 failed=1`）→ 再把标签去
+  凭据化（样本仍写临时文件喂扫描器，断言语义不变）→ 复跑 `43/0`、守卫 `16/0`、守卫 stdout 落盘复扫
+  `findings=0`。复现取证：沙箱重跑旧自检并按 CI 参数扫其 stdout，7 条 `match_sha256`
+  与该 run 逐条相同（口径为整段 `match.group(0)` 取哈希，见 check_artifact_secrets.py:184）。
 - [ ] 遗留：`SECRET_SCAN_SUMMARY` 新增三键（`shape_scanned_files`/`shape_excluded_files`/
-  `exclude_rules`）的 **CI 实跑取值仍未取到**——6 个 scanner step 全在 `workflow_dispatch` 档 job，
-  push 档一条不执行，且 `perf-probe` 腿只扫 `artifacts` 不覆盖 minified 产物；要补这条需触发一次
-  扫描 `frontend/playwright-report` 的真实 dispatch 运行。已知代价两条（`Pa(ss)word` 形态不报、
+  `exclude_rules`）的 **CI 绿态实跑取值仍未取到**。run#36939737132 虽给到
+  `shape_scanned_files=5 shape_excluded_files=1 exclude_rules=8`，但该运行整体为红，只能证明"CI 里
+  确实按新参数执行并计数"，不能当绿灯证据；6 个 scanner step 全在 `workflow_dispatch` 档 job，
+  push 档一条不执行，且 `perf-probe` 腿只扫 `artifacts` 不覆盖 minified 产物；要补这条需在修复推送后
+  重新触发一次真实 dispatch 运行。已知代价两条（`Pa(ss)word` 形态不报、
   排除路径不扫赋值形状）详见 `docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md` §9.11。
 
 ## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）
