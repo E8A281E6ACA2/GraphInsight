@@ -491,8 +491,8 @@ backfill 不止建 chunk_revisions 行，还必须把版本号真实补写到索
 4. **补写 Milvus**：仅对本次新 backfill 的 chunk：读取 embedding 后 upsert 到目标 collection（v3，显式 `content_revision INT64 = 1`）；embedding 未配置 → 跳过，报告 `VECTOR_BACKFILL_SKIPPED`，该行 `vector_status=skipped`。
 5. **投影状态落库**：仅对本次新 backfill 的 chunk：Neo4j 已补写 → `graph_status=indexed, graph_content_revision=1`；Milvus 已 upsert → `vector_status=indexed, vector_content_revision=1`；其余按能力跳过/失败。
 6. **验证**：Neo4j 抽样 `content_revision=1`；Milvus 抽样 metadata `content_revision` 为 int 且 =1；输出 `rows_new/rows_existing/needs_reindex_targets/converged/neo4j_updated/milvus_upserted/skipped`。
-7. **needs_reindex_targets 前置门（v3.2.1 收口）**：`needs_reindex_targets` 非空时，把该集合生成 current revision 的 reindex targets 入队（reindex-document/reindex-chunks），执行到全部收敛（按投影各自独立判定）**之后**，才允许关闭 backfill 前置门；未收敛不关闭。收敛判定：**indexed** 必须满足 `*_content_revision == current.content_revision`；**skipped** 必须满足"该投影能力未配置（embedding/LLM 关闭）且 `*_content_revision IS NULL`"——skipped 允许关闭技术迁移前置门，但必须输出 `DEGRADED_SKIPPED`，**不得宣布完整索引验收通过**；**failed/stale/pending 继续阻断前置门**。`converged` 集合不产生任务。
-8. **重复执行**：全幂等，第二次 `rows_new=0`、`needs_reindex_targets=0`（已有 revision 行的 chunk 不再被触碰）。
+7. **needs_reindex_targets 前置门（v3.2.1 收口）**：`needs_reindex_targets` 非空时，把该集合生成 current revision 的 reindex targets 入队（reindex-document/reindex-chunks），执行到全部收敛（按投影各自独立判定）**之后**，才允许关闭 backfill 前置门；未收敛不关闭。收敛判定：**indexed** 必须满足 `*_content_revision == current.content_revision`；**skipped** 必须满足"该投影能力未配置（embedding/LLM 关闭）且 `*_content_revision IS NULL`"——skipped 允许关闭技术迁移前置门，但必须输出 `DEGRADED_SKIPPED`，**不得宣布完整索引验收通过**；**failed/stale/pending 继续阻断前置门**。`converged` 集合不产生任务。**入队清单取写入后重新读取的 inventory（v3.2.1 执行态取证纠偏，不改变任何阈值）**：本轮新写入但投影未收敛的 chunk（例如 §8.5 下 `vector_status=pending`、或 graph 补写失败）在决策时属 `new_chunks`，若仍按决策时清单入队，会出现"同一轮报告 `needs_reindex_targets=N` 却只给子集排队"的静默漏排；门评算与入队必须基于同一份写入后状态。
+8. **重复执行**：全幂等，第二次 `rows_new=0`、`needs_reindex_targets=0`（已有 revision 行的 chunk 不再被触碰）。**口径澄清（v3.2.1 执行态取证）**：`needs_reindex_targets=0` 只在"该集合已被 reindex 收敛"之后成立；reindex job 尚未执行（或没有消费方）时，第二轮仍会列出**同一批** targets，幂等体现在不新增 revision 行、不重复补写索引、入队复用同一 `targets_hash`（`jobs_reused`），而不是把未收敛投影报成 0。
 
 backfill 时序：
 

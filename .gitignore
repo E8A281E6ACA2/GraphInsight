@@ -118,3 +118,4 @@ drill_state.json
 *.drill_state.json
 .gi_drill_state*
 !docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md
+!docs/ENTERPRISE_M5A_FIX_ACCEPTANCE_REPORT.md
