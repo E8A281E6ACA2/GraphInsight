@@ -1,14 +1,15 @@
 # M5-A 审计整改轮验收报告（2026-10-01）
 
-基线：`ef88722`（本地，未 push）。本报告只记录**已验证事实**与**明确未验证项**，不含推测性结论。
+基线：`63f9932`（v1/v2 交付基线，本地未 push；v3 追加轮 §9 在其后单独提交）。本报告只记录**已验证事实**与**明确未验证项**，不含推测性结论。
 
 ## 1. 结论（TLDR）
 
-1. 审计提出的四项阻断问题（#1 孤儿 revision、#2 严格 UNRECOVERABLE、#3 v2 Milvus 真实查询路径、#4 作用域 fail-closed）与两项补充（schema/index 结构校验、`rows_skipped_existing`）**代码已落地并通过契约测试矩阵**（临时 SQLite，111 项断言全绿，退出码 0）。
-2. 活栈取证已完成的部分：**真实 PostgreSQL 结构校验通过**、**真实 Milvus / Neo4j / PG 只读路径通过（非 mock，含零写入自证）**，并按用户授权（"dev 上用专用合成 KB 跑 / 只用合成专用 KB"）在 dev 活栈跑通**真实写入执行态**：PG revision 行 + Neo4j `content_revision=1` + `admin_jobs` 入队 + 幂等重跑，34 项断言全绿（§3.4）。写入面严格限制在合成 kb_id `m5a-live-20261001`，取证后已按 kb_id 整块回收并复核回到基线计数（`chunk_revisions=0`、`admin_jobs=21`），未触碰现有真实 KB。
+1. 审计提出的四项阻断问题（#1 孤儿 revision、#2 严格 UNRECOVERABLE、#3 v2 Milvus 真实查询路径、#4 作用域 fail-closed）与两项补充（schema/index 结构校验、`rows_skipped_existing`）**代码已落地并通过契约测试矩阵**（临时 SQLite，断言全绿，退出码 0；断言数为 **110**，v1/v2 写的 111 是计数口径虚高，见 §9.5）。
+2. 活栈取证已完成的部分：**真实 PostgreSQL 结构校验通过**、**真实 Milvus / Neo4j / PG 只读路径通过（非 mock，含零写入自证；断言 20 项，§3.3）**，并按用户授权（"dev 上用专用合成 KB 跑 / 只用合成专用 KB"）在 dev 活栈跑通**真实写入执行态**：PG revision 行 + Neo4j `content_revision=1` + `admin_jobs` 入队 + 幂等重跑，全绿退出码 0（§3.4；其历史"34 项"含子进程回显与汇总行，统一口径下的准确数需带 `--confirm` 复跑才能取，见 §9.5）。写入面严格限制在合成 kb_id `m5a-live-20261001`，取证后已按 kb_id 整块回收并复核回到基线计数（`chunk_revisions=0`、`admin_jobs=21`），未触碰现有真实 KB。
 3. 执行态取证又暴露并修复了一个静默缺陷：**同一轮新写入但未收敛的 chunk 没有排入 reindex job**（§5.4）。修复后活栈幂等重跑才复用 `targets_hash`。
 4. **仍未取得证据的腿见 §6**：reindex 收敛闭环（当前代码库根本没有该 job 的消费方，属结构性缺口而非"没跑"）、Milvus 向量侧真实写入、真实上传→解析链路、规模与并发。因此**本轮不宣布 M5-A 验收通过，M5-B Go API 继续冻结**。
 5. 活栈探测额外发现并已修复四处问题（§5.1–§5.4，其中 §5.3 是口径纠偏），这些缺陷都是纯 mock/SQLite 测试结构上不可能发现的。
+6. v3 追加轮闭合存量风险任务 **#55**：`check_kb_migrations_smoke.py` 原用"置空 env 覆盖变量 + 注入 sqlite 地址"的**伪隔离**，其 `rollback` 步实际会打到开发 PostgreSQL 的两张真实表。已改为 env 文件真隔离并在任何破坏性动作前加方言守卫，同时新增静态防回归守卫；历史影响面的可证否部分与**不可判定窗口**见 §9.2。
 
 ## 2. 四项阻断问题的落点
 
@@ -27,7 +28,7 @@
 
 ## 3. 已验证证据（真实输出摘录）
 
-### 3.1 契约测试矩阵（临时 SQLite，111 项断言）
+### 3.1 契约测试矩阵（临时 SQLite，110 项断言）
 
 ```text
 $ python backend/tests/check_m5a_revision_backfill.py
@@ -158,7 +159,7 @@ $ cd backend && PYTHONPATH=. python tests/check_m5a_live_execution.py --confirm
 ✓ live execution-state evidence collected (real PG + Neo4j + Milvus)
 ```
 
-34 项断言全绿。这一轮跑出的是**审计前置条件的直接证据**：真实 PG 写 revision 行、真实 Neo4j MERGE `content_revision=1` 并读回、真实 `admin_jobs` 入队与 `targets_hash` 复用、真实作用域冲突 fail-closed。
+34 行 ✓（其中含 CLI 回显的 `✓ dry-run completed` / `✓ backfill 完成` 与末尾汇总行；统一口径的断言数见 §9.5）。这一轮跑出的是**审计前置条件的直接证据**：真实 PG 写 revision 行、真实 Neo4j MERGE `content_revision=1` 并读回、真实 `admin_jobs` 入队与 `targets_hash` 复用、真实作用域冲突 fail-closed。
 
 ## 4. dev 活栈的客观条件（影响"执行态"能否取证）
 
@@ -222,12 +223,19 @@ $ cd backend && PYTHONPATH=. python tests/check_m5a_live_execution.py --confirm
 # 契约矩阵（临时 SQLite，无需活栈）
 python backend/tests/check_m5a_revision_backfill.py
 
+# 迁移幂等/回滚 smoke（v3 起为真隔离：env 文件 + 破坏性动作前的方言守卫）
+python backend/tests/check_kb_migrations_smoke.py
+
+# 静态守卫（含 #55 的 sqlite 隔离写法防回归）
+python backend/tests/check_migration_cleanup_guards.py
+
 # 语法检查
 python -m py_compile backend/admin/backfill_chunk_revisions.py \
     backend/admin/m5a_schema_check.py backend/admin/migrate_chunk_revisions.py \
     backend/admin/migrate_jobs_targets_hash.py backend/tests/m5a_backfill_driver.py \
     backend/tests/check_m5a_revision_backfill.py backend/tests/check_m5a_live_stack_readonly.py \
-    backend/tests/check_m5a_live_execution.py
+    backend/tests/check_m5a_live_execution.py backend/tests/check_kb_migrations_smoke.py \
+    backend/tests/check_migration_cleanup_guards.py
 
 # 活栈只读结构校验（真实 PG；非破坏）
 cd backend && PYTHONPATH=. python admin/m5a_schema_check.py both
@@ -245,4 +253,129 @@ cd backend && PYTHONPATH=. python tests/check_m5a_live_execution.py --confirm --
 ## 8. 修订记录
 
 - v1（2026-10-01）：审计整改轮首版交付报告。四项阻断修复 + 两项补充落地；活栈完成真实 PG 结构校验与只读非 mock 取证；写入执行态未取证，M5-A 不宣布通过，M5-B 保持冻结。
-- v2（2026-10-01）：补真实写入执行态取证（§3.4，合成 KB 授权窗口，34 项断言全绿、清理后复核回基线）。执行态又命中并修复一个静默缺陷（§5.4：未收敛的新 chunk 未在同一轮排入 reindex job），SQLite 矩阵从 108 增至 111 项并新增 `rfa_rerun` 回归；计数改名 `insert_conflicts_skipped`（§2）；未登记 KB 的 `SCOPE_UNRESOLVED` 拒绝腿固化进只读脚本（§3.3）；§6 改写为当前结构性缺口清单，其中 reindex job 无消费方一条决定了"门收敛"这条腿在 M5-B 之前不可能取证。设计文档 §15.3 步骤 7/8 同步补两处口径说明（§5.4 入队时机、§5.5 幂等文字歧义），**未改动任何验收阈值**。M5-A 仍不宣布通过，M5-B 保持冻结。
+- v2（2026-10-01）：补真实写入执行态取证（§3.4，合成 KB 授权窗口，34 项断言全绿、清理后复核回基线）。执行态又命中并修复一个静默缺陷（§5.4：未收敛的新 chunk 未在同一轮排入 reindex job），SQLite 矩阵从 108 增至 111 项并新增 `rfa_rerun` 回归；计数改名 `insert_conflicts_skipped`（§2）；未登记 KB 的 `SCOPE_UNRESOLVED` 拒绝腿固化进只读脚本（§3.3）；§6 改写为当前结构性缺口清单，其中 reindex job 无消费方一条决定了"门收敛"这条腿在 M5-B 之前不可能取证。设计文档 §15.3 步骤 7/8 同步补两处口径说明（§5.4 入队时机、§5.5 幂等文字歧义），**未改动任何验收阈值**。M5-A 仍不宣布通过，M5-B 保持冻结。（v3 复核注：本条与 v1 的"111 项 / 34 项"是 `grep -c "✓"` 得到的 ✓ 行数，含汇总行与子进程回显，统一口径下的断言数见 §9.5；退出码与通过/失败判定不变。）
+- v3（2026-10-01）：闭合任务 #55（迁移测试 DB 伪隔离）。新增 §9 记录根因、"历史是否曾在活 PG drop 表"的取证结论与不可判定窗口、整改后的三层守卫输出与静态防回归。**本节追加在修订记录之后，是为了保持审计已引用的 §1–§8 编号不变**。M5-A 结论不变：仍不宣布通过，M5-B 保持冻结。
+
+---
+
+## 9. 追加轮：迁移测试 DB 伪隔离整改（任务 #55）
+
+### 9.1 现象与根因
+
+`backend/tests/check_kb_migrations_smoke.py` 的文档口径是"临时 SQLite，不触碰开发/生产数据库"，
+但它对子进程用的是 `ADMIN_DATABASE_URL=sqlite:///...` + `GRAPHINSIGHT_BACKEND_ENV_FILE=""`。
+`backend/admin/database.py:14-22` 只在该变量**指向存在的文件**时才走隔离分支；空串落到 `else`
+执行 `load_dotenv(find_dotenv(), override=True)`，沿子进程脚本 `__file__` 向上命中 `backend/.env`，
+用其中的 PostgreSQL 地址**覆盖**注入的 sqlite 地址。旧脚本同文件三处（子进程 env、bootstrap、
+父进程 inspector）都用了这个伪隔离配方。
+
+实测探针（复刻旧配方，仅 `--dry-run`，零 DDL）：
+
+```text
+数据库: postgresql://graphinsight:****@127.0.0.1:5434/graphinsight_admin
+方言: postgresql
+计划动作: rollback
+- drop table knowledge_base_documents
+- drop table knowledge_bases
+```
+
+即：旧 smoke 的 `rollback` 步一旦在装有 `backend/.env` 的机器上手工执行，就删的是开发库的两张真实表。
+
+### 9.2 历史是否真的在活 PG 上 drop 过表（结论 + 不可判定窗口）
+
+能证否的部分（当前活库只读快照，全程未下发任何 DDL）：
+
+- `knowledge_bases` 现存 1 行，`created_at = 2026-09-30 00:46:43.324408+00`（E2E 合成 KB）。该行仍在**当前表版本**里，故 2026-09-30 00:46 之后未发生过 DROP。
+- OID 单调：`knowledge_bases=32906`、`knowledge_base_documents=32932`、`chunk_revisions=33001`（本轮 M5-A 建）。
+- `admin_logs` 的 `project_id/kb_id` 位于 attnum 31/32，恰为该表 attnum 上界（32）；`admin_qa_traces` 的 `tenant_id/project_id/kb_id` 位于 42/43/44，恰为上界（44）。`migrate_audit_scope_columns.py` 的 rollback 会 `DROP COLUMN`、migrate 再 `ADD COLUMN`（attnum 只增不复用），若这套 smoke 真跑过活库，这些列会落在更高的 attnum 上并留下空洞——现未见该痕迹。
+- 行数面：`knowledge_base_documents` 0 行、`chunk_revisions` 0 行；`pg_stat` 累计 `knowledge_bases` ins=5/del=4、`knowledge_base_documents` ins=10/del=10，量级与"建表后仅 E2E/测试轮次使用"一致。
+
+不可判定的窗口（如实记录，不粉饰）：
+
+- 时间窗：`2026-09-29 14:46`（`9a11561` 引入伪隔离）→ `2026-09-30 00:46`（E2E 行落入当前表版本）。
+- 该窗口的语句日志取不到：活库 `logging_collector=off`、`log_statement=none`，`data_directory=/var/lib/postgresql/data`（容器内），无历史 DDL 日志可查；OID 布局与该窗口内"是否曾 rollback 再 recreate"并不互斥。
+- **结论：这一段窗口无法从数据库侧证实或证伪。** 影响面评估：按 M1 契约 KB 目录不建 default KB、不迁旧数据，dev 库该窗期内无业务存量；且该 smoke 从未进 CI，也未挂进 `run_unified_boundary_guards.py` / `run_backend_smoke_suite.py`（Explore 取证：仅 `9a11561` 一次提交，聚合器无引用），只有手工运行才可能触发。因此不存在"生产数据被删"的路径，dev 库当前数据面自洽。
+
+### 9.3 整改内容
+
+1. 隔离手法统一为：临时目录内生成真实存在的 `kb_mig_smoke.env`（内容 `ADMIN_DATABASE_URL=sqlite:///...`），**所有子进程与父进程共用这一份**，并在父进程 import 前写入 `os.environ`。
+2. 破坏性动作前置守卫：`guard_isolation()` 先验证子进程与父进程引擎方言均为 sqlite；每个迁移脚本再跑一次 `--dry-run` 并解析其打印的 `方言:`，非 sqlite 即中止，**一条 migrate/rollback 都不下发**；每个真实动作额外断言 "exit 0 且仍为 sqlite"。
+3. 守卫有效性自证：把 env 文件内容改指 PostgreSQL，引擎方言必须随之变化（`create_engine` 惰性，只读方言、不建连接），证明守卫不是摆设。
+4. 静态防回归：`backend/tests/check_migration_cleanup_guards.py` 新增 `test_sqlite_isolated_tests_use_env_file_not_blank_override()`——凡源码含 `sqlite:///` 的 `check_*.py`，禁止出现置空 `GRAPHINSIGHT_BACKEND_ENV_FILE` 的写法，且必须把该变量指向真实 env 文件。该守卫已随 `migration_cleanup` case 进入 `run_unified_boundary_guards.py`。
+
+### 9.4 整改后真实输出
+
+`python backend/tests/check_kb_migrations_smoke.py`（19 项，EXIT=0）：
+
+```text
+隔离方式: GRAPHINSIGHT_BACKEND_ENV_FILE -> kb_mig_smoke.env
+  ✓ 子进程引擎守卫（必须 sqlite）
+  ✓ 父进程引擎守卫（必须 sqlite）
+  ✓ 基础表引导
+[migrate_knowledge_base_tables.py]
+  ✓ dry-run 解析到 sqlite（真实动作前的最后一道闸）
+  ✓ 首次 migrate（exit 0 且仍为 sqlite）
+  ✓ 重复 migrate（幂等）（exit 0 且仍为 sqlite）
+  ✓ rollback（exit 0 且仍为 sqlite）
+  ✓ rollback 后再 migrate（exit 0 且仍为 sqlite）
+[migrate_audit_scope_columns.py]  （同上 5 项全 ✓）
+  ✓ 结构校验连接的仍是 sqlite（非误连开发库）
+  ✓ knowledge_bases 存在
+  ✓ knowledge_base_documents 存在
+  ✓ admin_logs 含 project_id/kb_id
+  ✓ admin_qa_traces 含 tenant/project/kb
+  ✓ 守卫有效性自证（env 文件改指 PG 时方言必须变化，否则守卫是摆设）
+✓ all migration smoke checks passed
+```
+
+静态守卫与负向自证：
+
+```text
+$ python backend/tests/check_migration_cleanup_guards.py
+MIGRATION_CLEANUP_GUARDS_OK            # GUARD_EXIT=0
+$ # 负向自证 A：把 HEAD 里带伪隔离的旧 smoke 原样复制成 tests/check_zz_head_legacy_probe.py
+AssertionError: ... check_zz_head_legacy_probe.py 置空 env 覆盖变量（伪隔离）: GRAPHINSIGHT_BACKEND_ENV_FILE"] = "";
+              ... check_zz_head_legacy_probe.py 未把 env 覆盖变量指向真实 env 文件   # PROBE_EXIT=1
+$ # 负向自证 B：最小合成样本（sqlite 注入 + 置空变量），同样被点名
+AssertionError: ... check_zz_guard_probe_tmp.py 置空 env 覆盖变量（伪隔离）: ...   # PROBE_EXIT=1
+$ # 两个探针文件均已删除（tests/check_zz* 计数为 0），守卫复跑回到 exit 0
+```
+
+即：守卫不是只对合成样本生效，对**真实历史 bug 文件**同样会红。
+
+活库回归对照（整改后复跑，与 §9.2 快照逐字一致，证明本轮零触碰）：
+
+```text
+dialect = postgresql | db = graphinsight_admin
+  knowledge_bases          rows=1  oid=32906 relfilenode=32906
+  knowledge_base_documents rows=0  oid=32932 relfilenode=32932
+  chunk_revisions          rows=0  oid=33001 relfilenode=33001
+  admin_logs      last_attnum=32 live_cols=16
+  admin_qa_traces last_attnum=44 live_cols=20
+```
+
+全仓同类写法排查：`GRAPHINSIGHT_BACKEND_ENV_FILE` 置空仅此一例（已修）；含 `sqlite:///` 的 10 个 `check_*.py`
+现全部使用 env 文件手法。`check_dual_kb_blackbox.py` 的置空属于活栈测试"就要连开发库"的有意行为，不含 sqlite 注入，不在禁列。
+
+### 9.5 本轮自查纠偏：断言计数口径虚高（我自己犯的，主动认账）
+
+现象：v1/v2 里的"111 项 / 22 项 / 34 项"是用 `grep -c "✓"` 统计整份输出得到的，把两类**非断言行**算了进去：
+
+1. 套件末尾的汇总行，例如 `✓ all M5-A acceptance checks passed`；
+2. 被回显进输出的子进程日志行，例如 backfill CLI 的 `✓ dry-run completed，未写库`、`✓ backfill 完成，前置门 CLOSED`。
+
+统一口径（此后一律照此计数）：**断言数 = 输出中匹配 `^  ✓`（两空格前缀，`step()` 的固定格式）的行数**；失败对应 `^  ✗`。
+
+2026-10-01 按统一口径复跑核对：
+
+| 套件 | v1/v2 记录 | 统一口径实测 | 差异来源 |
+| --- | --- | --- | --- |
+| `check_m5a_revision_backfill.py` | 111 | **110**（✗ 0，exit 0） | 多算 1 行汇总 |
+| `check_m5a_live_stack_readonly.py` | 22 | **20**（✗ 0，exit 0） | 多算 1 行汇总 + 1 行 CLI 回显 |
+| `check_kb_migrations_smoke.py`（v3 整改后） | — | **19**（✗ 0，exit 0） | 本轮新计 |
+| `check_migration_cleanup_guards.py` | — | 守卫输出 `MIGRATION_CLEANUP_GUARDS_OK`，负向自证 exit 1 | 非 step 型套件，按退出码判定 |
+| `check_m5a_live_execution.py` | 34 | **需带 `--confirm` 复跑才能给准数**（其回显含 CLI 的 ✓ 行） | 本轮未复跑，避免对 dev 活库做无必要的真实写入 |
+
+影响面：**不改变任何结论**。四个套件当时与现在的退出码都是 0、失败断言都是 0，虚高只出现在"数量表述"，不涉及阈值、不涉及通过/失败判定，也未掩盖任何缺陷。§3.4 的准确断言数按上表标注为待复跑项，不在本文里猜数。
+
+
