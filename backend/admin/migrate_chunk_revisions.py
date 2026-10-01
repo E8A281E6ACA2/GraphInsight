@@ -6,6 +6,8 @@ chunk_revisions 表迁移/回滚（M5-A，设计 §3 + §15.1 冻结契约）。
 - 5 个查询索引（§3）+ current 部分唯一索引（§15.1）
 - 支持 postgresql / sqlite 双方言；--dry-run 只打印计划不写库；
   --action rollback 按"索引随表 drop"原则整表删除（§15.1：无独立回滚面）。
+- migrate 后执行结构校验（admin/m5a_schema_check.py）：逐列类型/可空、UNIQUE 约束、
+  索引存在性、列顺序与部分唯一索引 WHERE 谓词；校验不通过则退出码 1。
 
 用法：
     python backend/admin/migrate_chunk_revisions.py --dry-run
@@ -26,6 +28,7 @@ backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
 from admin.database import engine  # noqa: E402
+from admin.m5a_schema_check import check_chunk_revisions_structure, print_results  # noqa: E402
 
 load_dotenv(find_dotenv(), override=True)
 
@@ -254,6 +257,11 @@ def main() -> int:
         return 0
 
     _run(args.action)
+    if args.action == "migrate":
+        with engine.connect() as conn:
+            if not print_results("chunk_revisions", check_chunk_revisions_structure(conn)):
+                print("✗ chunk_revisions 结构校验未通过（迁移已执行，但契约结构不符，禁止进入下一步）")
+                return 1
     print(f"✓ chunk_revisions {args.action} completed")
     return 0
 

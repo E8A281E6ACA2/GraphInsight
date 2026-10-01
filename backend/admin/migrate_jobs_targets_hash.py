@@ -30,6 +30,7 @@ backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
 from admin.database import engine  # noqa: E402
+from admin.m5a_schema_check import check_targets_hash_structure, print_results  # noqa: E402
 
 load_dotenv(find_dotenv(), override=True)
 
@@ -179,6 +180,11 @@ def main() -> int:
         return 0
 
     _run(args.action)
+    if args.action == "migrate":
+        with engine.connect() as conn:
+            if not print_results("admin_jobs.targets_hash", check_targets_hash_structure(conn)):
+                print("✗ targets_hash 结构校验未通过（迁移已执行，但契约结构不符，禁止进入下一步）")
+                return 1
     print(f"✓ admin_jobs.targets_hash {args.action} completed")
     return 0
 
