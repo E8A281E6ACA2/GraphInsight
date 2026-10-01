@@ -10,29 +10,58 @@
   * 形状（JWT / 带口令的 DSN / password= 赋值 / bcrypt 哈希）会误报仓库里公开声明过的
     fixture 口令，所以允许显式 --allow-fixture 放行，但放行清单会打进日志，便于复核。
 
+形状层内部分两档（任务 #31）：
+  * 高置信形状 jwt / dsn_with_credentials / bcrypt_hash 在任何文件里都扫；
+  * 赋值形状 credential_assignment 依赖值的字符集，是唯一的误报来源，因此对打包产物
+    （playwright-report/、test-results/、node_modules/、dist/、build/、*.min.js、
+    *.min.css、*.map）默认关闭；--exclude 追加范围，--no-default-excludes 恢复全量扫描。
+    取舍是「误报靠扫描范围控制，漏报靠规则修复」，不再靠放宽全局值字符集换安静——
+    那一次字符集调整把 password=ab;cdefghij、"password": "..." 这类真凭据一起放过了。
+    被排除的文件仍然扫字面值与高置信形状，注入凭据不会因为排除而隐身。
+
 扫描结果只打印匹配位置的哈希与脱敏片段，绝不回显命中的凭据本身。
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
+
+ASSIGNMENT_KIND = "credential_assignment"
+
+# 打包/压缩产物：赋值形状在此类路径上的误报率远高于收益，默认只跑字面值与高置信形状。
+DEFAULT_SHAPE_EXCLUDES: tuple[str, ...] = (
+    "*/playwright-report/*",
+    "*/test-results/*",
+    "*/node_modules/*",
+    "*/dist/*",
+    "*/build/*",
+    "*.min.js",
+    "*.min.css",
+    "*.map",
+)
+
+# 键锚点不能用 \b：`_` 属于词字符，ADMIN_PASSWORD / SECRET_KEY 会在 \b 处失配。
+# 允许前缀段（GRAPHINSIGHT_ADMIN_PASSWORD=）；后缀只放行确实承载凭据的形态
+# （_key/_hash/_token/_value/_secret），password_hint / passwordValidator 仍不误报。
+# 冒号前允许可选引号，使 JSON 的 "password": "..." 也能命中。
+# 值字符集放开 ; { }（真凭据里会出现），结构性误报交给下面的字面量判别。
+CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-])*"
+    r"(?:password|passwd|secret|api[_-]?key|access[_-]?token|authorization)"
+    r"(?:[_-](?:key|hash|token|value|secret))?['\"]?"
+    r"\s*[:=]\s*['\"]?(?P<value>[^\s'\",]{6,})"
+)
 
 PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
     ("dsn_with_credentials", re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]{1,64}:[^\s/:@]{3,128}@[0-9a-zA-Z.-]+")),
-    (
-        "credential_assignment",
-        # 值字符集排除 ; { }：minified JS 里 o.password=null;const 之类的结构赋值
-        # 会把 JS 语法片段当成凭据值误报；真实凭据通常带引号，仍能被捕获。
-        re.compile(
-            r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|authorization)\b\s*[:=]\s*[\"']?([^\s\"',;{}]{6,})"
-        ),
-    ),
+    (ASSIGNMENT_KIND, CREDENTIAL_ASSIGNMENT),
     ("bcrypt_hash", re.compile(r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")),
 )
 
@@ -47,17 +76,48 @@ PLACEHOLDER_VALUES = {
     "***",
 }
 
+# 值首段就是这些字面量/接收者时，赋值右侧是程序结构而不是凭据
+# （minified 与松散日志里的 `password=null;const t=1;`，源码里的 `password=self.password`）。
+# 判别只看开头连续字母段，`null;const` 判为结构，`ab;cdefghij` 与 `nullpass123` 不放过。
+STRUCTURAL_VALUE_HEADS = {
+    "null",
+    "undefined",
+    "true",
+    "false",
+    "nan",
+    "void",
+    "this",
+    "self",
+    "cls",
+}
 
-def _walk(paths: Iterable[Path]) -> Iterable[Path]:
+# 值为「点分标识符 + 左括号」开头时是调用表达式（os.getenv(...) / get_password_hash(x)），
+# 不是凭据。已知代价：真凭据若长成 `Pa(ss)word` 这种"标识符紧跟左括号"的形态会被放过，
+# 自检里有一条用例把这个缺口钉在明面上，不允许它悄悄扩大。
+CODE_CALL_VALUE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\(")
+
+
+def _walk(paths: Iterable[Path], excludes: Sequence[str]) -> Iterable[tuple[Path, bool]]:
+    """产出 (文件, 是否扫描赋值形状)。排除只作用于赋值形状，不作用于字面值与高置信形状。"""
     for root in paths:
         if root.is_file():
-            yield root
+            yield root, not _is_shape_excluded(root, excludes)
             continue
         if not root.exists():
             continue
         for path in root.rglob("*"):
             if path.is_file():
-                yield path
+                yield path, not _is_shape_excluded(path, excludes)
+
+
+def _is_shape_excluded(path: Path, excludes: Sequence[str]) -> bool:
+    text = path.as_posix()
+    # 相对路径可能没有前导目录段，补一份带前导 / 的形态让 `*/dir/*` 能命中根目录。
+    for candidate in (text, f"/{text}"):
+        for pattern in excludes:
+            if fnmatch.fnmatch(candidate, pattern):
+                return True
+    return False
 
 
 def _sha(text: str) -> str:
@@ -70,16 +130,29 @@ def _redact(match: str) -> str:
     return f"{match[:6]}...{match[-3:]}({len(match)} chars)"
 
 
+def _is_structural_value(value: str) -> bool:
+    head = re.match(r"[^A-Za-z]*([A-Za-z]+)", value)
+    return bool(head) and head.group(1).lower() in STRUCTURAL_VALUE_HEADS
+
+
+def _is_code_value(value: str) -> bool:
+    """结构字面量或调用表达式——两者都是代码骨架，不是凭据。"""
+    return _is_structural_value(value) or bool(CODE_CALL_VALUE.match(value))
+
+
 def scan(
-    files: Iterable[Path],
+    targets: Iterable[tuple[Path, bool]],
     literals: list[str],
     allowed: set[str],
-) -> tuple[int, int, list[str]]:
+) -> tuple[int, int, int, list[str]]:
     findings: list[str] = []
     scanned_files = 0
+    shape_files = 0
     scanned_bytes = 0
-    for path in files:
+    for path, assignment_scanned in targets:
         scanned_files += 1
+        if assignment_scanned:
+            shape_files += 1
         try:
             raw = path.read_bytes()
         except OSError as exc:
@@ -94,17 +167,23 @@ def scan(
                     f"length={len(value)} occurrences={text.count(value)}"
                 )
         for kind, pattern in PATTERNS:
+            if kind == ASSIGNMENT_KIND and not assignment_scanned:
+                continue
             for match in pattern.finditer(text):
                 token = match.group(0)
-                captured = match.group(2) if kind == "credential_assignment" and match.groups() and match.group(2) else token
+                captured = match.group("value") if kind == ASSIGNMENT_KIND else token
+                if not captured:
+                    continue
                 if captured.strip() in allowed or captured.strip() in PLACEHOLDER_VALUES:
+                    continue
+                if kind == ASSIGNMENT_KIND and _is_code_value(captured):
                     continue
                 if kind == "dsn_with_credentials" and any(fixture in token for fixture in allowed):
                     continue
                 findings.append(
                     f"SECRET_FINDING kind={kind} file={path} match_sha256={_sha(token)} value={_redact(captured)}"
                 )
-    return scanned_files, scanned_bytes, findings
+    return scanned_files, shape_files, scanned_bytes, findings
 
 
 def main() -> int:
@@ -121,6 +200,17 @@ def main() -> int:
         action="append",
         default=[],
         help="Declared non-secret fixture value that shape patterns may match. Repeatable.",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Glob whose files skip the credential_assignment shape only (defaults still apply). Repeatable.",
+    )
+    parser.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help="Scan bundled/minified artifacts for assignment shapes too (stricter, may raise false positives).",
     )
     parser.add_argument("--skip-missing", action="store_true", help="Do not fail when no path exists.")
     args = parser.parse_args()
@@ -140,6 +230,10 @@ def main() -> int:
     if missing:
         print(f"SECRET_SCAN_NOTE missing_paths={missing}")
 
+    excludes: list[str] = list(args.exclude)
+    if not args.no_default_excludes:
+        excludes.extend(DEFAULT_SHAPE_EXCLUDES)
+
     literals: list[str] = []
     provided: list[str] = []
     for name in args.secret_env_var:
@@ -151,14 +245,22 @@ def main() -> int:
             print(f"SECRET_SCAN_NOTE env_var_unset name={name}")
     allowed = {item.strip() for item in args.allow_fixture if item.strip()}
 
-    files, total_bytes, findings = scan(_walk(existing), literals, allowed)
+    files, shape_files, total_bytes, findings = scan(_walk(existing, excludes), literals, allowed)
+    excluded_files = files - shape_files
     for line in findings[:40]:
         print(line)
     if len(findings) > 40:
         print(f"SECRET_FINDINGS_TRUNCATED hidden={len(findings) - 40}")
+    if excluded_files:
+        print(
+            f"SECRET_SCAN_NOTE shape_assignment_skipped_files={excluded_files} "
+            "scope=bundled/minified_artifacts layers_still_scanned=run_credential,jwt,dsn,bcrypt"
+        )
     print(
         "SECRET_SCAN_SUMMARY "
         f"paths={len(existing)} files={files} bytes={total_bytes} "
+        f"shape_scanned_files={shape_files} shape_excluded_files={excluded_files} "
+        f"exclude_rules={len(excludes)} "
         f"credential_env_vars={len(provided)} allowed_fixtures={len(allowed)} "
         f"findings={len(findings)} result={'pass' if not findings else 'fail'}"
     )

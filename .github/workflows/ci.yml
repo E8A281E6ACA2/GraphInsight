@@ -123,6 +123,7 @@ jobs:
             backend/tests/run_perf_probe.py \
             backend/tests/run_perf_soak.py \
             backend/tests/check_artifact_secrets.py \
+            backend/tests/check_artifact_secrets_selftest.py \
             backend/tests/check_rbac_catalog_parity.py \
             backend/tests/check_workflow_contexts.py \
             backend/tests/run_rollback_drill.py \
