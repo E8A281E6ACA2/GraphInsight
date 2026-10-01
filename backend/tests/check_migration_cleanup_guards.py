@@ -508,6 +508,45 @@ def test_kb_scope_strict_mode_has_no_compat_toggle() -> None:
             raise AssertionError(f"{rel_path} must keep local interception when no KB is selected")
 
 
+def test_sqlite_isolated_tests_use_env_file_not_blank_override() -> None:
+    """DB 隔离铁律（任务 #55）：注入 sqlite 测试库的文件禁止把 env 覆盖变量置空。
+
+    `GRAPHINSIGHT_BACKEND_ENV_FILE=""` 是伪隔离：admin/database.py 只在该变量指向
+    存在的文件时才走隔离分支，空串落到 else 分支执行 load_dotenv(find_dotenv(),
+    override=True)，沿子进程脚本 __file__ 命中 backend/.env，用其中的 PostgreSQL
+    地址覆盖注入的 sqlite 地址——迁移测试的 rollback（DROP TABLE/COLUMN）就会打到
+    开发库。唯一合法写法是把该变量指向真实存在的临时 env 文件。
+    """
+    tests_dir = ROOT / "tests"
+    blank_markers = (
+        'GRAPHINSIGHT_BACKEND_ENV_FILE"] = ""',
+        'GRAPHINSIGHT_BACKEND_ENV_FILE", "")',
+        "GRAPHINSIGHT_BACKEND_ENV_FILE'] = ''",
+    )
+    isolation_markers = (
+        'GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(',
+        "GRAPHINSIGHT_BACKEND_ENV_FILE'] = str(",
+        'GRAPHINSIGHT_BACKEND_ENV_FILE"] = f"',
+    )
+    offenders = []
+    self_name = Path(__file__).name
+    for path in sorted(tests_dir.glob("check_*.py")):
+        if path.name == self_name:
+            # 本守卫自身源码里就带着被禁字面量（用于构造匹配规则），不参与扫描
+            continue
+        source = path.read_text(encoding="utf-8")
+        if "sqlite:///" not in source:
+            continue
+        for marker in blank_markers:
+            if marker in source:
+                offenders.append(f"{path.name} 置空 env 覆盖变量（伪隔离）: {marker}")
+        if not any(marker in source for marker in isolation_markers):
+            offenders.append(f"{path.name} 未把 env 覆盖变量指向真实 env 文件")
+    if offenders:
+        raise AssertionError("sqlite-isolated tests must point GRAPHINSIGHT_BACKEND_ENV_FILE at an existing env file: "
+                             + "; ".join(offenders))
+
+
 def main() -> int:
     test_nl2cypher_status_uses_current_config_service()
     test_config_constants_do_not_restore_openai_category()
@@ -525,6 +564,7 @@ def main() -> int:
     test_linux_backend_tooling_uses_dot_venv_only()
     test_unified_dev_defaults_do_not_regress_to_remote_or_python_public()
     test_kb_scope_strict_mode_has_no_compat_toggle()
+    test_sqlite_isolated_tests_use_env_file_not_blank_override()
     print("MIGRATION_CLEANUP_GUARDS_OK")
     return 0
 
