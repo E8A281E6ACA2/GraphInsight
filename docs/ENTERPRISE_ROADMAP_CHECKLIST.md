@@ -146,6 +146,27 @@
   配置真实 embedding/LLM 后按新声明口径复跑 soak 与 4→8→16 capacity 矩阵。
 - [ ] 遗留：并发 4→8→16 的 capacity 递增矩阵，用于定位真实上限（当前只有并发 4 单点）。
 
+## Release Gate R2 跟进（2026-10-01，任务 #31：secret scan 正样本自检与范围排除）
+
+- [x] 开工前先测基线：用 HEAD 规则跑形状矩阵，11 条正样本 6 条 MISS（其中 1 条为探针 bcrypt
+  样本自身长度缺陷），真实规则盲区 5 条——§9.10 记录的 3 条全部实测复现，另确认下划线后缀键
+  （`SECRET_KEY=`）为同类变体、JSON 引号键（`{"password": "..."}`）为评审未记录的新盲区。
+- [x] 规则层修复：键锚点去 `\b` 改"前缀段 + 凭据后缀白名单（`_key/_hash/_token/_value/_secret`）"，
+  键后与值前各允许可选引号；值字符集放回 `;{}`；结构性/调用表达式误报改由值首段字面量表与
+  「点分标识符紧跟左括号」判别承接。pass/fail 判据未变（仍 `findings=0` 放行），未放宽验收阈值。
+- [x] 误报修复从"全局放宽字符集"改为"扫描范围"：新增 `DEFAULT_SHAPE_EXCLUDES`
+  （playwright-report/、test-results/、node_modules/、dist/、build/、`*.min.js`、`*.min.css`、`*.map`），
+  排除只关闭赋值形状一档，字面值与 jwt/dsn/bcrypt 照常扫；`--exclude` / `--no-default-excludes`
+  可控，SUMMARY 增 `shape_scanned_files`/`shape_excluded_files`/`exclude_rules` 并逐次打印排除 NOTE。
+- [x] 正样本自检套件 `backend/tests/check_artifact_secrets_selftest.py`：42 项断言全绿，逐样本单文件
+  单进程；负向对照（把扫描器形状循环去势）→ `assertions=37 failed=14` 变红，sha256 逐字节还原后复绿，
+  证明"门禁永远干净"这种失效无法躲过自检。
+- [x] 接线与取证：`run_unified_boundary_guards.py` 新增 case `secret_scanner_selftest`
+  （本地复跑 `SUMMARY total=16 failed=0`）；`ci.yml` `backend-scripts` py_compile 清单加入该文件；
+  CI 实际扫描范围（playwright-report/test-results/artifacts/logs/dev）新旧均 `findings=0`。
+- [ ] 遗留：本轮未 push（github.com 出口连接超时），CI 实跑证据待下轮有出口时补；已知代价两条
+  （`Pa(ss)word` 形态不报、排除路径不扫赋值形状）详见 `docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md` §9.11。
+
 ## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）
 
 - [x] 后端新增业务面 KB 目录 `GET /api/knowledge-bases`（`knowledge_bases_business.go`）：仅认证 + `AuthorizedKBIDs(subject, "graph:read")` 计算集合，再由 `adminstore.ListAuthorizedKnowledgeBases` 按集合取 active KB 行；无授权→空集合，不放大。

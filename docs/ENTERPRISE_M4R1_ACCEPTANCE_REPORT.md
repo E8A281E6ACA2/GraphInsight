@@ -375,3 +375,75 @@ graph-build 199.2ms。
 
 跟进立项：secret scan 补正样本自检（喂已知凭据断言 `findings>0`、minified 样本断言不命中）
 并评估路径排除改造，见任务清单。
+
+### 9.11 任务 #31 收口：正样本自检 + 误报修复改为扫描范围（2026-10-01）
+
+承接 §9.10 的三项残留风险。本轮不改 pass/fail 判据（仍是 `findings=0` 才放行），
+只把"误报"从全局放宽值字符集改成按扫描范围控制，并补上"门禁确实能抓到东西"的自证。
+
+**开工前基线（先测再改，不凭印象）**：用 HEAD 规则跑形状矩阵，11 条正样本里 6 条 MISS。
+其中 1 条（bcrypt）是探针样本自身缺陷——哈希体只有 50 字符，不满足 `[./A-Za-z0-9]{53}`，
+不是扫描器问题。**真实规则盲区 5 条**：
+
+| # | 样本 | §9.10 是否记录 | 根因 |
+|---|---|---|---|
+| 1 | `password=ab;cdefghij` | 已记录（盲区 1） | 值字符集排除 `;`（上一轮为消 minified 误报所加） |
+| 2 | `password={token:'...'}` | 已记录（盲区 3） | 值字符集排除 `{` |
+| 3 | `ADMIN_PASSWORD=xxx` | 已记录（盲区 2） | `\b` 键锚点在 `_` 处失配（`_` 是词字符） |
+| 4 | `SECRET_KEY=django-insecure-...` | 未记录，盲区 2 同类变体 | `\b` 使键后缀 `_KEY` 失配 |
+| 5 | `{"password": "SuperSecret123"}` | **未记录的新盲区** | 键后紧跟引号，`\s*[:=]` 无法命中 JSON 引号键 |
+
+**规则层**（`backend/tests/check_artifact_secrets.py`）：键锚点由 `\b(kw)\b` 改为
+"允许前缀段 `(?:[A-Za-z0-9]+[_-])*` + 凭据后缀白名单 `_key|_hash|_token|_value|_secret`"，
+并在键后与值前各允许可选引号（使 JSON `"password": "..."` 命中）；值字符集放回 `;{}`，
+即 `[^\s'\",]{6,}`。结构性/代码形态误报改由两条判别承接：值首段为
+`null|undefined|true|false|nan|void|this|self|cls` 视为字面量；值形如
+「点分标识符紧跟左括号」（`self.hash_password(`、`os.getenv(`、`get_password_hash(`）
+视为调用表达式。
+
+**范围层**：`DEFAULT_SHAPE_EXCLUDES` 默认排除
+`playwright-report/`、`test-results/`、`node_modules/`、`dist/`、`build/`、`*.min.js`、
+`*.min.css`、`*.map`。排除**只关闭赋值形状**这一档，`run_credential` 字面值与
+jwt / dsn / bcrypt 三个高置信形状照常扫描，因此打包产物里的真实注入凭据不会因排除而隐身。
+`--exclude` 追加范围、`--no-default-excludes` 恢复全量。SUMMARY 新增
+`shape_scanned_files` / `shape_excluded_files` / `exclude_rules` 三个键，既有键名与语义不变，
+并对每个被排除文件打印 `SECRET_SCAN_NOTE shape_assignment_skipped_files=... layers_still_scanned=...`
+使范围可审计。
+
+**自检层**：新增 `backend/tests/check_artifact_secrets_selftest.py`，42 项断言
+（`grep -c "^  ✓"` = 42，与 `SECRET_SCAN_SELFTEST_SUMMARY assertions=42 failed=0` 同口径）。
+分五组：正样本 11（含 §9.10 三条盲区与本轮 JSON 引号键）、负样本 12（结构性与代码形态）、
+字面值与 fixture 放行 6、排除范围 7、输出与退出码契约 6。每个样本单独落文件单独跑一次 CLI，
+失败可直接指到具体形状，不看总数。
+
+**守卫有效性负向对照**：把 `scan()` 的形状循环改成空迭代（扫描器"永远干净"），
+自检必须变红——实测 `assertions=37 failed=14`（该实验发生在补 5 条代码形态断言之前，
+故当时总数为 37），随后按 sha256 逐字节还原（`664d3484332afba7…` 一致）并复跑 `42/0`。
+
+**自查认账（两条，均在提交前被自己的探针抓到）**：
+1. 第一版正则重写把**值侧**可选前导引号弄丢，导致评审指定的正样本 `password: "SuperSecret123"`
+   从命中回归为漏检；形状矩阵探针立刻报 GAP，已补回并保留该断言。
+2. `--allow-fixture` 那条断言最初用 `ci-internal-token` 作样本，而该值同时位于内置
+   `PLACEHOLDER_VALUES` 表内，"放行"实际由占位表给出、并非 flag 生效，属"因错误原因通过"。
+   改用表外值 `ci-fixture-login-pw`，并补一条"内置占位表单独生效"的断言，两条互证。
+
+**误报量级取证**：CI 实际扫描范围（`frontend/playwright-report`、`frontend/test-results`、
+`artifacts`、`logs/dev`）新旧两版均 `findings=0 result=pass`；对源码树 `backend/admin` 的对照为
+old=10 → new=9（本门禁职责不含源码树，该数值只用于说明字符集放宽没在源码上制造误报增量，
+放宽带来的 24 条源码调用表达式误报已由代码形态判别吸收）。
+
+**已知代价（不粉饰）**：
+1. 值首段是"标识符紧跟左括号"的凭据（如 `password=Pa(ss)word12345`）不报；自检里有一条
+   专门命名为「【已知代价】」的断言钉住它，改动这个取舍必须先动那条断言。
+2. 被排除路径不扫赋值形状。因此 CI 各扫描步骤**必须继续传 `--secret-env-var`**：缺该参数时，
+   打包产物里的 `password=<真凭据>` 会静默放行——这是范围换安静换来的实打实缺口。
+3. 键后缀只放行 `_key/_hash/_token/_value/_secret`：`password_hint=` 有意不报；
+   反向 `password_reset_token=` 会报。
+4. CI 现有 3 个 `--allow-fixture` 值都已在内置占位表内，flag 属冗余（历史遗留，不影响判定）。
+
+**接线**：`run_unified_boundary_guards.py` 新增 case `secret_scanner_selftest`，本地复跑
+`SUMMARY total=16 failed=0`（该 case 3.5s）；`.github/workflows/ci.yml` 的
+`backend-scripts` job py_compile 清单加入自检文件。
+
+**本轮未做**：github.com 出口当时连接超时，未 push、未取 CI 实跑证据；§9.10 的历史表述未改动。
+
