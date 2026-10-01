@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""
+M5-A 迁移/backfill 验收测试（临时 SQLite 隔离 + UTF-8 子进程捕获）
+
+覆盖验收矩阵（设计 §17.3 / 开工令 M5-A-4）：
+1. chunk_revisions 迁移 dry-run/幂等/回滚/再迁移
+2. current 部分唯一索引（同 chunk 双 current 拒绝；superseded 允许）
+3. admin_jobs.targets_hash 迁移幂等/部分唯一（NULL 不参与）/回滚
+4. backfill 新 chunk（revision 1 + 投影状态落库）与幂等重跑
+5. 已有 revision 行不降级（索引侧不被触碰，§17.1）
+6. needs_reindex_targets 前置门（入队 targets_hash、重跑复用、收敛后 CLOSED）
+7. blocked（能力关闭 + pending）阻断；UNRECOVERABLE_MISMATCH 拒绝（exit 2）
+8. DEGRADED_SKIPPED 降级门（CLOSED_DEGRADED，不得宣布完整索引验收通过）
+9. 双 KB 隔离（同 chunk_id 跨 KB 不串写）
+10. §8.5 MILVUS_REVISION_FIELD_ABSENT → vector 保持 pending 并转 needs_reindex
+11. 表缺失/非法 kb_id 拒绝执行；全流程 Windows/Linux UTF-8 子进程运行
+
+隔离铁律（本次实测根因）：脚本带 backend/ 下 __file__ 时 dotenv find_dotenv 会
+向上找到 backend/.env 并以 override=True 覆盖注入的 ADMIN_DATABASE_URL，
+cwd/置空 GRAPHINSIGHT_BACKEND_ENV_FILE 均无效。唯一可靠做法：
+GRAPHINSIGHT_BACKEND_ENV_FILE 指向"含 ADMIN_DATABASE_URL=sqlite 的临时 env 文件"，
+admin/database.py 会优先加载该文件且不再回退 find_dotenv。
+每个子进程还打印引擎方言，非 sqlite 立即失败（防误连开发库）。
+
+运行：python backend/tests/check_m5a_revision_backfill.py
+（依赖 sqlalchemy/dotenv；无需 Neo4j/Milvus/PG）
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+backend_dir = Path(__file__).parent.parent
+FAILURES: list = []
+
+# Windows 控制台默认 cp936，本套件打印中文断言名与子进程中文输出，必须自锁 UTF-8
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _utf8_env(base: dict) -> dict:
+    env = base.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+class Harness:
+    def __init__(self, tmp: Path):
+        self.tmp = tmp
+        self.env_file = tmp / "m5a_test.env"
+        self.current_db = ""
+
+    def use_db(self, name: str) -> str:
+        db_path = (self.tmp / name).as_posix()
+        url = f"sqlite:///{db_path}"
+        self.env_file.write_text(f"ADMIN_DATABASE_URL={url}\n", encoding="utf-8")
+        self.current_db = url
+        return url
+
+    def run(self, script: str, args: list = None, extra_env: dict = None) -> tuple:
+        env = self._base_env(extra_env)
+        cmd = [sys.executable, str(backend_dir / script)] + (args or [])
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(self.tmp),
+            env=env,
+            timeout=180,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def _base_env(self, extra_env: dict = None) -> dict:
+        env = _utf8_env(os.environ)
+        env["GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(self.env_file)
+        env["PYTHONPATH"] = str(backend_dir)
+        if extra_env:
+            env.update(extra_env)
+        return env
+
+    def guard_sqlite(self) -> None:
+        code, out = self.run_python_code(
+            "from admin.database import engine; print('DIALECT', engine.dialect.name)"
+        )
+        step("引擎隔离守卫（必须 sqlite）", code == 0 and "DIALECT sqlite" in out, out[-300:])
+
+    def run_python_code(self, code: str) -> tuple:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(self.tmp),
+            env=self._base_env(),
+            timeout=180,
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+
+def step(name: str, ok: bool, detail: str = "") -> None:
+    mark = "✓" if ok else "✗"
+    print(f"  {mark} {name}" + (f" ({detail})" if detail and not ok else ""))
+    if not ok:
+        FAILURES.append(name)
+
+
+def parse_marker(out: str, marker: str) -> list:
+    for line in out.splitlines():
+        if line.startswith(marker):
+            return json.loads(line[len(marker):])
+    return []
+
+
+def row_of(rows: list, kb: str, chunk: str) -> dict:
+    cols = ["kb_id", "chunk_id", "doc_id", "content_revision", "revision_status",
+            "graph_status", "graph_content_revision", "vector_status",
+            "vector_content_revision", "content", "revision_source", "reason"]
+    for row in rows:
+        if row[0] == kb and row[1] == chunk:
+            return dict(zip(cols, row))
+    return {}
+
+
+def bootstrap_admin_jobs(h: Harness) -> tuple:
+    return h.run_python_code(
+        "from admin.database import Base, engine;"
+        "from admin.models import AdminJob;"
+        "Base.metadata.create_all(bind=engine, tables=[AdminJob.__table__]);"
+        "engine.dispose(); print('bootstrap ok')"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A. chunk_revisions 迁移
+# ---------------------------------------------------------------------------
+
+
+def section_a(h: Harness) -> None:
+    print("[A] migrate_chunk_revisions（幂等/回滚/部分唯一索引）")
+    h.use_db("mig_a.db")
+    script = str(Path("admin") / "migrate_chunk_revisions.py")
+
+    code, out = h.run(script, ["--dry-run"])
+    step("dry-run 退出 0 且写计划", code == 0 and "dry-run completed" in out and "计划动作: migrate" in out, out[-300:])
+    code, out = h.run_python_code(
+        "from admin.database import engine;"
+        "from sqlalchemy import text;"
+        "c = engine.connect();"
+        "print('TABLES', [r[0] for r in c.execute(text(\"SELECT name FROM sqlite_master WHERE type='table'\"))])"
+    )
+    step("dry-run 未建表", code == 0 and "chunk_revisions" not in out, out[-300:])
+
+    code, out = h.run(script, ["--action", "migrate"])
+    step("首次 migrate", code == 0 and "table is ready" in out, out[-300:])
+    code, out = h.run(script, ["--action", "migrate"])
+    step("重复 migrate 幂等", code == 0 and "already exists" in out and "indexes ensured" in out, out[-300:])
+
+    code, out = h.run(str(Path("tests") / "m5a_backfill_driver.py"), ["--scenario", "current_unique"])
+    rows = parse_marker(out, "__ROWS__")
+    step("current 部分唯一索引：双 current 拒绝", code == 0 and "__DUP_CURRENT_REJECTED__True" in out, out[-400:])
+    step("superseded 历史行允许", "__SUPERSEDED_ALLOWED__True" in out and len(rows) == 2, out[-400:])
+
+    code, out = h.run(script, ["--action", "rollback"])
+    step("rollback 整表删除", code == 0 and "rollback completed" in out, out[-300:])
+    code, out = h.run_python_code(
+        "from admin.database import engine;"
+        "from sqlalchemy import text;"
+        "c = engine.connect();"
+        "print('STILL', c.execute(text(\"SELECT name FROM sqlite_master WHERE name='chunk_revisions'\")).fetchall())"
+    )
+    step("rollback 后表不存在", code == 0 and "STILL []" in out, out[-300:])
+    code, out = h.run(script, ["--action", "migrate"])
+    step("rollback 后再 migrate", code == 0 and "table is ready" in out, out[-300:])
+
+
+# ---------------------------------------------------------------------------
+# B. admin_jobs.targets_hash 迁移
+# ---------------------------------------------------------------------------
+
+
+def section_b(h: Harness) -> None:
+    print("[B] migrate_jobs_targets_hash（幂等/部分唯一/回滚）")
+    h.use_db("mig_b.db")
+    code, out = bootstrap_admin_jobs(h)
+    step("admin_jobs 引导", code == 0 and "bootstrap ok" in out, out[-300:])
+    script = str(Path("admin") / "migrate_jobs_targets_hash.py")
+
+    code, out = h.run(script, ["--dry-run"])
+    step("dry-run", code == 0 and "dry-run completed" in out, out[-300:])
+    code, out = h.run(script, ["--action", "migrate"])
+    step("首次 migrate 加列+索引", code == 0 and "added column" in out and "ensured index" in out, out[-300:])
+    code, out = h.run(script, ["--action", "migrate"])
+    step("重复 migrate 幂等", code == 0 and "targets_hash already exists" in out and "index uq_admin_jobs_targets_hash already exists" in out, out[-300:])
+
+    dup_code = (
+        "from admin.database import engine\n"
+        "from sqlalchemy import text\n"
+        "ins = 'INSERT INTO admin_jobs (job_type, status, kb_id, targets_hash, retry_count, max_retries) "
+        "VALUES (:a, :b, :c, :d, 0, 3)'\n"
+        "dup = 0\n"
+        "with engine.begin() as conn:\n"
+        "    conn.execute(text(ins), {'a': 'reindex_chunks', 'b': 'pending', 'c': 'kb1', 'd': 'h' * 64})\n"
+        "with engine.begin() as conn:\n"
+        "    try:\n"
+        "        conn.execute(text(ins), {'a': 'reindex_chunks', 'b': 'failed', 'c': 'kb1', 'd': 'h' * 64})\n"
+        "    except Exception:\n"
+        "        dup = 1\n"
+        "with engine.begin() as conn:\n"
+        "    conn.execute(text(ins), {'a': 'reindex_chunks', 'b': 'pending', 'c': 'kb1', 'd': None})\n"
+        "    conn.execute(text(ins), {'a': 'build_graph', 'b': 'pending', 'c': 'kb1', 'd': None})\n"
+        "    print('NULL_ROWS', len(conn.execute(text('SELECT id FROM admin_jobs WHERE targets_hash IS NULL')).fetchall()))\n"
+        "print('DUP_REJECTED', dup)\n"
+    )
+    code, out = h.run_python_code(dup_code)
+    step("targets_hash 部分唯一：同 hash 拒绝（含 failed 状态）", code == 0 and "DUP_REJECTED 1" in out, out[-300:])
+    step("历史 NULL 行不参与唯一性", "NULL_ROWS 2" in out, out[-300:])
+
+    code, out = h.run(script, ["--action", "rollback"])
+    step("rollback 先删索引再删列", code == 0 and "dropped index" in out and "dropped column" in out, out[-300:])
+    code, out = h.run(script, ["--action", "migrate"])
+    step("rollback 后再 migrate", code == 0 and "added column" in out, out[-300:])
+
+
+# ---------------------------------------------------------------------------
+# C. backfill 场景
+# ---------------------------------------------------------------------------
+
+
+def section_c(h: Harness) -> None:
+    print("[C] backfill_chunk_revisions 场景矩阵")
+    h.use_db("backfill.db")
+    code, out = h.run(str(Path("admin") / "migrate_chunk_revisions.py"), ["--action", "migrate"])
+    step("backfill 库迁移 chunk_revisions", code == 0, out[-300:])
+    code, out = bootstrap_admin_jobs(h)
+    step("backfill 库引导 admin_jobs", code == 0 and "bootstrap ok" in out, out[-300:])
+    code, out = h.run(str(Path("admin") / "migrate_jobs_targets_hash.py"), ["--action", "migrate"])
+    step("backfill 库迁移 targets_hash", code == 0, out[-300:])
+
+    driver = str(Path("tests") / "m5a_backfill_driver.py")
+
+    code, out = h.run(driver, ["--scenario", "new_and_degraded"])
+    rows = parse_marker(out, "__ROWS__")
+    r = row_of(rows, "kb-a", "c1")
+    step("新 chunk：revision 1 current 落库", code == 0 and r.get("content_revision") == 1 and r.get("revision_status") == "current", f"exit={code} row={r}")
+    step("新 chunk：graph indexed/1，vector skipped/NULL", r.get("graph_status") == "indexed" and r.get("graph_content_revision") == 1 and r.get("vector_status") == "skipped" and r.get("vector_content_revision") is None, str(r))
+    step("新 chunk：system_initial + backfill_m5a + 中文内容 UTF-8", r.get("revision_source") == "system_initial" and r.get("reason") == "backfill_m5a" and r.get("content") == "内容一", str(r))
+    step("降级门：DEGRADED_SKIPPED + CLOSED_DEGRADED + 不得宣布完整验收", "DEGRADED_SKIPPED" in out and "CLOSED_DEGRADED" in out and "不得宣布完整索引验收通过" in out, out[-400:])
+
+    code, out = h.run(driver, ["--scenario", "new_and_degraded_rerun"])
+    step("幂等重跑：rows_new=0 且门状态不变", code == 0 and "rows_new=0" in out and "CLOSED_DEGRADED" in out, f"exit={code} " + out[-300:])
+
+    code, out = h.run(driver, ["--scenario", "no_downgrade"])
+    rows = parse_marker(out, "__ROWS__")
+    calls = parse_marker(out, "__CALLS__")
+    e1 = row_of(rows, "kb-a", "e1")
+    n1 = row_of(rows, "kb-a", "n1")
+    step("已有 revision 不降级：索引侧仅触碰新 chunk", code == 0 and calls == ["n1"], f"exit={code} calls={calls}")
+    step("已有行原样保留（indexed/1、内容不变）", e1.get("graph_status") == "indexed" and e1.get("graph_content_revision") == 1 and e1.get("vector_content_revision") == 1 and e1.get("content") == "E-keep" and e1.get("doc_id") == "d9", str(e1))
+    step("新行 n1 正常落库", n1.get("content") == "N-new" and n1.get("graph_status") == "indexed", str(n1))
+
+    code, out = h.run(driver, ["--scenario", "nr_setup"])
+    step("needs_reindex 场景播种", code == 0, out[-300:])
+    code, out = h.run(driver, ["--scenario", "nr_dry_preview"])
+    jobs = parse_marker(out, "__JOBS__")
+    step("dry-run：targets 预览输出且不写库（exit 0、jobs=0）", code == 0 and "dry-run preview" in out and "chunk_id=x1" in out and jobs == [], f"exit={code} jobs={len(jobs)}")
+    code, out = h.run(driver, ["--scenario", "nr_run"])
+    jobs = parse_marker(out, "__JOBS__")
+    step("needs_reindex 前置门 OPEN（exit 3）", code == 3 and "[gate] OPEN" in out, f"exit={code}")
+    step("reindex job 入队（targets_hash 64 位、payload 含 current targets）", len(jobs) == 1 and jobs[0][3] and len(str(jobs[0][3])) == 64 and '"chunk_id": "x1"' in str(jobs[0][4]) and '"target_revision": 1' in str(jobs[0][4]), str(jobs))
+    code, out = h.run(driver, ["--scenario", "nr_run_again"])
+    jobs = parse_marker(out, "__JOBS__")
+    step("重跑 targets_hash 复用不新建", code == 3 and "jobs_reused=1" in out and len(jobs) == 1, f"exit={code} jobs={len(jobs)}")
+    code, _ = h.run(driver, ["--scenario", "nr_finish"])
+    step("模拟 reindex 完成", code == 0, f"exit={code}")
+    code, out = h.run(driver, ["--scenario", "nr_converged"])
+    step("收敛后前置门 CLOSED（exit 0）", code == 0 and "gate] CLOSED" in out, f"exit={code}")
+
+    code, out = h.run(driver, ["--scenario", "blocked_gate"])
+    step("blocked：能力关闭+pending 阻断（exit 3，blocked=1）", code == 3 and "blocked=1" in out and "needs_reindex=0" in out, f"exit={code} " + out[-300:])
+
+    code, out = h.run(driver, ["--scenario", "unrecoverable_dry"])
+    step("UNRECOVERABLE_MISMATCH：dry-run 拒绝（exit 2）", code == 2 and "UNRECOVERABLE_MISMATCH" in out, f"exit={code} " + out[-300:])
+
+    code, out = h.run(driver, ["--scenario", "dual_kb"])
+    rows = parse_marker(out, "__ROWS__")
+    b = row_of(rows, "kb-b", "z9")
+    a = row_of(rows, "kb-a", "z9")
+    step("双 KB 隔离：kb-a 新行落库", code == 0 and a.get("content") == "A-new", str(a))
+    step("双 KB 隔离：同 chunk_id 的 kb-b 行不被改写", b.get("content") == "B-keep" and b.get("graph_status") == "indexed" and b.get("doc_id") == "db1", str(b))
+    jobs = parse_marker(out, "__JOBS__")
+    step("双 KB 隔离：无 kb-b 任务写入", all(str(j[1]) == "kb-a" for j in jobs), str(jobs))
+
+    code, out = h.run(driver, ["--scenario", "rfa_run"])
+    rows = parse_marker(out, "__ROWS__")
+    rfa = row_of(rows, "kb-a", "f1")
+    step("§8.5 REVISION_FIELD_ABSENT：vector 保持 pending 不伪标", "MILVUS_REVISION_FIELD_ABSENT" in out and rfa.get("vector_status") == "pending" and rfa.get("vector_content_revision") is None, f"exit={code} {rfa}")
+    step("§8.5 pending 转 needs_reindex 阻断门（exit 3）", code == 3 and "needs_reindex=1" in out, f"exit={code}")
+
+
+# ---------------------------------------------------------------------------
+# D. CLI 拒绝路径（真实入口 argparse/main）
+# ---------------------------------------------------------------------------
+
+
+def section_d(h: Harness) -> None:
+    print("[D] backfill CLI 拒绝路径")
+    script = str(Path("admin") / "backfill_chunk_revisions.py")
+
+    h.use_db("cli_missing.db")
+    code, out = h.run(script, ["--kb", "kb-a", "--dry-run"])
+    step("表缺失拒绝执行（exit 2）", code == 2 and "chunk_revisions 表不存在" in out, f"exit={code} " + out[-300:])
+
+    h.use_db("mig_a.db")  # 已有 chunk_revisions 表（引擎隔离已在 guard 验证）
+    code, out = h.run(script, ["--kb", "BAD KB!!"])
+    step("非法 kb_id 拒绝（exit 2，SCOPE_INVALID）", code == 2 and "kb_id 非法" in out, f"exit={code} " + out[-300:])
+    code, out = h.run(script, ["--dry-run"])
+    step("--kb 必填（argparse 拒绝）", code != 0 and "required" in out.lower(), f"exit={code} " + out[-200:])
+
+
+def main() -> int:
+    print("=" * 60)
+    print("GraphInsight M5-A migration/backfill acceptance tests (sqlite)")
+    print("=" * 60)
+    with tempfile.TemporaryDirectory() as tmp:
+        h = Harness(Path(tmp))
+        h.use_db("guard.db")
+        h.guard_sqlite()
+        section_a(h)
+        section_b(h)
+        section_c(h)
+        section_d(h)
+    print("-" * 60)
+    if FAILURES:
+        for item in FAILURES:
+            print(f"  FAILED: {item}")
+        print(f"✗ {len(FAILURES)} checks failed")
+        return 1
+    print("✓ all M5-A acceptance checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
