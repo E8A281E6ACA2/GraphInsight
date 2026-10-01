@@ -76,11 +76,13 @@ def run_cli(paths: list[Path], extra_args: list[str] | None = None, with_literal
 
 
 RUN_COUNT = 0
+LABELS: list[str] = []
 
 
 def step(name: str, ok: bool, detail: str = "") -> None:
     global RUN_COUNT
     RUN_COUNT += 1
+    LABELS.append(name)
     mark = "✓" if ok else "✗"
     print(f"  {mark} {name}" + (f" ({detail})" if detail and not ok else ""))
     if not ok:
@@ -119,36 +121,38 @@ def expect_clean(name: str, rel_path: str, sample: str) -> None:
 # A. 正样本：赋值形状必须命中（逐条，含 R2 记录的三处盲区与本轮新发现的 JSON 引号键）
 # ---------------------------------------------------------------------------
 def positive_assignment_shapes() -> None:
-    expect_hit("password: \"SuperSecret123\"（引号值，评审指定正样本）", "quoted.log",
+    # 步骤名一律用文字描述形态，不写凭据字面量：这份 stdout 会被 CI 落进
+    # artifacts/release-acceptance/acceptance-summary.log 并纳入扫描范围（见 label_echo_guard）。
+    expect_hit("引号值正样本（键名冒号加双引号包值，评审指定）", "quoted.log",
                'password: "SuperSecret123"', "credential_assignment")
-    expect_hit("api_key=abcdef123456（裸值）", "bare.log", "api_key=abcdef123456", "credential_assignment")
-    expect_hit("{\"password\": \"...\"}（JSON 引号键，本轮新发现的第 4 处盲区）", "json.log",
+    expect_hit("裸值正样本（api_key 形态、无引号）", "bare.log", "api_key=abcdef123456", "credential_assignment")
+    expect_hit("JSON 引号键正样本（键本身带双引号，本轮新发现的第 4 处盲区）", "json.log",
                '{"password": "SuperSecret123"}', "credential_assignment")
-    expect_hit("ADMIN_PASSWORD=...（下划线前缀键，盲区 2）", "env.log",
+    expect_hit("下划线前缀键正样本（环境变量式大写键，盲区 2）", "env.log",
                "ADMIN_PASSWORD=RealSecret99", "credential_assignment")
-    expect_hit("SECRET_KEY=...（下划线后缀键，盲区 2 变体）", "env2.log",
+    expect_hit("下划线后缀键正样本（大写 SECRET 键，盲区 2 变体）", "env2.log",
                "SECRET_KEY=django-insecure-abc123456789", "credential_assignment")
-    expect_hit("password=ab;cdefghij（值含分号，盲区 1）", "semi.log",
+    expect_hit("值含分号正样本（盲区 1）", "semi.log",
                "password=ab;cdefghij", "credential_assignment")
-    expect_hit("password={token:'...'}（值为对象字面量，盲区 3）", "obj.log",
+    expect_hit("值为对象字面量正样本（盲区 3）", "obj.log",
                "password={token:'Realsecretvalue'}", "credential_assignment")
-    expect_hit("括号不在调用位（ab;cd(efghij）仍然命中", "paren.log",
+    expect_hit("值含分号与括号但括号不在调用位仍然命中", "paren.log",
                "password=ab;cd(efghij", "credential_assignment")
-    expect_hit("password_hash=<bcrypt>（bcrypt 形状）", "bcrypt.log",
+    expect_hit("bcrypt 形状正样本（hash 后缀键）", "bcrypt.log",
                f"password_hash={BCRYPT_SAMPLE}", "bcrypt_hash")
-    expect_hit("带口令 DSN", "dsn.log",
+    expect_hit("带口令 DSN 正样本", "dsn.log",
                "connect postgresql://appuser:s3cr3tpass@10.0.0.5:5432/graphinsight", "dsn_with_credentials")
-    expect_hit("JWT", "jwt.log", f"authorization payload {JWT_SAMPLE}", "jwt")
+    expect_hit("JWT 正样本", "jwt.log", f"authorization payload {JWT_SAMPLE}", "jwt")
 
 
 # ---------------------------------------------------------------------------
 # B. 负样本：结构性/占位值不得命中（放宽字符集后仍然安静）
 # ---------------------------------------------------------------------------
 def negative_structural() -> None:
-    expect_clean("minified 结构赋值 o.password=null;const 不命中", "struct1.log",
+    expect_clean("minified 结构赋值不命中（null 值后紧跟语句）", "struct1.log",
                  "o.password=null;const t=1;")
-    expect_clean("松散日志 password = null; 不命中", "struct2.log", "password = null;")
-    expect_clean("this.password=null 不命中", "struct3.log", "this.password=null,")
+    expect_clean("松散日志不命中（键名两侧空格加 null 值）", "struct2.log", "password = null;")
+    expect_clean("this 前缀赋值不命中（右值为 null）", "struct3.log", "this.password=null,")
     expect_clean("占位值 changeme 不命中", "ph1.log", "password=changeme")
     expect_clean("已声明 fixture 默认在占位表内不命中", "ph2.log", 'password: "graphinsight-dev-password"')
     expect_clean("非凭据键名 password_hint 不命中", "hint.log",
@@ -156,10 +160,10 @@ def negative_structural() -> None:
     expect_clean("驼峰标识符 passwordValidator 不命中", "camel.log",
                  "const passwordValidator = createValidator({})")
     expect_clean("非凭据后缀 password_reset 不命中", "reset.log", "password_reset=not-a-token-form")
-    expect_clean("方法接收者 password=self.password 不命中", "py1.log", "password=self.password")
-    expect_clean("调用表达式 password=os.getenv(\"ADMIN_PASSWORD\") 不命中", "py2.log",
+    expect_clean("方法接收者右值不命中（self 前缀）", "py1.log", "password=self.password")
+    expect_clean("调用表达式右值不命中（环境变量读取形态）", "py2.log",
                  'password=os.getenv("ADMIN_PASSWORD")')
-    expect_clean("哈希函数 password=get_password_hash(raw) 不命中", "py3.log",
+    expect_clean("哈希函数右值不命中（调用表达式形态）", "py3.log",
                  "password=get_password_hash(raw)")
 
     # 已知代价（不是遗漏）：值以"标识符紧跟左括号"开头时按调用表达式放过，
@@ -281,6 +285,19 @@ def output_contract() -> None:
     step("扫描器源文件可编译", _compiles(), "")
 
 
+def label_echo_guard() -> None:
+    """把全部步骤名回写成一份日志再交给扫描器：门禁必须对自己的测试输出保持安静。
+
+    CI 的 release-acceptance 会把统一守卫 stdout 落进
+    `artifacts/release-acceptance/acceptance-summary.log` 并纳入敏感信息扫描范围，
+    所以"把样本凭据写进步骤名"的写法会让门禁判红自己的夹具（2026-10-02 实测回归）。
+    """
+    echo = write("cases/label_echo.log", "\n".join(LABELS) + "\n")
+    code, out = run_cli([echo])
+    step("全部步骤名回显经扫描器 findings=0（夹具文本不得触发门禁）",
+         code == 0 and "findings=0" in out, f"exit={code} {summary_of(out)}")
+
+
 def _compiles() -> bool:
     proc = subprocess.run(
         [sys.executable, "-m", "py_compile", str(SCANNER)],
@@ -306,6 +323,7 @@ def main() -> int:
         literal_layer()
         exclusion_scope()
         output_contract()
+        label_echo_guard()
 
         print("-" * 60)
         for item in FAILURES:
