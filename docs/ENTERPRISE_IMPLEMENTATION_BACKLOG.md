@@ -253,6 +253,8 @@
 2. SQLite 隔离验收与唯一临时 v3 collection 真实读回均通过；临时 PG/Neo4j/Milvus 清理后无残留。
 3. 文档聚合异常已改为 fail-closed：仅“表尚未迁移”兼容，其它数据库异常向上抛出；worker/backfill 不得伪报成功或 `CLOSED`。
 4. 共享生产 v3 迁移、逐 KB C3 数据治理和共享生产 `CLOSED` 尚未完成。
+5. M5-A/B0 dry-run contract v1 已统一三个入口：固定 `DRY_RUN_RESULT` JSON 标记、`writes=0` 和退出码语义；仅为隔离验收契约，不代表共享生产迁移完成。
+6. 2026-10-03 共享只读 C3 inventory 已运行：1 个 KB，`blocked/orphan/unrecoverable/scope_unresolved/scope_mismatches` 全为 0；当前读取到 `graphinsight_chunks_v2` 且无显式 `content_revision`，所以共享生产 gate 仍为 OPEN。
 
 2. `M5-B0-C3` 共享 KB 不可自动收敛清单
 状态：`todo`
