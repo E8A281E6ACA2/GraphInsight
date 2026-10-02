@@ -4,17 +4,18 @@ Date: 2026-10-02
 
 ## Status
 
-`in_progress`, not `CLOSED`.
+`CLOSED` for the disposable evidence namespace; shared development remains untouched.
 
-The isolated SQLite worker contract remains green. This audit fix adds structured failure diagnostics to the admin job result/log path and makes Milvus existing-field read failures fail closed before a full-row upsert. Shared development services were not modified.
+The isolated SQLite worker contract remains green. This audit fix adds structured failure diagnostics to the admin job result/log path, makes Milvus existing-field read failures fail closed before a full-row upsert, and loads a newly indexed collection before readback. Shared development services were not modified.
 
 ## Evidence
 
 - `python backend/tests/check_b0_reindex_chunks.py`: 152 checks, exit 0.
 - `python -m py_compile backend/services/chunk_projection_reindex.py backend/services/job_runtime.py backend/services/vector_store.py backend/admin/backfill_chunk_revisions.py`: exit 0.
-- No real Neo4j/Milvus write evidence was collected in this change.
-- No temporary `graphinsight_chunks_v3` collection was created.
+- `PYTHONPATH=backend python backend/tests/check_b0_reindex_chunks_live.py --confirm`: exit 0, real PostgreSQL state plus real Neo4j and Milvus v3 projection converged to `indexed/1`.
+- The live harness used one unique KB and one disposable `graphinsight_chunks_v3_*` collection, deterministic local test vectors, and removed all synthetic rows, nodes, files, and the collection in `finally`.
+- No shared-dev KB, v2 collection, or production embedding request was touched.
 
 ## Audit wording
 
-The implementation and isolated contract evidence are ready for review. Production closure is pending a disposable Milvus v3 collection and real Neo4j/Milvus execution evidence. Until then, report the state as `CLOSED_DEGRADED` or pending evidence, and do not call it a complete CLOSED loop.
+The implementation, isolated contract evidence, and disposable real projection evidence are ready for review. This proves the worker/storage path in the controlled namespace; it does not authorize writing the shared v2 collection or claim broad production migration completion.
