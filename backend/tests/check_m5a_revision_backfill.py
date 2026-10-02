@@ -120,6 +120,11 @@ def parse_marker(out: str, marker: str) -> list:
     return []
 
 
+def parse_dry_run_result(out: str) -> dict:
+    value = parse_marker(out, "DRY_RUN_RESULT ")
+    return value if isinstance(value, dict) else {}
+
+
 def row_of(rows: list, kb: str, chunk: str) -> dict:
     cols = ["kb_id", "chunk_id", "doc_id", "content_revision", "revision_status",
             "graph_status", "graph_content_revision", "vector_status",
@@ -165,7 +170,18 @@ def section_a(h: Harness) -> None:
     script = str(Path("admin") / "migrate_chunk_revisions.py")
 
     code, out = h.run(script, ["--dry-run"])
-    step("dry-run 退出 0 且写计划", code == 0 and "dry-run completed" in out and "计划动作: migrate" in out, out[-300:])
+    dry = parse_dry_run_result(out)
+    step(
+        "dry-run 退出 0 且写计划",
+        code == 0
+        and "dry-run completed" in out
+        and "计划动作: migrate" in out
+        and dry.get("contract_version") == 1
+        and dry.get("operation") == "migrate_chunk_revisions"
+        and dry.get("writes") == 0
+        and dry.get("exit_code") == 0,
+        out[-500:],
+    )
     code, out = h.run_python_code(
         "from admin.database import engine;"
         "from sqlalchemy import text;"
@@ -235,7 +251,16 @@ def section_b(h: Harness) -> None:
     script = str(Path("admin") / "migrate_jobs_targets_hash.py")
 
     code, out = h.run(script, ["--dry-run"])
-    step("dry-run", code == 0 and "dry-run completed" in out, out[-300:])
+    dry = parse_dry_run_result(out)
+    step(
+        "dry-run",
+        code == 0
+        and "dry-run completed" in out
+        and dry.get("contract_version") == 1
+        and dry.get("operation") == "migrate_jobs_targets_hash"
+        and dry.get("writes") == 0,
+        out[-500:],
+    )
     code, out = h.run(script, ["--action", "migrate"])
     step("首次 migrate 加列+索引", code == 0 and "added column" in out and "ensured index" in out, out[-300:])
     step(
@@ -321,7 +346,19 @@ def section_c(h: Harness) -> None:
     step("needs_reindex 场景播种", code == 0, out[-300:])
     code, out = h.run(driver, ["--scenario", "nr_dry_preview"])
     jobs = parse_marker(out, "__JOBS__")
-    step("dry-run：targets 预览输出且不写库（exit 0、jobs=0）", code == 0 and "dry-run preview" in out and "chunk_id=x1" in out and jobs == [], f"exit={code} jobs={len(jobs)}")
+    dry = parse_dry_run_result(out)
+    step(
+        "dry-run：targets 预览输出且不写库（exit 0、jobs=0）",
+        code == 0
+        and "dry-run preview" in out
+        and "chunk_id=x1" in out
+        and jobs == []
+        and dry.get("contract_version") == 1
+        and dry.get("operation") == "backfill_chunk_revisions"
+        and dry.get("writes") == 0
+        and dry.get("status") == "OPEN",
+        f"exit={code} jobs={len(jobs)} dry={dry}",
+    )
     code, out = h.run(driver, ["--scenario", "nr_run"])
     jobs = parse_marker(out, "__JOBS__")
     step("needs_reindex 前置门 OPEN（exit 3）", code == 3 and "[gate] OPEN" in out, f"exit={code}")
@@ -340,7 +377,16 @@ def section_c(h: Harness) -> None:
 
     prep_db(h, "bf_unrec.db")
     code, out = h.run(driver, ["--scenario", "unrecoverable_dry"])
-    step("UNRECOVERABLE_MISMATCH：dry-run 拒绝（exit 2）", code == 2 and "UNRECOVERABLE_MISMATCH" in out, f"exit={code} " + out[-300:])
+    dry = parse_dry_run_result(out)
+    step(
+        "UNRECOVERABLE_MISMATCH：dry-run 拒绝（exit 2）",
+        code == 2
+        and "UNRECOVERABLE_MISMATCH" in out
+        and dry.get("status") == "rejected"
+        and dry.get("exit_code") == 2
+        and dry.get("writes") == 0,
+        f"exit={code} dry={dry} " + out[-300:],
+    )
 
     prep_db(h, "bf_dual.db")
     code, out = h.run(driver, ["--scenario", "dual_kb"])
@@ -467,7 +513,16 @@ def section_d(h: Harness) -> None:
 
     h.use_db("cli_missing.db")
     code, out = h.run(script, ["--kb", "kb-a", "--dry-run"])
-    step("表缺失拒绝执行（exit 2）", code == 2 and "chunk_revisions 表不存在" in out, f"exit={code} " + out[-300:])
+    dry = parse_dry_run_result(out)
+    step(
+        "表缺失拒绝执行（exit 2）",
+        code == 2
+        and "chunk_revisions 表不存在" in out
+        and dry.get("status") == "rejected"
+        and dry.get("details", {}).get("reason") == "MIGRATION_REQUIRED"
+        and dry.get("writes") == 0,
+        f"exit={code} dry={dry} " + out[-300:],
+    )
 
     h.use_db("mig_a.db")  # 已有 chunk_revisions 表（引擎隔离已在 guard 验证）
     code, out = h.run(script, ["--kb", "BAD KB!!"])
