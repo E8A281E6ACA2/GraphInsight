@@ -305,17 +305,9 @@ def _milvus_client():
 
 
 def _milvus_has_revision_field(client, collection: str) -> bool:
-    if not client.has_collection(collection):
-        return False
-    try:
-        description = client.describe_collection(collection)
-    except Exception:
-        return False
-    fields = description.get("fields") if isinstance(description, dict) else None
-    if not isinstance(fields, list):
-        return False
-    names = {f.get("name") for f in fields if isinstance(f, dict)}
-    return "content_revision" in names
+    from services.vector_store import content_revision_field_is_int64
+
+    return content_revision_field_is_int64(client, collection)
 
 
 MILVUS_BASE_OUTPUT_FIELDS = ["chunk_id", "doc_id", "text", "tenant_id", "project_id", "parser_version"]
@@ -427,7 +419,9 @@ def _backfill_milvus(kb_id: str, plans: List[ChunkPlan]) -> Dict[str, str]:
             for item, vector in zip(chunk, vectors)
         ]
         try:
-            client.upsert(collection_name=collection, data=rows)
+            from services.vector_store import require_upsert_count
+
+            require_upsert_count(client.upsert(collection_name=collection, data=rows), len(rows))
         except Exception:  # noqa: BLE001 - upsert 失败逐 chunk 记 failed
             for item in chunk:
                 outcome[item.chunk_id] = "failed"
@@ -778,13 +772,13 @@ def _update_projection_state(
     graph_content_revision: Optional[int] = None,
     vector_status: Optional[str] = None,
     vector_content_revision: Optional[int] = None,
-) -> None:
+) -> int:
     """落投影状态。backfill 只处理本轮新建的 revision 1 行，故 CAS 固定在 revision 1；
     与 reindex worker 共用 services.chunk_projection_state 的同一份回写实现。
     """
     from services.chunk_projection_state import update_projection_state
 
-    update_projection_state(
+    return update_projection_state(
         kb_id,
         chunk_id,
         expected_revision=1,
@@ -993,7 +987,9 @@ def run(kb_id: str, dry_run: bool) -> int:
         "milvus_failed": 0,
         "milvus_skipped": 0,
         "revision_field_absent": 0,
+        "state_write_failed": 0,
     }
+    state_write_failed: List[str] = []
     for plan in fresh_plans:
         if not inventory.graph_enabled:
             graph_status, graph_rev = "skipped", None
@@ -1019,7 +1015,21 @@ def run(kb_id: str, dry_run: bool) -> int:
         else:
             vector_status, vector_rev = "failed", None
             counts["milvus_failed"] += 1
-        _update_projection_state(kb_id, plan.chunk_id, graph_status, graph_rev, vector_status, vector_rev)
+        rowcount = _update_projection_state(kb_id, plan.chunk_id, graph_status, graph_rev, vector_status, vector_rev)
+        if rowcount != 1:
+            state_write_failed.append(plan.chunk_id)
+            counts["state_write_failed"] += 1
+
+    from services.chunk_projection_state import aggregate_document_states
+
+    document_states = aggregate_document_states(
+        kb_id,
+        sorted({plan.doc_id for plan in fresh_plans if plan.doc_id}),
+    )
+    if document_states:
+        print(f"  document_states={json.dumps(document_states, ensure_ascii=False, sort_keys=True)}")
+    if state_write_failed:
+        print("  state_write_failed=" + ",".join(sorted(state_write_failed)))
 
     print(
         f"  rows_new={counts['rows_new']} insert_conflicts_skipped={pg['existing']} "
@@ -1033,6 +1043,9 @@ def run(kb_id: str, dry_run: bool) -> int:
             "（collection 无显式 content_revision 字段，vector 投影保持 pending；"
             "按 §8.5/§15.4 迁移 v3 collection 后重跑 reindex）"
         )
+
+    if state_write_failed:
+        print("✗ projection state CAS did not update exactly one current row; gate remains OPEN")
 
     # 入队必须基于写入之后的新鲜 inventory（活栈执行态取证发现的静默漏排）：
     # 决策时清单只包含"本轮之前就有 current 行"的 chunk，本轮新写入但投影未收敛的 chunk

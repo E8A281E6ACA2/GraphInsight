@@ -76,6 +76,10 @@ def aggregate_document_states(kb_id: str, doc_ids: List[str]) -> List[Dict[str, 
     if not clean_doc_ids:
         return []
     with _engine().begin() as conn:
+        try:
+            conn.execute(text("SELECT 1 FROM knowledge_base_documents LIMIT 1"))
+        except Exception:  # noqa: BLE001 - migration may not have created document table yet
+            return []
         rows = conn.execute(
             text(
                 "SELECT doc_id, graph_status, vector_status FROM chunk_revisions "

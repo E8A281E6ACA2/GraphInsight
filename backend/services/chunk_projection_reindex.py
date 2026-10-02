@@ -457,6 +457,11 @@ def reindex_chunks(*, job_id: int, payload: Dict[str, Any], scope: Dict[str, str
 
     # 复核 1：targets 对应的 current 行清单
     rows = _load_current_rows(kb_id, [item["chunk_id"] for item in targets])
+    affected_doc_ids = {
+        str(row.get("doc_id") or "") for row in rows.values() if str(row.get("doc_id") or "")
+    }
+    if payload_doc_id:
+        affected_doc_ids.add(payload_doc_id)
 
     outdated: List[Dict[str, Any]] = []
     scope_mismatches: List[Dict[str, Any]] = []
@@ -496,6 +501,7 @@ def reindex_chunks(*, job_id: int, payload: Dict[str, Any], scope: Dict[str, str
         report["execution_status"] = "no_write"
         report["message"] = "没有 target 命中当前 current revision，未写入任何投影"
         report["counts"] = {"targets": len(targets), "outdated": len(outdated), "scope_mismatch": len(scope_mismatches)}
+        report["document_states"] = aggregate_document_states(kb_id, sorted(affected_doc_ids))
         return report
 
     # 复核 2：写索引前逐目标确认 current 仍等于 target
@@ -504,7 +510,15 @@ def reindex_chunks(*, job_id: int, payload: Dict[str, Any], scope: Dict[str, str
     outcomes: Dict[str, Dict[str, Any]] = {}
     for candidate in candidates:
         chunk_id = candidate["chunk_id"]
-        row = fresh.get(chunk_id) or candidate["row"]
+        row = fresh.get(chunk_id)
+        if row is None:
+            outcomes[chunk_id] = {
+                "graph": OUTCOME_CURRENT_MOVED,
+                "vector": OUTCOME_CURRENT_MOVED,
+                "doc_id": candidate["row"]["doc_id"],
+            }
+            affected_doc_ids.add(str(candidate["row"].get("doc_id") or ""))
+            continue
         if row["content_revision"] != candidate["target_revision"]:
             outdated.append(
                 {
@@ -534,6 +548,8 @@ def reindex_chunks(*, job_id: int, payload: Dict[str, Any], scope: Dict[str, str
                 "needs_vector": _side_needed(row, "vector", candidate["target_revision"]),
             }
         )
+        if row["doc_id"]:
+            affected_doc_ids.add(row["doc_id"])
 
     graph_items = [item for item in items if item["needs_graph"]]
     vector_items = [item for item in items if item["needs_vector"]]
@@ -608,7 +624,7 @@ def reindex_chunks(*, job_id: int, payload: Dict[str, Any], scope: Dict[str, str
             ):
                 claimed[side] = OUTCOME_STATE_WRITE_FAILED
 
-    doc_ids = sorted({item["doc_id"] for item in items if item["doc_id"]})
+    doc_ids = sorted({doc_id for doc_id in affected_doc_ids if doc_id})
     document_states = aggregate_document_states(kb_id, doc_ids)
 
     def _count(side: str, state: str) -> int:

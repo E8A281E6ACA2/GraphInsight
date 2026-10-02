@@ -13,6 +13,75 @@ from services.scope_contract import milvus_kb_filter, normalize_scope_id
 logger = get_logger()
 
 
+class VectorStoreSchemaError(RuntimeError):
+    """Milvus collection schema cannot satisfy the projection contract."""
+
+
+class VectorStoreUpsertError(RuntimeError):
+    """Milvus did not acknowledge the expected number of upserts."""
+
+
+def _is_int64_field(field: Dict[str, Any]) -> bool:
+    raw_type = field.get("data_type", field.get("type"))
+    if hasattr(raw_type, "name"):
+        raw_type = raw_type.name
+    if isinstance(raw_type, int):
+        return raw_type == 5  # pymilvus DataType.INT64
+    normalized = str(raw_type or "").strip().upper()
+    return normalized in {"INT64", "5"}
+
+
+def content_revision_field_is_int64(client: Any, collection: str) -> bool:
+    """Shared §8.5 check: field must be explicit and INT64, never dynamic metadata."""
+    if not client.has_collection(collection):
+        return False
+    try:
+        description = client.describe_collection(collection)
+    except Exception:
+        return False
+    fields = description.get("fields") if isinstance(description, dict) else None
+    return any(
+        isinstance(field, dict)
+        and str(field.get("name") or "") == "content_revision"
+        and _is_int64_field(field)
+        for field in (fields or [])
+    )
+
+
+def require_upsert_count(result: Any, expected: int) -> int:
+    """Extract Milvus' acknowledged mutation count and reject partial/unknown writes."""
+    count = None
+    if isinstance(result, dict):
+        for key in ("upsert_count", "insert_count", "mutation_count"):
+            if key in result:
+                count = result[key]
+                break
+        status = result.get("status")
+        if isinstance(status, dict) and status.get("code") not in (None, 0, "0"):
+            raise VectorStoreUpsertError(f"Milvus upsert status={status}")
+    else:
+        for key in ("upsert_count", "insert_count", "mutation_count"):
+            value = getattr(result, key, None)
+            if value is not None:
+                count = value
+                break
+        status = getattr(result, "status", None)
+        code = getattr(status, "code", None) if status is not None else None
+        if code not in (None, 0, "0"):
+            raise VectorStoreUpsertError(f"Milvus upsert status code={code}")
+    try:
+        acknowledged = int(count)
+    except (TypeError, ValueError) as exc:
+        raise VectorStoreUpsertError(
+            f"Milvus upsert returned no acknowledged count (expected={expected})"
+        ) from exc
+    if acknowledged != int(expected):
+        raise VectorStoreUpsertError(
+            f"Milvus upsert count mismatch: expected={expected} actual={acknowledged}"
+        )
+    return acknowledged
+
+
 def require_scope_filter(filter_expr: Optional[str]) -> str:
     """空 filter 一律拒绝（契约 §3.4/§11.2：不允许无作用域的向量检索）。"""
     cleaned = str(filter_expr or "").strip()
@@ -110,7 +179,7 @@ class MilvusVectorStore:
             if existing_dimension and existing_dimension != vector_dimension:
                 # 阻断修复（契约 §11.4）：向量是 projection，但 collection 里可能仍有唯一可用
                 # 索引；维度/Schema 冲突绝不允许静默 drop 重建，必须人工迁移。
-                raise RuntimeError(
+                raise VectorStoreSchemaError(
                     f"Milvus collection {collection} 的向量维度 ({existing_dimension}) "
                     f"与当前 embedding 维度 ({vector_dimension}) 不一致。"
                     "为避免静默销毁已有向量数据，系统不会自动 drop/重建 collection。"
@@ -143,6 +212,7 @@ class MilvusVectorStore:
             schema.add_field(field_name="content_hash", datatype=DataType.VARCHAR, max_length=80)
             schema.add_field(field_name="embedding_model", datatype=DataType.VARCHAR, max_length=128)
             schema.add_field(field_name="entities_json", datatype=DataType.VARCHAR, max_length=2048)
+            schema.add_field(field_name="content_revision", datatype=DataType.INT64)
             schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=vector_dimension)
             client.create_collection(collection_name=collection, schema=schema)
 
@@ -180,7 +250,7 @@ class MilvusVectorStore:
             if not self.has_content_revision_field(collection):
                 # §8.5 冻结：没有显式字段就禁止写版本（写进去只会进 dynamic metadata，
                 # 类型与查询都不可靠）。拒写而不是降级写入，投影由调用方保持未收敛状态。
-                raise RuntimeError(
+                raise VectorStoreSchemaError(
                     f"Milvus collection {collection} 缺少显式 content_revision 字段，"
                     "禁止把投影版本号写入 dynamic metadata；请按 §8.5/§15.4 迁移到 "
                     "graphinsight_chunks_v3 后重建向量"
@@ -207,8 +277,8 @@ class MilvusVectorStore:
             if chunk.content_revision is not None:
                 row["content_revision"] = int(chunk.content_revision)
             rows.append(row)
-        client.upsert(collection_name=collection, data=rows)
-        return len(rows)
+        result = client.upsert(collection_name=collection, data=rows)
+        return require_upsert_count(result, len(rows))
 
     def has_content_revision_field(self, collection: Optional[str] = None) -> bool:
         """collection 是否有显式 `content_revision` 字段（§8.5 v3 判据）。
@@ -225,14 +295,7 @@ class MilvusVectorStore:
         try:
             client = self._get_client()
             if client.has_collection(target):
-                description = client.describe_collection(target)
-                fields = description.get("fields") if isinstance(description, dict) else None
-                names = {
-                    str(item.get("name") or "")
-                    for item in (fields or [])
-                    if isinstance(item, dict)
-                }
-                supported = "content_revision" in names
+                supported = content_revision_field_is_int64(client, target)
         except Exception as exc:  # noqa: BLE001 - 探测失败按“不支持”处理，宁可拒写不误写
             logger.warning("探测 Milvus content_revision 字段失败", context={"collection": target, "error": str(exc)})
             supported = False
