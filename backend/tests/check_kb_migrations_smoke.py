@@ -31,6 +31,12 @@ from pathlib import Path
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
+# Windows 默认码（cp936）下父进程打印 ✓/✗ 与中文会 UnicodeEncodeError 直接崩掉整个取证，
+# 所以脚本自身必须强制 UTF-8——不允许靠命令行 `-X utf8` 当前提。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 FAILURES: list = []
 
 # 由 main() 在临时目录里创建；所有子进程与父进程都必须走这一份 env 文件
@@ -55,7 +61,19 @@ def _base_env() -> dict:
     return env
 
 
+def _dump_failure(label: str, code: int, stdout: str, stderr: str) -> None:
+    """子进程非 0 退出时给出完整 exit code 与 stderr，不做尾部截断。"""
+    if code == 0:
+        return
+    print(f"    !! {label} exit={code}")
+    for line in (stdout.splitlines() or ["<stdout 为空>"]):
+        print(f"    [stdout] {line}")
+    for line in (stderr.splitlines() or ["<stderr 为空>"]):
+        print(f"    [stderr] {line}")
+
+
 def run_script(script: str, action: str, extra_args: list = None) -> tuple:
+    label = f"{script} --action {action}"
     proc = subprocess.run(
         [sys.executable, str(backend_dir / "admin" / script), "--action", action, *(extra_args or [])],
         capture_output=True,
@@ -66,6 +84,7 @@ def run_script(script: str, action: str, extra_args: list = None) -> tuple:
         env=_base_env(),
         timeout=120,
     )
+    _dump_failure(label, proc.returncode, proc.stdout, proc.stderr)
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -80,6 +99,7 @@ def run_python_code(code: str) -> tuple:
         env=_base_env(),
         timeout=120,
     )
+    _dump_failure("python -c", proc.returncode, proc.stdout, proc.stderr)
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -108,7 +128,7 @@ def guard_isolation() -> None:
         "print('DIALECT', engine.dialect.name);"
         "print('DBNAME', str(engine.url).split('@')[-1])"
     )
-    step("子进程引擎守卫（必须 sqlite）", code == 0 and "DIALECT sqlite" in out, out[-400:])
+    step("子进程引擎守卫（必须 sqlite 且 exit 0）", code == 0 and "DIALECT sqlite" in out, f"exit={code} {out[-400:]}")
 
     from admin.database import engine as parent_engine
 
@@ -131,9 +151,9 @@ def run_migration_cycle(script: str) -> None:
     print(f"[{script}]")
     code, out = run_script(script, "migrate", ["--dry-run"])
     step(
-        "dry-run 解析到 sqlite（真实动作前的最后一道闸）",
+        "dry-run 解析到 sqlite 且 exit 0（真实动作前的最后一道闸）",
         code == 0 and dialect_of(out) == "sqlite",
-        f"dialect={dialect_of(out)} {out[-300:]}",
+        f"exit={code} dialect={dialect_of(out)} {out[-300:]}",
     )
     if FAILURES:
         print(f"  !! {script} 隔离守卫未过，跳过后续 migrate/rollback")
@@ -146,7 +166,11 @@ def run_migration_cycle(script: str) -> None:
         ("migrate", "rollback 后再 migrate"),
     ):
         code, out = run_script(script, action)
-        step(f"{name}（exit 0 且仍为 sqlite）", code == 0 and dialect_of(out) == "sqlite", out[-300:])
+        step(
+            f"{name}（exit 0 且仍为 sqlite）",
+            code == 0 and dialect_of(out) == "sqlite",
+            f"exit={code} dialect={dialect_of(out)} {out[-300:]}",
+        )
 
 
 def main() -> int:
@@ -183,7 +207,7 @@ def main() -> int:
             "engine.dispose(); print('bootstrap ok')"
         )
         code, out = run_python_code(bootstrap)
-        step("基础表引导", code == 0 and "bootstrap ok" in out, out[-300:])
+        step("基础表引导（exit 0）", code == 0 and "bootstrap ok" in out, f"exit={code} {out[-300:]}")
         rc = abort_if_not_isolated("基础表引导")
         if rc:
             return rc
@@ -234,7 +258,7 @@ def main() -> int:
         step(
             "守卫有效性自证（env 文件改指 PG 时方言必须变化，否则守卫是摆设）",
             proc.returncode == 0 and "DIALECT postgresql" in (proc.stdout + proc.stderr),
-            (proc.stdout + proc.stderr)[-300:],
+            f"exit={proc.returncode} {(proc.stdout + proc.stderr)[-300:]}",
         )
         engine.dispose()  # Windows 下必须先释放连接才能清理临时目录
 

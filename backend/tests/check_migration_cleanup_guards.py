@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 
@@ -547,6 +548,77 @@ def test_sqlite_isolated_tests_use_env_file_not_blank_override() -> None:
                              + "; ".join(offenders))
 
 
+def _subprocess_calls_without_env(source: str) -> list:
+    """返回 `subprocess.run/check_output/call/check_call(...)` 里没带 `env=` 的行号。"""
+    offenders = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        names = []
+        if isinstance(func, ast.Attribute):
+            names.append(func.attr)
+            if isinstance(func.value, ast.Name):
+                names.append(func.value.id)
+        elif isinstance(func, ast.Name):
+            names.append(func.id)
+        if not ({a for a in names} & {"run", "check_output", "call", "check_call"}) or "subprocess" not in names:
+            continue
+        if not any(keyword.arg == "env" for keyword in node.keywords):
+            offenders.append(node.lineno)
+    return offenders
+
+
+def test_windows_utf8_acceptance_chain_is_self_enforced() -> None:
+    """Windows UTF-8 验收链铁律（2026-10-02 裁定第 1 项）：取证脚本必须自带 UTF-8 契约。
+
+    背景：`-X utf8` 曾被当成"运行命令前提"写进验收文档。父进程不强制 UTF-8 时，
+    打印 `✓`/中文会 UnicodeEncodeError 崩掉整条链；子进程不传 `PYTHONUTF8` 时，
+    被检 CLI 自己崩溃会把真实退出码顶掉——本轮实测出现过"子进程 exit 1、
+    断言仍判通过"的假绿灯。因此这条契约必须由脚本自身承担，并有静态守卫防回归。
+    """
+    chain_files = (
+        "tests/check_m5a_live_stack_readonly.py",
+        "tests/check_m5a_live_execution.py",
+        "tests/check_kb_migrations_smoke.py",
+        "tests/run_unified_boundary_guards.py",
+    )
+    offenders = []
+    for rel in chain_files:
+        path = ROOT / rel
+        source = path.read_text(encoding="utf-8")
+        if 'sys.stdout.reconfigure(encoding="utf-8"' not in source:
+            offenders.append(f"{rel} 缺少父进程 stdout 强制 UTF-8")
+        if 'sys.stderr.reconfigure(encoding="utf-8"' not in source:
+            offenders.append(f"{rel} 缺少父进程 stderr 强制 UTF-8")
+        for lineno in _subprocess_calls_without_env(source):
+            offenders.append(f"{rel}:{lineno} 子进程调用未传 env=（丢 PYTHONUTF8）")
+        if "PYTHONUTF8" not in source and "subprocess.run(" in source:
+            offenders.append(f"{rel} 起子进程但未设置 PYTHONUTF8")
+
+    # 已登记 KB 的 CLI 检查必须看真实退出码（本轮假绿灯的直接回归位）
+    readonly_src = (ROOT / "tests" / "check_m5a_live_stack_readonly.py").read_text(encoding="utf-8")
+    if "proc.returncode == 0" not in readonly_src:
+        offenders.append("tests/check_m5a_live_stack_readonly.py 的已登记 KB CLI 检查未断言 returncode == 0")
+
+    # 守卫有效性自证：喂去势样本，规则必须变红（否则这是一条空规则）
+    neutered_child = (
+        "import subprocess, sys\n"
+        'proc = subprocess.run([sys.executable, "-c", "print(1)"], capture_output=True, text=True)\n'
+        "print(proc.returncode)\n"
+    )
+    if len(_subprocess_calls_without_env(neutered_child)) != 1:
+        offenders.append("UTF-8 守卫未能识别无 env= 的子进程调用（规则是摆设）")
+    if _subprocess_calls_without_env(
+        "import subprocess\nsubprocess.run([1], env={'PYTHONUTF8': '1'})\n"
+    ):
+        offenders.append("UTF-8 守卫误报：带 env= 的子进程调用被判违规")
+
+    if offenders:
+        raise AssertionError("windows UTF-8 acceptance chain must be self-enforcing: " + "; ".join(offenders))
+
+
 def main() -> int:
     test_nl2cypher_status_uses_current_config_service()
     test_config_constants_do_not_restore_openai_category()
@@ -565,6 +637,7 @@ def main() -> int:
     test_unified_dev_defaults_do_not_regress_to_remote_or_python_public()
     test_kb_scope_strict_mode_has_no_compat_toggle()
     test_sqlite_isolated_tests_use_env_file_not_blank_override()
+    test_windows_utf8_acceptance_chain_is_self_enforced()
     print("MIGRATION_CLEANUP_GUARDS_OK")
     return 0
 
