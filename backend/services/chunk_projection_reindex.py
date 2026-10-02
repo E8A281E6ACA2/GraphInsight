@@ -298,6 +298,15 @@ def _existing_milvus_fields(kb_id: str, chunk_ids: List[str]) -> Dict[str, Dict[
         output_fields = ["chunk_id"] + output_fields
 
     merged: Dict[str, Dict[str, Any]] = {}
+    try:
+        # 新建或刚迁移的 collection 可能尚未 load；Milvus query 在该状态下会失败。
+        loader = getattr(client, "load_collection", None)
+        if callable(loader):
+            loader(collection)
+    except Exception as exc:  # noqa: BLE001 - 读回失败必须保持 fail closed
+        raise RuntimeError(
+            f"Milvus collection load failed for reindex_chunks: kb_id={kb_id}"
+        ) from exc
     for batch in _batched(chunk_ids, MILVUS_QUERY_BATCH_SIZE):
         expr = " && ".join(
             [
@@ -359,7 +368,6 @@ def _write_milvus_projection(
     outcome: Dict[str, str] = {}
     if not items:
         return outcome
-    existing = _existing_milvus_fields(kb_id, [item["chunk_id"] for item in items])
     cfg = embedding_service.config()
     for batch in _batched(items, MILVUS_BATCH_SIZE):
         try:
@@ -377,6 +385,10 @@ def _write_milvus_projection(
             for item in batch:
                 outcome[item["chunk_id"]] = OUTCOME_WRITE_FAILED
             continue
+        # ensure_collection creates the vector index and loads a newly migrated
+        # collection before the readback query below.
+        vector_store.ensure_collection(dimension=len(vectors[0]) if vectors else None)
+        existing = _existing_milvus_fields(kb_id, [item["chunk_id"] for item in batch])
         chunks = []
         for item, vector in zip(batch, vectors):
             merged = existing.get(item["chunk_id"]) or {}
