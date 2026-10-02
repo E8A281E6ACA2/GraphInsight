@@ -563,6 +563,7 @@ class JobService:
                 duration_seconds = round(time.monotonic() - started_monotonic, 3)
             error_type = type(exc).__name__
             error_message = f"{error_type}: {str(exc)}"
+            error_details = getattr(exc, "details", None)
             logger.error("后台任务执行失败", context={"job_id": job_id, "error": error_message}, exc_info=True)
             try:
                 failed = db.query(AdminJob).filter(AdminJob.id == job_id).first()
@@ -577,6 +578,7 @@ class JobService:
                             "job_id": job_id,
                             "error_type": error_type,
                             "error": str(exc),
+                            "details": error_details,
                             "runtime": {
                                 "duration_seconds": duration_seconds,
                                 "timeout_seconds": JOB_EXECUTION_TIMEOUT_SECONDS,
@@ -596,6 +598,7 @@ class JobService:
                             "status": failed.status,
                             "error_type": error_type,
                             "runtime_seconds": duration_seconds,
+                            "error_details": error_details,
                         },
                         error_message=error_message[:1000],
                     )

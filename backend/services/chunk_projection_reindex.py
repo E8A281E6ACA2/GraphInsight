@@ -289,8 +289,10 @@ def _existing_milvus_fields(kb_id: str, chunk_ids: List[str]) -> Dict[str, Dict[
         description = client.describe_collection(collection)
         fields = description.get("fields") if isinstance(description, dict) else None
         names = {str(item.get("name") or "") for item in (fields or []) if isinstance(item, dict)}
-    except Exception:  # noqa: BLE001 - 探测不到 schema 就不合并，宁可少读也不猜
-        names = set()
+    except Exception as exc:  # noqa: BLE001 - 读不到 schema 时禁止整行替换，避免洗掉旧元数据
+        raise RuntimeError(
+            f"Milvus collection schema probe failed for reindex_chunks: kb_id={kb_id}"
+        ) from exc
     output_fields = [field for field in MILVUS_MERGE_FIELDS if field in names]
     if "chunk_id" not in output_fields:
         output_fields = ["chunk_id"] + output_fields
@@ -313,9 +315,10 @@ def _existing_milvus_fields(kb_id: str, chunk_ids: List[str]) -> Dict[str, Dict[
                 )
                 or []
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("reindex_chunks 读取 Milvus 旧记录失败", context={"kb_id": kb_id, "error": str(exc)})
-            continue
+        except Exception as exc:  # noqa: BLE001 - upsert 是整行替换，读回失败必须 fail closed
+            raise RuntimeError(
+                f"reindex_chunks Milvus existing-field read failed: kb_id={kb_id}"
+            ) from exc
         for row in page:
             chunk_id = str(row.get("chunk_id") or "")
             if not chunk_id:
@@ -651,10 +654,18 @@ def reindex_chunks(*, job_id: int, payload: Dict[str, Any], scope: Dict[str, str
             details={"kb_id": kb_id, "blocked": vector_blocked, "counts": counts},
         )
     if failed_chunks:
-        raise RuntimeError(
+        error = RuntimeError(
             f"reindex_chunks 投影写入未收敛: kb_id={kb_id} failed={len(failed_chunks)} "
             f"chunks={failed_chunks[:10]}"
         )
+        error.details = {
+            "job_id": job_id,
+            "kb_id": kb_id,
+            "counts": counts,
+            "outcomes": outcomes,
+            "failed_chunks": failed_chunks[:50],
+        }
+        raise error
     return report
 
 
