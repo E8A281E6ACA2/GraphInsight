@@ -65,6 +65,7 @@ backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
 from admin.database import engine  # noqa: E402
+from admin.dry_run_contract import emit_dry_run_result  # noqa: E402
 from config import get_settings  # noqa: E402
 from services.scope_contract import milvus_kb_filter, normalize_scope_id  # noqa: E402
 
@@ -100,6 +101,7 @@ class Inventory:
     needs_reindex_targets: List[Dict[str, Any]] = field(default_factory=list)
     converged: int = 0
     blocked: int = 0
+    blocked_targets: List[Dict[str, Any]] = field(default_factory=list)
     orphan_revisions: List[str] = field(default_factory=list)
     rows_skipped_existing: int = 0
     scope_mismatches: List[Dict[str, str]] = field(default_factory=list)
@@ -659,9 +661,27 @@ def build_inventory(kb_id: str) -> Inventory:
                 )
             elif "blocked" in (graph_state, vector_state):
                 inventory.blocked += 1
+                inventory.blocked_targets.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "doc_id": row["doc_id"],
+                        "reason": "PROJECTION_BLOCKED",
+                        "graph_state": graph_state,
+                        "vector_state": vector_state,
+                    }
+                )
             elif is_orphan:
                 # 孤儿行不得判为 converged：两侧索引都没有该 chunk，门必须保持 OPEN
                 inventory.blocked += 1
+                inventory.blocked_targets.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "doc_id": row["doc_id"],
+                        "reason": "ORPHAN_REVISION",
+                        "graph_state": graph_state,
+                        "vector_state": vector_state,
+                    }
+                )
             else:
                 inventory.converged += 1
             continue
@@ -936,20 +956,58 @@ def run(kb_id: str, dry_run: bool) -> int:
     # 作用域冲突 fail-closed：先于任何写入与 dry-run 分支拒绝（审计修复 #4）
     if inventory.scope_mismatches:
         _print_report(inventory, gate, dry_run=dry_run)
+        if dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={"reason": "SCOPE_MISMATCH", "count": len(inventory.scope_mismatches)},
+            )
         print(f"✗ 拒绝执行：SCOPE_MISMATCH {len(inventory.scope_mismatches)} 处，零写入")
         return 2
 
     if dry_run:
         _print_report(inventory, gate, dry_run=True)
         if inventory.unrecoverable:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={
+                    "reason": "UNRECOVERABLE_MISMATCH",
+                    "count": len(inventory.unrecoverable),
+                },
+            )
             print("✗ UNRECOVERABLE_MISMATCH：dry-run 终止，禁止写入，请走受控清库分支")
             return 2
         if inventory.scope_unresolved:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={
+                    "reason": "SCOPE_UNRESOLVED",
+                    "count": len(inventory.scope_unresolved),
+                },
+            )
             print(
                 f"✗ SCOPE_UNRESOLVED：{len(inventory.scope_unresolved)} 个 chunk 作用域三件套不全，"
                 "dry-run 终止，禁止写入（先补 knowledge_bases 登记或走 reindex 重建，不得伪造作用域落库）"
             )
             return 2
+        emit_dry_run_result(
+            operation="backfill_chunk_revisions",
+            status=("CLOSED_DEGRADED" if gate["degraded_skipped"] else "CLOSED")
+            if gate["closed"]
+            else "OPEN",
+            exit_code=0,
+            details={
+                "needs_reindex": gate["needs_reindex"],
+                "blocked": gate["blocked"],
+                "unrecoverable": gate["unrecoverable"],
+                "scope_unresolved": gate["scope_unresolved"],
+            },
+        )
         print("✓ dry-run completed，未写库")
         return 0
 
@@ -1089,9 +1147,23 @@ def main() -> int:
         kb_id = normalize_scope_id("kb_id", args.kb)
     except Exception as exc:  # noqa: BLE001 - SCOPE_INVALID 必须显式报告
         print(f"✗ kb_id 非法: {exc}")
+        if args.dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={"reason": "SCOPE_INVALID"},
+            )
         return 2
     if not kb_id:
         print("✗ kb_id 不能为空")
+        if args.dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={"reason": "SCOPE_INVALID"},
+            )
         return 2
 
     print("=" * 60)
@@ -1100,11 +1172,25 @@ def main() -> int:
     with engine.begin() as conn:
         if not _table_exists(conn, "chunk_revisions"):
             print("✗ chunk_revisions 表不存在，请先执行 migrate_chunk_revisions.py")
+            if args.dry_run:
+                emit_dry_run_result(
+                    operation="backfill_chunk_revisions",
+                    status="rejected",
+                    exit_code=2,
+                    details={"reason": "MIGRATION_REQUIRED", "table": "chunk_revisions"},
+                )
             return 2
     try:
         return run(kb_id, dry_run=bool(args.dry_run))
     except Exception as exc:  # noqa: BLE001 - 运维脚本失败必须显式退出码
         print(f"✗ backfill 执行失败: {exc}")
+        if args.dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="error",
+                exit_code=1,
+                details={"reason": "RUNTIME_ERROR"},
+            )
         return 1
 
 

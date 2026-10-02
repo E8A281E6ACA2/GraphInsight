@@ -30,6 +30,7 @@ backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
 from admin.database import engine  # noqa: E402
+from admin.dry_run_contract import emit_dry_run_result  # noqa: E402
 from admin.m5a_schema_check import check_targets_hash_structure, print_results  # noqa: E402
 
 load_dotenv(find_dotenv(), override=True)
@@ -176,6 +177,12 @@ def main() -> int:
     _print_plan(args.action)
 
     if args.dry_run:
+        emit_dry_run_result(
+            operation="migrate_jobs_targets_hash",
+            status="ready",
+            exit_code=0,
+            plan=_build_plan(args.action),
+        )
         print("✓ dry-run completed, database not modified")
         return 0
 
