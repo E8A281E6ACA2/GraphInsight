@@ -256,6 +256,7 @@ cd backend && PYTHONPATH=. python tests/check_m5a_live_execution.py --confirm --
 - v2（2026-10-01）：补真实写入执行态取证（§3.4，合成 KB 授权窗口，34 项断言全绿、清理后复核回基线）。执行态又命中并修复一个静默缺陷（§5.4：未收敛的新 chunk 未在同一轮排入 reindex job），SQLite 矩阵从 108 增至 111 项并新增 `rfa_rerun` 回归；计数改名 `insert_conflicts_skipped`（§2）；未登记 KB 的 `SCOPE_UNRESOLVED` 拒绝腿固化进只读脚本（§3.3）；§6 改写为当前结构性缺口清单，其中 reindex job 无消费方一条决定了"门收敛"这条腿在 M5-B 之前不可能取证。设计文档 §15.3 步骤 7/8 同步补两处口径说明（§5.4 入队时机、§5.5 幂等文字歧义），**未改动任何验收阈值**。M5-A 仍不宣布通过，M5-B 保持冻结。（v3 复核注：本条与 v1 的"111 项 / 34 项"是 `grep -c "✓"` 得到的 ✓ 行数，含汇总行与子进程回显，统一口径下的断言数见 §9.5；退出码与通过/失败判定不变。）
 - v3（2026-10-01）：闭合任务 #55（迁移测试 DB 伪隔离）。新增 §9 记录根因、"历史是否曾在活 PG drop 表"的取证结论与不可判定窗口、整改后的三层守卫输出与静态防回归。**本节追加在修订记录之后，是为了保持审计已引用的 §1–§8 编号不变**。M5-A 结论不变：仍不宣布通过，M5-B 保持冻结。
 - v4（2026-10-02）：新增 §10——Windows UTF-8 验收链修复（验收基础设施）。基线复现出四条真实失败腿与**一处假绿灯**（只读脚本的"已登记 KB CLI"步骤不看 `returncode`，子进程已崩仍判通过），整改 5 个文件（三个被点名脚本 + 统一守卫入口 + 迁移 smoke 的父进程侧），取消"必须带 `-X utf8`"这个历史前提；第二项五条命令用普通 `python` 复跑全部 `EXIT=0`。§10.4 如实登记全仓同类缺口 22 个文件（本轮未越界修改），§10.5 勘误 M4R1 报告里"运行前提"的旧表述。**M5-A 仍不宣布通过，M5-B 保持冻结，未 push。**
+- v5（2026-10-02）：新增 §11——第三项"M5-A/M5-B 依赖方案"交付为独立提案文档 `docs/ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md`（未改代码）。§11.2 主动精确化 §6 的旧措辞：门收敛的前置不是"M5-B"整体，而是 **M5-B0（Python worker 消费 `reindex_chunks`）+ Milvus v3 显式 `content_revision`** 两者同时到位，缺一不可；§11.3 登记依赖方案顺带暴露的两处既有口径问题（`content_revision` 硬编码 1 的版本假降风险、`job_type` 白名单四份无对账守卫）。M5-A 结论不变：仍不宣布通过，M5-B Go API 保持冻结，未 push。
 
 ---
 
@@ -470,5 +471,38 @@ EXIT=0                   backend/tests/check_migration_cleanup_guards.py   （MI
 3. §10.2 的断言变更**只加不减**：新增 `returncode == 0` 断言与幂等重跑退出码断言，未放宽任何既有阈值；
    readonly 步骤总数仍为 20（旧步骤 `CLI dry-run 有结构化输出` 改为带 `exit 0` 的更强表述，不是新增计数）。
 4. 未 push（本轮改动留在本地待复核）。
+
+---
+
+## 11. 追加轮：M5-A / M5-B 依赖方案交付（2026-10-02，第三项）
+
+同样追加在修订记录之后，保持 §1–§10 编号不变。
+
+### 11.1 交付物
+
+`docs/ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md`（v1，提案未实现）。回答四项：`reindex_chunks` 由谁消费、job service / worker / Go API 的最小接入边界、Milvus v3 如何提供 `content_revision`、`needs_reindex_targets` 何时真正收敛 CLOSED。全部结论带 `path:line` 证据；本轮未改任何代码。
+
+### 11.2 对 §6 措辞的精确化（主动认账）
+
+§6 原写"reindex job 无消费方 ⇒ '门收敛'这条腿**在 M5-B 之前不可能取证**"。这句把"消费方"和"M5-B"绑死了，不准确：
+
+1. 入队方（backfill）和执行方（Python 进程内 worker）都在 Python 侧，Go 只提供人工触发与列表界面；
+2. 因此存在一个不触碰 Go 的最小切片（依赖方案 §3.1 的 **M5-B0**）即可让门变得可取证；
+3. 正确的阻断表述是：**在 M5-B0（Python worker 消费 `reindex_chunks`）+ Milvus v3（显式 `content_revision`）之前不可能取证**，两者缺一不可（只做 v3 收敛不了任何既有 `needs_reindex_targets`，只做 worker 会被 §8.5 的 v2 缺字段拒写拦回 `pending`）。
+
+这不改变本轮任何验收阈值与结论，只把"等什么"说准。
+
+### 11.3 依赖方案顺带暴露的两处既有口径问题（记录，未修）
+
+1. `backfill_chunk_revisions.py:433` 把 Milvus 的 `content_revision` 硬编码为 `1`。S1 双写期新 chunk 确实是 revision 1，但按设计书 §16.1 的"回滚需带当前 revision 全量 upsert 回 v2"这条路径，硬编码会把已有 revision 3 写成 1（版本假降）。应在 M5-B0 一并改为取该行 `current.content_revision`。
+2. `job_type` 白名单实际有 4 份（Python `SUPPORTED_JOB_TYPES`/`RUNNABLE_JOB_TYPES`、Go `supportedJobTypes`/`adminJobTypeFromPath`），今天没有任何守卫对账——这正是"`reindex_chunks` 能入队、能显示、永不执行、零报错"的成因。需要一份跨语言 job_type 精确对账静态守卫（与 R2-2 的 Python/Go RBAC 对账同一手法）。
+
+### 11.4 门禁自证
+
+`check_artifact_secrets.py` 对新增文档单独扫描：`files=1 findings=0 result=pass EXIT=0`（普通 `python`，未加 `-X utf8`）。既有四份文档同批扫描 `findings=10`（M5A 报告 1 条 DSN + M4R1 报告 9 条历史标注），本轮新增命中 0。
+
+### 11.5 待用户拍板（依赖方案 §7）
+
+B0 是否授权开工（会改 `RUNNABLE_JOB_TYPES` 并新增真实写索引的执行体）、v3 迁移窗口（共享 dev Milvus 环境变更 + 回滚预演）、不可收敛清单的处置口径（删孤儿行 vs 永久标注 blocked）。
 
 
