@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import time
 import uuid
 from typing import Any
 
@@ -70,15 +71,23 @@ def _read_real_projections(kb_id: str, collection: str) -> tuple[dict[str, Any],
         driver.close()
 
     client = vector_store._get_client()
-    mil = list(
-        client.query(
-            collection_name=collection,
-            filter=f'kb_id == "{kb_id}"',
-            output_fields=["chunk_id", "text", "kb_id", "tenant_id", "project_id", "content_revision", "vector"],
-            limit=10,
+    client.flush(collection_name=collection)
+    client.load_collection(collection_name=collection)
+    mil = []
+    for _ in range(10):
+        mil = list(
+            client.query(
+                collection_name=collection,
+                filter=f'kb_id == "{kb_id}"',
+                output_fields=["chunk_id", "text", "kb_id", "tenant_id", "project_id", "content_revision", "vector"],
+                limit=10,
+                consistency_level="Strong",
+            )
+            or []
         )
-        or []
-    )
+        if mil:
+            break
+        time.sleep(0.5)
     return (neo[0] if neo else {}), (mil[0] if mil else {})
 
 
