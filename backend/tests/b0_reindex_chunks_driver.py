@@ -353,6 +353,33 @@ def scenario_current_moved() -> None:
     _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
 
 
+def scenario_current_deleted_race() -> None:
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    _install()
+    real_load = worker._load_current_rows
+    state = {"round": 0}
+
+    def delete_before_fresh(kb_id: str, chunk_ids: List[str]):
+        rows = real_load(kb_id, chunk_ids)
+        if state["round"] == 1:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "DELETE FROM chunk_revisions WHERE kb_id = :kb AND chunk_id = :chunk "
+                        "AND revision_status = 'current'"
+                    ),
+                    {"kb": kb_id, "chunk": "c-1"},
+                )
+            return {}
+        state["round"] += 1
+        return rows
+
+    worker._load_current_rows = delete_before_fresh
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+
+
 def scenario_idempotent_rerun() -> None:
     _seed_kb()
     _seed_doc(DOC)
@@ -478,7 +505,47 @@ def scenario_upsert_guard_blocks_dynamic_field() -> None:
         vector_store.upsert_chunks([chunk], [[0.1, 0.2]])
         print("__GUARD__" + json.dumps({"raised": False, "rows": captured.get("rows")}, ensure_ascii=False))
     except Exception as exc:  # noqa: BLE001
-        print("__GUARD__" + json.dumps({"raised": True, "error": str(exc)[:200]}, ensure_ascii=False))
+        print("__GUARD__" + json.dumps({"raised": True, "type": type(exc).__name__, "error": str(exc)[:200]}, ensure_ascii=False))
+
+
+def scenario_schema_and_upsert_contract() -> None:
+    from services.vector_store import VectorChunk, content_revision_field_is_int64, vector_store
+
+    class SchemaClient:
+        def __init__(self, field_type):
+            self.field_type = field_type
+
+        def has_collection(self, name):
+            return True
+
+        def describe_collection(self, name):
+            return {"fields": [{"name": "content_revision", "data_type": self.field_type}]}
+
+    schema = {
+        "int64": content_revision_field_is_int64(SchemaClient(5), "v3"),
+        "varchar": content_revision_field_is_int64(SchemaClient("VARCHAR"), "v3"),
+        "missing_type": content_revision_field_is_int64(SchemaClient(None), "v3"),
+    }
+    vector_store._get_client = lambda: type(
+        "MutationClient",
+        (),
+        {
+            "upsert": lambda self, **kwargs: {"upsert_count": 0},
+        },
+    )()
+    vector_store._revision_field = {"test_collection": True}
+    vector_store.is_enabled = lambda: True
+    vector_store.config = lambda: {"collection": "test_collection", "enabled": True, "provider": "milvus"}
+    vector_store.ensure_collection = lambda **k: None
+    chunk = VectorChunk(
+        chunk_id="c-1", doc_id=DOC, text="x", kb_id=KB, tenant_id=TENANT, project_id=PROJECT, content_revision=1
+    )
+    try:
+        vector_store.upsert_chunks([chunk], [[0.1, 0.2]])
+        mutation = {"type": "none"}
+    except Exception as exc:  # noqa: BLE001
+        mutation = {"type": type(exc).__name__, "message": str(exc)}
+    print("__SCHEMA_CONTRACT__" + json.dumps({"schema": schema, "mutation": mutation}, ensure_ascii=False, sort_keys=True))
 
 
 def scenario_closed_loop() -> None:
@@ -556,12 +623,14 @@ SCENARIOS = {
     "revision_field_absent": scenario_revision_field_absent,
     "graph_write_failed": scenario_graph_write_failed,
     "current_moved": scenario_current_moved,
+    "current_deleted_race": scenario_current_deleted_race,
     "idempotent_rerun": scenario_idempotent_rerun,
     "cross_kb_isolation": scenario_cross_kb_isolation,
     "doc_aggregation": scenario_doc_aggregation,
     "dispatch_separation": scenario_dispatch_separation,
     "existing_fields_merge": scenario_existing_fields_merge,
     "upsert_guard": scenario_upsert_guard_blocks_dynamic_field,
+    "schema_and_upsert_contract": scenario_schema_and_upsert_contract,
     "closed_loop": scenario_closed_loop,
 }
 

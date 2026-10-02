@@ -332,6 +332,30 @@ def section_b(h: Harness) -> None:
 # ---------------------------------------------------------------------------
 
 
+def section_b_deleted_race(h: Harness) -> None:
+    print("[B2] current delete race")
+    out = scenario(h, "deleted_race.db", "current_deleted_race")
+    step("second recheck missing current becomes current_moved", counts_of(out).get("current_moved") == 1, f"counts={counts_of(out)}")
+    step(
+        "deleted current race performs no Neo4j/Milvus writes",
+        calls_of(out) == {"graph": [], "vector": []}
+        and obj_marker(out, "__NEO4J__") == {}
+        and obj_marker(out, "__MILVUS__") == {},
+        f"calls={calls_of(out)} neo={obj_marker(out, '__NEO4J__')} mil={obj_marker(out, '__MILVUS__')}",
+    )
+    step(
+        "deleted current race does not invent a document aggregate after row deletion",
+        result_of(out).get("document_states") == [],
+        f"docs={result_of(out).get('document_states')}",
+    )
+    out = scenario(h, "excluded_aggregate.db", "outdated_revision")
+    step(
+        "all targets excluded still aggregates existing document",
+        result_of(out).get("document_states") == [{"doc_id": DOC, "graph_status": "pending", "vector_status": "pending"}],
+        f"docs={result_of(out).get('document_states')}",
+    )
+
+
 def section_c(h: Harness) -> None:
     print("[C] 作用域校验 fail-closed")
     out = scenario(h, "empty_targets.db", "empty_targets")
@@ -435,12 +459,20 @@ def section_f(h: Harness) -> None:
     out = scenario(h, "guard.db2", "upsert_guard")
     guard = obj_marker(out, "__GUARD__")
     step("无显式字段时 upsert_chunks 拒写", guard.get("raised") is True, f"guard={guard}")
+    step("缺显式字段抛 VectorStoreSchemaError", guard.get("type") == "VectorStoreSchemaError", f"guard={guard}")
     step("拒写理由指向 v3 迁移与 dynamic metadata 禁令", "dynamic metadata" in str(guard.get("error")) and "content_revision" in str(guard.get("error")), f"guard={guard}")
 
 
 # ---------------------------------------------------------------------------
 # G. 闭环：backfill 入队 → worker 消费 → 复跑得到 CLOSED
 # ---------------------------------------------------------------------------
+
+
+def section_f2(h: Harness) -> None:
+    out = scenario(h, "schema_contract.db", "schema_and_upsert_contract")
+    contract = obj_marker(out, "__SCHEMA_CONTRACT__")
+    step("content_revision 只有显式 INT64 才通过", contract.get("schema") == {"int64": True, "missing_type": False, "varchar": False}, f"contract={contract}")
+    step("Milvus upsert 数量不符进入 VectorStoreUpsertError", contract.get("mutation", {}).get("type") == "VectorStoreUpsertError", f"contract={contract}")
 
 
 def section_g(h: Harness) -> None:
@@ -473,10 +505,12 @@ def main() -> int:
         section_s(h)
         section_a(h)
         section_b(h)
+        section_b_deleted_race(h)
         section_c(h)
         section_d(h)
         section_e(h)
         section_f(h)
+        section_f2(h)
         section_g(h)
     print("-" * 60)
     if FAILURES:

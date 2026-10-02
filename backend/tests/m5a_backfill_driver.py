@@ -108,6 +108,35 @@ def _ensure_kb_table(kb_id: str, tenant_id: str, project_id: str) -> None:
         )
 
 
+def _ensure_doc_table() -> None:
+    from admin.database import Base
+    from admin.models import KnowledgeBaseDocument
+
+    Base.metadata.create_all(bind=engine, tables=[KnowledgeBaseDocument.__table__])
+
+
+def _seed_doc(kb_id: str, doc_id: str, graph_status: str = "pending", vector_status: str = "pending") -> None:
+    _ensure_doc_table()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO knowledge_base_documents (doc_id, kb_id, tenant_id, project_id, name, "
+                "relative_path, source_type, size, sha256, version, status, graph_status, vector_status) "
+                "VALUES (:doc, :kb, 't1', 'p1', :name, :path, 'upload', 10, :sha, 1, 'indexed', :graph, :vector) "
+                "ON CONFLICT (doc_id) DO NOTHING"
+            ),
+            {
+                "doc": doc_id,
+                "kb": kb_id,
+                "name": f"{doc_id}.md",
+                "path": f"kb/{kb_id}/{doc_id}.md",
+                "sha": _sha(doc_id),
+                "graph": graph_status,
+                "vector": vector_status,
+            },
+        )
+
+
 def _patch_sources(
     neo: Dict[str, Dict[str, dict]] = None,
     mil: Dict[str, Dict[str, dict]] = None,
@@ -164,7 +193,16 @@ def _dump_state(calls: list = None) -> None:
         except Exception:  # noqa: BLE001 - 迁移测试库可能没有 admin_jobs，dump 视为空
             pass
     print("__ROWS__" + json.dumps([list(r) for r in rows], ensure_ascii=False))
+    docs = []
+    try:
+        with engine.begin() as conn:
+            docs = conn.execute(
+                text("SELECT kb_id, doc_id, graph_status, vector_status FROM knowledge_base_documents ORDER BY doc_id")
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        docs = []
     print("__JOBS__" + json.dumps([list(j) for j in jobs], ensure_ascii=False))
+    print("__DOCS__" + json.dumps([list(d) for d in docs], ensure_ascii=False))
     if calls is not None:
         print("__CALLS__" + json.dumps(calls, ensure_ascii=False))
 
@@ -399,6 +437,33 @@ def s_scope_conflict_row():
     return code
 
 
+def s_direct_document_aggregation():
+    _ensure_kb_table("kb-a", "t1", "p1")
+    _seed_doc("kb-a", "d-direct")
+    parsed = {"kb-a": {"direct-1": {"doc_id": "d-direct", "text": "direct content", "parser_version": "p1"}}}
+    neo = {"kb-a": {"direct-1": {"doc_id": "d-direct", "text": "direct content", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
+    _patch_sources(neo=neo, parsed=parsed, graph=True, vector=False)
+    code = bf.run("kb-a", dry_run=False)
+    _dump_state()
+    return code
+
+
+def s_direct_cas_failure():
+    _ensure_kb_table("kb-a", "t1", "p1")
+    _seed_doc("kb-a", "d-cas")
+    parsed = {"kb-a": {"cas-1": {"doc_id": "d-cas", "text": "cas content"}}}
+    neo = {"kb-a": {"cas-1": {"doc_id": "d-cas", "text": "cas content", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
+    _patch_sources(neo=neo, parsed=parsed, graph=True, vector=False)
+    original = bf._update_projection_state
+    bf._update_projection_state = lambda *args, **kwargs: 0
+    try:
+        code = bf.run("kb-a", dry_run=False)
+    finally:
+        bf._update_projection_state = original
+    _dump_state()
+    return code
+
+
 SCENARIOS = {
     "new_and_degraded": lambda: s_new_and_degraded(),
     "new_and_degraded_rerun": lambda: s_new_and_degraded(),
@@ -420,6 +485,8 @@ SCENARIOS = {
     "unrecoverable_neo_only": s_unrecoverable_neo_only,
     "scope_conflict_new": s_scope_conflict_new,
     "scope_conflict_row": s_scope_conflict_row,
+    "direct_document_aggregation": s_direct_document_aggregation,
+    "direct_cas_failure": s_direct_cas_failure,
     "scope_unresolved": s_scope_unresolved,
     "collection_resolution": s_collection_resolution,
 }

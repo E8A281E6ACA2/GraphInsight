@@ -431,6 +431,24 @@ def section_c(h: Harness) -> None:
 # ---------------------------------------------------------------------------
 
 
+def section_e2(h: Harness) -> None:
+    driver = str(Path("tests") / "m5a_backfill_driver.py")
+    prep_db(h, "bf_direct_agg.db")
+    code, out = h.run(driver, ["--scenario", "direct_document_aggregation"])
+    docs = parse_marker(out, "__DOCS__")
+    doc = next((row for row in docs if row[1] == "d-direct"), None)
+    step("backfill 直接路径写入后聚合文档状态", code == 0 and doc is not None and doc[2] == "indexed" and doc[3] == "stale", f"exit={code} docs={docs}")
+
+    prep_db(h, "bf_direct_cas.db")
+    code, out = h.run(driver, ["--scenario", "direct_cas_failure"])
+    rows = parse_marker(out, "__ROWS__")
+    docs = parse_marker(out, "__DOCS__")
+    doc = next((row for row in docs if row[1] == "d-cas"), None)
+    step("backfill 检查 CAS rowcount=1，失败时保持 OPEN", code == 3 and "state_write_failed=cas-1" in out, f"exit={code} out={out[-500:]}")
+    step("backfill CAS 失败不伪装 indexed", rows and rows[0][1] == "cas-1" and rows[0][5] == "pending", f"rows={rows}")
+    step("backfill CAS 失败仍聚合文档为 pending", doc is not None and doc[2] == "pending" and doc[3] == "pending", f"docs={docs}")
+
+
 def section_d(h: Harness) -> None:
     print("[D] backfill CLI 拒绝路径")
     script = str(Path("admin") / "backfill_chunk_revisions.py")
@@ -457,6 +475,7 @@ def main() -> int:
         section_a(h)
         section_b(h)
         section_c(h)
+        section_e2(h)
         section_d(h)
     print("-" * 60)
     if FAILURES:

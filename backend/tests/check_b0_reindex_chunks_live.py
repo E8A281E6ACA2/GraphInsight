@@ -47,17 +47,10 @@ def _seed(kb_id: str, tenant_id: str, project_id: str, chunk_id: str, doc_id: st
         )
 
 
-def _cleanup(kb_id: str, collection: str) -> None:
-    from admin.database import engine
+def _read_real_projections(kb_id: str, collection: str) -> tuple[dict[str, Any], dict[str, Any]]:
     from config import get_settings
     from neo4j import GraphDatabase
-    from pymilvus import MilvusClient
     from services.vector_store import vector_store
-
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM chunk_revisions WHERE kb_id = :kb"), {"kb": kb_id})
-        conn.execute(text("DELETE FROM admin_jobs WHERE kb_id = :kb"), {"kb": kb_id})
-        conn.execute(text("DELETE FROM knowledge_bases WHERE id = :kb"), {"kb": kb_id})
 
     settings = get_settings()
     driver = GraphDatabase.driver(
@@ -67,13 +60,88 @@ def _cleanup(kb_id: str, collection: str) -> None:
     )
     try:
         with driver.session(database=getattr(settings, "neo4j_database", None) or None) as session:
-            session.run("MATCH (c:Chunk {kb_id: $kb}) DETACH DELETE c", {"kb": kb_id}).consume()
+            neo = session.run(
+                "MATCH (c:Chunk {kb_id: $kb}) RETURN c.chunk_id AS chunk_id, c.text AS text, "
+                "c.kb_id AS kb_id, c.tenant_id AS tenant_id, c.project_id AS project_id, "
+                "c.content_revision AS content_revision",
+                {"kb": kb_id},
+            ).data()
     finally:
         driver.close()
 
     client = vector_store._get_client()
-    if client.has_collection(collection):
-        client.drop_collection(collection)
+    mil = list(
+        client.query(
+            collection_name=collection,
+            filter=f'kb_id == "{kb_id}"',
+            output_fields=["chunk_id", "text", "kb_id", "tenant_id", "project_id", "content_revision", "vector"],
+            limit=10,
+        )
+        or []
+    )
+    return (neo[0] if neo else {}), (mil[0] if mil else {})
+
+
+def _cleanup(kb_id: str, collection: str) -> dict[str, Any]:
+    from admin.database import engine
+    from config import get_settings
+    from neo4j import GraphDatabase
+    from pymilvus import MilvusClient
+    from services.vector_store import vector_store
+
+    report: dict[str, Any] = {"errors": []}
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM chunk_revisions WHERE kb_id = :kb"), {"kb": kb_id})
+            conn.execute(text("DELETE FROM admin_jobs WHERE kb_id = :kb"), {"kb": kb_id})
+            conn.execute(text("DELETE FROM knowledge_bases WHERE id = :kb"), {"kb": kb_id})
+    except Exception as exc:  # noqa: BLE001
+        report["errors"].append(f"pg:{type(exc).__name__}")
+
+    try:
+        settings = get_settings()
+        driver = GraphDatabase.driver(
+            settings.neo4j_uri,
+            auth=(settings.neo4j_user, settings.neo4j_password),
+            connection_timeout=getattr(settings, "neo4j_connection_timeout_seconds", 5.0),
+        )
+        try:
+            with driver.session(database=getattr(settings, "neo4j_database", None) or None) as session:
+                session.run("MATCH (c:Chunk {kb_id: $kb}) DETACH DELETE c", {"kb": kb_id}).consume()
+        finally:
+            driver.close()
+    except Exception as exc:  # noqa: BLE001
+        report["errors"].append(f"neo4j:{type(exc).__name__}")
+
+    try:
+        client = vector_store._get_client()
+        if client.has_collection(collection):
+            client.drop_collection(collection)
+    except Exception as exc:  # noqa: BLE001
+        report["errors"].append(f"milvus:{type(exc).__name__}")
+
+    with engine.connect() as conn:
+        report["pg_remaining"] = int(
+            conn.execute(text("SELECT count(*) FROM chunk_revisions WHERE kb_id = :kb"), {"kb": kb_id}).scalar() or 0
+        )
+    try:
+        settings = get_settings()
+        driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
+        try:
+            with driver.session(database=getattr(settings, "neo4j_database", None) or None) as session:
+                report["neo4j_remaining"] = int(
+                    session.run("MATCH (c:Chunk {kb_id: $kb}) RETURN count(c) AS n", {"kb": kb_id}).single()["n"]
+                )
+        finally:
+            driver.close()
+    except Exception as exc:  # noqa: BLE001
+        report["errors"].append(f"neo4j_verify:{type(exc).__name__}")
+    try:
+        client = vector_store._get_client()
+        report["milvus_collection_remaining"] = bool(client.has_collection(collection))
+    except Exception as exc:  # noqa: BLE001
+        report["errors"].append(f"milvus_verify:{type(exc).__name__}")
+    return report
 
 
 def _create_collection(collection: str) -> None:
@@ -150,13 +218,32 @@ def main() -> int:
             ).one()
         if tuple(row) != ("indexed", "indexed", 1, 1):
             raise RuntimeError(f"unexpected projection state: {tuple(row)}")
+        neo, mil = _read_real_projections(kb_id, collection)
+        for label, projection in (("neo4j", neo), ("milvus", mil)):
+            expected = {
+                "text": "B0 live projection evidence",
+                "kb_id": kb_id,
+                "tenant_id": tenant_id,
+                "project_id": project_id,
+                "content_revision": 1,
+            }
+            if any(projection.get(key) != value for key, value in expected.items()):
+                raise RuntimeError(f"{label} projection mismatch: {projection}")
+        vector = mil.get("vector")
+        if not isinstance(vector, list) or len(vector) != 4:
+            raise RuntimeError(f"milvus vector missing or malformed: {mil}")
         print("B0_LIVE_REAL_OK")
         print(f"collection={collection} kb={kb_id} graph=real neo4j vector=real milvus")
+        print(f"neo4j_readback={neo}")
+        print(f"milvus_readback={{'chunk_id': {mil.get('chunk_id')!r}, 'text': {mil.get('text')!r}, 'kb_id': {mil.get('kb_id')!r}, 'tenant_id': {mil.get('tenant_id')!r}, 'project_id': {mil.get('project_id')!r}, 'content_revision': {mil.get('content_revision')!r}, 'vector_dim': {len(vector)}}}")
         print("embedding=deterministic-local test vector; no external embedding request")
         return 0
     finally:
         try:
-            _cleanup(kb_id, collection)
+            cleanup = _cleanup(kb_id, collection)
+            print(f"cleanup_residuals={cleanup}")
+            if cleanup.get("errors") or cleanup.get("pg_remaining") or cleanup.get("neo4j_remaining") or cleanup.get("milvus_collection_remaining"):
+                raise RuntimeError(f"cleanup residuals: {cleanup}")
         finally:
             vector_store.config = original_config
             embedding_service.embed_texts = original_embed
