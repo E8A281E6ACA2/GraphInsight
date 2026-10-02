@@ -180,13 +180,17 @@
   凭据化（样本仍写临时文件喂扫描器，断言语义不变）→ 复跑 `43/0`、守卫 `16/0`、守卫 stdout 落盘复扫
   `findings=0`。复现取证：沙箱重跑旧自检并按 CI 参数扫其 stdout，7 条 `match_sha256`
   与该 run 逐条相同（口径为整段 `match.group(0)` 取哈希，见 check_artifact_secrets.py:184）。
-- [ ] 遗留：`SECRET_SCAN_SUMMARY` 新增三键（`shape_scanned_files`/`shape_excluded_files`/
-  `exclude_rules`）的 **CI 绿态实跑取值仍未取到**。run#36939737132 虽给到
-  `shape_scanned_files=5 shape_excluded_files=1 exclude_rules=8`，但该运行整体为红，只能证明"CI 里
-  确实按新参数执行并计数"，不能当绿灯证据；6 个 scanner step 全在 `workflow_dispatch` 档 job，
-  push 档一条不执行，且 `perf-probe` 腿只扫 `artifacts` 不覆盖 minified 产物；要补这条需在修复推送后
-  重新触发一次真实 dispatch 运行。已知代价两条（`Pa(ss)word` 形态不报、
-  排除路径不扫赋值形状）详见 `docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md` §9.11。
+- [x] dispatch 绿态取证（2026-10-02，报告 §9.11.2）：修复推送 `f41f4ef` 后重新触发 run#36942264746
+  （`run_release_acceptance=true`）→ 结论 **success**，step 16
+  `SECRET_SCAN_SUMMARY paths=4 files=6 shape_scanned_files=5 shape_excluded_files=1 exclude_rules=8
+  credential_env_vars=2 allowed_fixtures=3 findings=0 result=pass`，同 job
+  `assertions=43 failed=0`、`SUMMARY total=16 failed=0`。新 SUMMARY 三键的 CI 实跑取值至此闭合。
+- [ ] 遗留（绿态运行新暴露，需授权后动 workflow）：step 16 打印
+  `SECRET_SCAN_NOTE env_var_unset name=ADMIN_TOKEN`——该 step 请求三个 `--secret-env-var`，
+  实际只有 2 个有值参与字面值比对，即"本轮注入 admin token 不得进产物"这条在该 step 上未真正生效。
+  属 CI 凭据注入时机 / step 顺序问题，修复会改变 CI 判定面，未擅自改动。
+  同口径的另一条未覆盖：CI 没有 `--no-default-excludes`（全量赋值形状）step，
+  排除范围与赋值形状层的联合效果目前只在本地自检矩阵成立。
 
 ## 最新联调记录（2026-09-28，M4-R1 步骤 3：前端调用方迁移）
 

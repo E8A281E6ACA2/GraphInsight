@@ -450,8 +450,16 @@ old=10 → new=9（本门禁职责不含源码树，该数值只用于说明字�
    §9.11.2 轮次复测：写初稿时一度把"键名冒号 + 双引号包值"那条正样本**原样贴进正文**，本报告自身命中
    由 9 升到 10、两份文档合计 10 升到 12；发现后把该处改写为形状描述、不保留字面量，复测回到
    本报告 9 + roadmap 1 = `findings=10`，两份文档扫描字节 86574 → 93318。
-   同轮把 M5-A 修复验收报告一并纳入对照（该文档自身 1 条），三份文档合计 `findings=12`——
-   数字上升全部来自文档化的合成样本，无真凭据，且这三份文档都不在 CI 扫描路径内。
+   同轮把 M5-A 修复验收报告一并纳入对照（该文档自身 1 条），并补入审计复核内容包
+   `docs/ENTERPRISE_AUDIT_REVIEW_PACKAGE_M5A.md`（该包自身 `findings=0`，写法即按"文本对门禁安静"执行）：
+   四份文档合计 `findings=11`（本报告 9 + roadmap 1 + M5-A 报告 1 + 审计包 0）。
+   数字上升全部来自文档化的合成样本，无真凭据，且这四份文档都不在 CI 扫描路径内。
+6. **CI 字面值层存在"参数为空即失效"的窗口（绿态运行暴露，本轮未修）**：run `36942264746`
+   的 step 16 打印 `SECRET_SCAN_NOTE env_var_unset name=ADMIN_TOKEN`，说明该 step 请求的三个
+   `--secret-env-var` 里 `ADMIN_TOKEN` 当时无值，实际只有 2 个参与字面值比对。
+   即"本轮注入的 admin token 不得出现在产物里"这条约束在该 step 上未真正生效。
+   这是 workflow 侧凭据注入时机与 step 顺序问题，修法要改 CI 判定面（新增/调整 step），
+   需明确授权后再动；本条先点名登记，不当作已通过。
 
 **接线**：`run_unified_boundary_guards.py` 新增 case `secret_scanner_selftest`，本地复跑
 `SUMMARY total=16 failed=0`（该 case 3.5s）；`.github/workflows/ci.yml` 的
@@ -493,7 +501,7 @@ Linux runner 上的断言数与本地 Windows（系统 Python 3.14 + `PYTHONUTF8
 `Compile smoke and perf scripts` step 命令行已含
 `backend/tests/check_artifact_secrets_selftest.py` 且该 job 通过，即自检文件在 CI 侧可编译。
 
-**这条腿仍未闭合（不得写成"CI 已验证"）**：`SECRET_SCAN_SUMMARY` 的新增三键
+**这条腿当时仍未闭合（原文保留，闭合过程见 §9.11.2）**：`SECRET_SCAN_SUMMARY` 的新增三键
 `shape_scanned_files` / `shape_excluded_files` / `exclude_rules` 在 CI 里的实跑取值仍未取到——
 调用 `check_artifact_secrets.py` 的 6 个 step 全在 `workflow_dispatch` 档 job
 （release-frontend-e2e、release-acceptance、rollback-matrix、frontend-e2e、perf-probe、perf-soak），
@@ -553,16 +561,40 @@ CI 真实命中集合里没有它。
 3. 复跑：`assertions=43 failed=0 result=pass`；守卫套件 `SUMMARY total=16 failed=0`；
    并额外把守卫自己的 stdout 落盘复扫 → `findings=0 result=pass`。
 
-**仍未闭合（不得提前写成"CI 已验证"）**：run `36939737132` 虽然是唯一一次拿到
-`SECRET_SCAN_SUMMARY` 新键实跑取值的运行（`shape_scanned_files=5 / shape_excluded_files=1 /
-exclude_rules=8`），但那次运行整体是**红的**，因此这组数值**只能作为"扫描器在 CI 里确实按新参数
-执行并计数"的证据，不能作为"门禁绿灯"的证据**。绿态取值必须在修复推送后重新触发 dispatch 获取，
-取到之前 §9.11.1 的边界表述维持不变。
+**这条腿的取证状态分两段记录（不因后来的绿态回溯美化红态）**：
+run `36939737132`（红）虽是第一次拿到新键实跑取值（`shape_scanned_files=5 / shape_excluded_files=1 /
+exclude_rules=8`），但那次运行整体红，当时**不能**当门禁绿灯证据使用。修复推送后重新触发
+run `36942264746`（event=workflow_dispatch，`run_release_acceptance=true`，headSha=`f41f4ef`），
+结论 **success**，step 16 关键行：
 
-另需注意：`shape_scanned_files=5` 与"CI 扫描目标目录全在排除清单内"的推论并不矛盾——那 5 个参与
-赋值形状扫描的文件来自 `artifacts/release-acceptance/`（含被 withholds 的守卫 stdout），
-而 `frontend/playwright-report` 内的产物走的是排除分支（`shape_excluded_files=1`）。
-换言之：**这次意外把"排除层之外还有真实扫描面"这件事证明了**，也正好是已知代价 2 的反面案例。
+```text
+SECRET_SCAN_NOTE env_var_unset name=ADMIN_TOKEN
+SECRET_SCAN_NOTE shape_assignment_skipped_files=1 scope=bundled/minified_artifacts layers_still_scanned=run_credential,jwt,dsn,bcrypt
+SECRET_SCAN_SUMMARY paths=4 files=6 bytes=690679 shape_scanned_files=5 shape_excluded_files=1 exclude_rules=8 credential_env_vars=2 allowed_fixtures=3 findings=0 result=pass
+SECRET_SCAN_SELFTEST_SUMMARY assertions=43 failed=0 result=pass   （同一 job 的守卫 step）
+SUMMARY total=16 failed=0
+```
+
+因此 §9.11.1 那句"新 SUMMARY 键仅有本地取证"可以升级为：**CI 已实跑并取得绿态取值**。
+job 明细：Go backend tests、Backend unified boundary guards、Backend smoke script syntax、
+Frontend build、Full release acceptance (self-contained stack) 全 success，其余 6 个未启用的
+dispatch job skipped。
+
+**绿态证明的是哪一条、没证明哪一条（重要）**：
+1. 证明了扫描器在 CI 里按新参数执行、计数自洽（`shape_scanned + shape_excluded = files`：5 + 1 = 6），
+   且**门禁对自己的测试输出保持安静**——这正是 §9.11.2 那次回归的反面试剂，现在它是绿的。
+2. 没有增强拦截力本身。`files=6` 里只有 1 个文件走排除分支（一个 bundled/minified 产物），
+   其余 5 个参与赋值形状扫描（来自 `artifacts/release-acceptance/` 与 `logs/dev/`）；
+   `frontend/playwright-report`、`frontend/test-results` 本身在默认排除清单内，
+   所以赋值形状层在那两条腿上不参与判定（与已知代价 2 同一口径）。
+3. **一个新暴露的弱点（如实记录，不粉饰）**：`SECRET_SCAN_NOTE env_var_unset name=ADMIN_TOKEN`
+   说明该 step 请求的三个 `--secret-env-var` 里 `ADMIN_TOKEN` 当时没有值，
+   实际只有 2 个（`credential_env_vars=2`）参与字面值比对。也就是说"本轮注入的 admin token 字面值
+   不得出现在产物里"这条约束在该 step 上**没有真正生效**，因为参数值为空。
+   这不是形状层的问题，而是 CI 侧凭据注入时机与该 step 的顺序问题；修复需要改动 workflow
+   的凭据注入/step 顺序（属新增判定面），本轮**未擅自改**，留作待办并在此点名。
+4. CI 侧没有 `--no-default-excludes`（全量赋值形状）的 step；排除范围与赋值形状层的联合效果
+   目前只在本地自检矩阵成立。要在 CI 侧也覆盖这条，需要新增 dispatch step，同样待批准。
 
 **M5-A 契约矩阵的复跑口径补充**：本轮首次运行 `backend/tests/check_m5a_revision_backfill.py`
 得 `108 pass / 2 fail`，失败用例的报错是子进程 `importlib.get_data` 抛 `MemoryError` 后建表未完成，
