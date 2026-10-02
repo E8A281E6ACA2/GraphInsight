@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 # §6.2 聚合优先级：failed > stale/skipped > pending > indexed
 PROJECTION_PRIORITY = {"failed": 0, "stale": 1, "skipped": 1, "pending": 2, "indexed": 3}
@@ -19,6 +19,11 @@ def _engine():
     from admin.database import engine
 
     return engine
+
+
+def _document_table_exists(conn) -> bool:
+    """Return false only when the document status table has not been migrated."""
+    return bool(inspect(conn).has_table("knowledge_base_documents"))
 
 
 def update_projection_state(
@@ -76,9 +81,7 @@ def aggregate_document_states(kb_id: str, doc_ids: List[str]) -> List[Dict[str, 
     if not clean_doc_ids:
         return []
     with _engine().begin() as conn:
-        try:
-            conn.execute(text("SELECT 1 FROM knowledge_base_documents LIMIT 1"))
-        except Exception:  # noqa: BLE001 - migration may not have created document table yet
+        if not _document_table_exists(conn):
             return []
         rows = conn.execute(
             text(
