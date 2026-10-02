@@ -125,24 +125,15 @@ class Inventory:
 
 
 def _graph_capability_enabled() -> bool:
-    return bool(getattr(settings, "llm_enabled", False))
+    from services.runtime_config import get_projection_capabilities
+
+    return bool(get_projection_capabilities()["graph"])
 
 
 def _vector_capability_enabled() -> bool:
-    try:
-        from services.runtime_config import get_embedding_runtime_config, get_vector_store_runtime_config
+    from services.runtime_config import get_projection_capabilities
 
-        embedding = get_embedding_runtime_config()
-        store = get_vector_store_runtime_config()
-    except Exception:
-        embedding = {
-            "enabled": bool(getattr(settings, "embedding_enabled", False)),
-            "api_key": getattr(settings, "llm_api_key", "") or getattr(settings, "openai_api_key", ""),
-        }
-        store = {"enabled": bool(getattr(settings, "vector_store_enabled", False))}
-    return bool(embedding.get("enabled")) and bool(str(embedding.get("api_key") or "").strip()) and bool(
-        store.get("enabled")
-    )
+    return bool(get_projection_capabilities()["vector"])
 
 
 def _sha256(value: str) -> str:
@@ -788,29 +779,20 @@ def _update_projection_state(
     vector_status: Optional[str] = None,
     vector_content_revision: Optional[int] = None,
 ) -> None:
-    assignments: List[str] = []
-    params: Dict[str, Any] = {"kb_id": kb_id, "chunk_id": chunk_id}
-    if graph_status is not None:
-        assignments.append("graph_status = :graph_status")
-        params["graph_status"] = graph_status
-        assignments.append("graph_content_revision = :graph_content_revision")
-        params["graph_content_revision"] = graph_content_revision
-    if vector_status is not None:
-        assignments.append("vector_status = :vector_status")
-        params["vector_status"] = vector_status
-        assignments.append("vector_content_revision = :vector_content_revision")
-        params["vector_content_revision"] = vector_content_revision
-    if not assignments:
-        return
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                f"UPDATE chunk_revisions SET {', '.join(assignments)} "
-                "WHERE kb_id = :kb_id AND chunk_id = :chunk_id AND content_revision = 1 "
-                "AND revision_status = 'current'"
-            ),
-            params,
-        )
+    """落投影状态。backfill 只处理本轮新建的 revision 1 行，故 CAS 固定在 revision 1；
+    与 reindex worker 共用 services.chunk_projection_state 的同一份回写实现。
+    """
+    from services.chunk_projection_state import update_projection_state
+
+    update_projection_state(
+        kb_id,
+        chunk_id,
+        expected_revision=1,
+        graph_status=graph_status,
+        graph_content_revision=graph_content_revision,
+        vector_status=vector_status,
+        vector_content_revision=vector_content_revision,
+    )
 
 
 def _enqueue_reindex_jobs(targets: List[Dict[str, Any]], trace_id: str) -> Dict[str, int]:

@@ -35,11 +35,12 @@ JOB_STATUS_CANCELLED = "cancelled"
 
 ALLOWED_RETRY_FROM = {JOB_STATUS_FAILED, JOB_STATUS_CANCELLED}
 ALLOWED_CANCEL_FROM = {JOB_STATUS_PENDING, JOB_STATUS_RUNNING}
-SUPPORTED_JOB_TYPES = {"build_graph", "clear_kb", "reindex"}
-RUNNABLE_JOB_TYPES = {"build_graph", "clear_kb", "reindex"}
+SUPPORTED_JOB_TYPES = {"build_graph", "clear_kb", "reindex", "reindex_chunks"}
+RUNNABLE_JOB_TYPES = {"build_graph", "clear_kb", "reindex", "reindex_chunks"}
 # 知识数据类任务：创建时必须携带 kb_id 且 KB 必须存在且为 active；
 # reindex 只重建 Neo4j 全文索引（基础设施操作），kb_id 可选。
-KB_SCOPED_JOB_TYPES = {"build_graph", "clear_kb"}
+# reindex_chunks 是 chunk 投影重建（§8.2），targets 必须限定在单个 kb 内 → 归知识数据类。
+KB_SCOPED_JOB_TYPES = {"build_graph", "clear_kb", "reindex_chunks"}
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:

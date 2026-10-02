@@ -6,6 +6,9 @@
 
 reindex 例外：它只重建 Neo4j 全文索引，属于基础设施操作而非知识数据操作，
 不携带知识数据作用域（缺失 kb_id 不报错）。
+
+reindex_chunks（M5-B0）：chunk 投影重建，属知识数据操作，同样要求 payload 冻结
+kb_id/tenant_id/project_id + 显式 targets（设计 §8.2/§15.2）。
 """
 from __future__ import annotations
 
@@ -89,6 +92,8 @@ def execute_job(*, job_id: int, job_type: str, payload: Dict[str, Any]) -> Dict[
         return execute_build_graph(job_id=job_id, payload=payload)
     if job_type == "clear_kb":
         return execute_clear_kb(job_id=job_id, payload=payload)
+    if job_type == "reindex_chunks":
+        return execute_reindex_chunks(job_id=job_id, payload=payload)
     if job_type == "reindex":
         return execute_reindex(job_id=job_id, payload=payload)
     raise ValidationException(f"任务类型暂不支持执行: {job_type}")
@@ -170,6 +175,18 @@ def execute_build_graph(*, job_id: int, payload: Dict[str, Any]) -> Dict[str, An
         "stats": stats,
         "failures": failures,
     }
+
+
+def execute_reindex_chunks(*, job_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """重建 chunk 的 Neo4j/Milvus 投影（设计 §8.2）。
+
+    与 `execute_reindex` 严格区分：后者只重建 Neo4j 全文索引（基础设施操作、不带知识
+    数据作用域），本任务必须先由 require_payload_scope 冻结 kb/tenant/project 才允许动投影。
+    """
+    scope = require_payload_scope(payload)
+    from services.chunk_projection_reindex import reindex_chunks
+
+    return reindex_chunks(job_id=job_id, payload=payload, scope=scope)
 
 
 def _remove_empty_dirs(root: Path) -> int:

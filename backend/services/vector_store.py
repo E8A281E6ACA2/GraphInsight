@@ -38,6 +38,8 @@ class VectorChunk:
     tenant_id: str = ""
     project_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # §8.5：投影版本号必须是 collection 的显式 INT64 字段，不能只进 dynamic metadata。
+    content_revision: Optional[int] = None
 
 
 @dataclass
@@ -52,6 +54,7 @@ class MilvusVectorStore:
         self._client = None
         self._client_key: Optional[tuple[str, str, str]] = None
         self._collection_ready = False
+        self._revision_field: Dict[str, bool] = {}
 
     def config(self) -> Dict[str, Any]:
         cfg = get_vector_store_runtime_config()
@@ -173,28 +176,68 @@ class MilvusVectorStore:
 
         import json
 
+        if any(chunk.content_revision is not None for chunk in chunks):
+            if not self.has_content_revision_field(collection):
+                # §8.5 冻结：没有显式字段就禁止写版本（写进去只会进 dynamic metadata，
+                # 类型与查询都不可靠）。拒写而不是降级写入，投影由调用方保持未收敛状态。
+                raise RuntimeError(
+                    f"Milvus collection {collection} 缺少显式 content_revision 字段，"
+                    "禁止把投影版本号写入 dynamic metadata；请按 §8.5/§15.4 迁移到 "
+                    "graphinsight_chunks_v3 后重建向量"
+                )
+
         rows = []
         for chunk, vector in zip(chunks, vectors):
-            rows.append(
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "doc_id": chunk.doc_id,
-                    "text": (chunk.text or "")[:4096],
-                    "title": (chunk.title or "")[:512],
-                    "location": (chunk.location or "")[:128],
-                    "content_hash": (chunk.content_hash or "")[:80],
-                    "embedding_model": (chunk.embedding_model or "")[:128],
-                    "entities_json": json.dumps(chunk.entities or [], ensure_ascii=False)[:2048],
-                    "vector": vector,
-                    **(chunk.metadata or {}),
-                    # 作用域以 VectorChunk 显式字段为准，元数据不能覆盖
-                    "kb_id": chunk.kb_id,
-                    "tenant_id": chunk.tenant_id,
-                    "project_id": chunk.project_id,
-                }
-            )
+            row = {
+                "chunk_id": chunk.chunk_id,
+                "doc_id": chunk.doc_id,
+                "text": (chunk.text or "")[:4096],
+                "title": (chunk.title or "")[:512],
+                "location": (chunk.location or "")[:128],
+                "content_hash": (chunk.content_hash or "")[:80],
+                "embedding_model": (chunk.embedding_model or "")[:128],
+                "entities_json": json.dumps(chunk.entities or [], ensure_ascii=False)[:2048],
+                "vector": vector,
+                **(chunk.metadata or {}),
+                # 作用域与版本号以 VectorChunk 显式字段为准，元数据不能覆盖
+                "kb_id": chunk.kb_id,
+                "tenant_id": chunk.tenant_id,
+                "project_id": chunk.project_id,
+            }
+            if chunk.content_revision is not None:
+                row["content_revision"] = int(chunk.content_revision)
+            rows.append(row)
         client.upsert(collection_name=collection, data=rows)
         return len(rows)
+
+    def has_content_revision_field(self, collection: Optional[str] = None) -> bool:
+        """collection 是否有显式 `content_revision` 字段（§8.5 v3 判据）。
+
+        结果按 collection 名缓存：schema 在运行期不会自变，重复 describe 只增加延迟。
+        """
+        target = str(collection or self.config().get("collection") or "").strip()
+        if not target:
+            return False
+        cached = self._revision_field.get(target)
+        if cached is not None:
+            return cached
+        supported = False
+        try:
+            client = self._get_client()
+            if client.has_collection(target):
+                description = client.describe_collection(target)
+                fields = description.get("fields") if isinstance(description, dict) else None
+                names = {
+                    str(item.get("name") or "")
+                    for item in (fields or [])
+                    if isinstance(item, dict)
+                }
+                supported = "content_revision" in names
+        except Exception as exc:  # noqa: BLE001 - 探测失败按“不支持”处理，宁可拒写不误写
+            logger.warning("探测 Milvus content_revision 字段失败", context={"collection": target, "error": str(exc)})
+            supported = False
+        self._revision_field[target] = supported
+        return supported
 
     def delete_doc(self, doc_id: str, kb_id: str) -> None:
         clean_kb = normalize_scope_id("kb_id", kb_id)
