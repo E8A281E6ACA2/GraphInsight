@@ -464,6 +464,34 @@ def s_direct_cas_failure():
     return code
 
 
+def s_backfill_document_aggregation_failure():
+    _ensure_kb_table("kb-a", "t1", "p1")
+    _seed_doc("kb-a", "d-agg-error")
+    parsed = {"kb-a": {"agg-1": {"doc_id": "d-agg-error", "text": "aggregate error content"}}}
+    neo = {"kb-a": {"agg-1": {"doc_id": "d-agg-error", "text": "aggregate error content", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
+    _patch_sources(neo=neo, parsed=parsed, graph=True, vector=False)
+    import services.chunk_projection_state as state
+
+    original = state.aggregate_document_states
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("document aggregation database unavailable")
+
+    state.aggregate_document_states = fail
+    try:
+        bf.run("kb-a", dry_run=False)
+    except Exception as exc:  # noqa: BLE001 - aggregation failure must escape run()
+        print("__AGGREGATION_ERROR__" + json.dumps({"type": type(exc).__name__, "message": str(exc)}, ensure_ascii=False))
+        code = 1
+    else:
+        print("__AGGREGATION_ERROR__" + json.dumps({"type": None}, ensure_ascii=False))
+        code = 0
+    finally:
+        state.aggregate_document_states = original
+    _dump_state()
+    return code
+
+
 SCENARIOS = {
     "new_and_degraded": lambda: s_new_and_degraded(),
     "new_and_degraded_rerun": lambda: s_new_and_degraded(),
@@ -487,6 +515,7 @@ SCENARIOS = {
     "scope_conflict_row": s_scope_conflict_row,
     "direct_document_aggregation": s_direct_document_aggregation,
     "direct_cas_failure": s_direct_cas_failure,
+    "backfill_document_aggregation_failure": s_backfill_document_aggregation_failure,
     "scope_unresolved": s_scope_unresolved,
     "collection_resolution": s_collection_resolution,
 }

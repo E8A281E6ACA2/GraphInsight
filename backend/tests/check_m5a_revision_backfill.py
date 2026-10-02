@@ -448,6 +448,18 @@ def section_e2(h: Harness) -> None:
     step("backfill CAS 失败不伪装 indexed", rows and rows[0][1] == "cas-1" and rows[0][5] == "pending", f"rows={rows}")
     step("backfill CAS 失败仍聚合文档为 pending", doc is not None and doc[2] == "pending" and doc[3] == "pending", f"docs={docs}")
 
+    prep_db(h, "bf_agg_error.db")
+    code, out = h.run(driver, ["--scenario", "backfill_document_aggregation_failure"])
+    aggregation_error = parse_marker(out, "__AGGREGATION_ERROR__")
+    step(
+        "backfill 文档聚合异常向上抛出且不报告 CLOSED",
+        code == 1
+        and aggregation_error.get("type") == "RuntimeError"
+        and "document aggregation database unavailable" in str(aggregation_error.get("message"))
+        and "✓ backfill 完成，前置门 CLOSED" not in out,
+        f"exit={code} error={aggregation_error} out={out[-500:]}",
+    )
+
 
 def section_d(h: Harness) -> None:
     print("[D] backfill CLI 拒绝路径")

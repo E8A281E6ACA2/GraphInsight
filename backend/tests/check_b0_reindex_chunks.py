@@ -439,6 +439,24 @@ def section_e(h: Harness) -> None:
     step("含未涉及 chunk 的文档 graph=failed、vector=pending", docs.get("doc-mixed") == {"graph_status": "failed", "vector_status": "pending"}, f"docs={docs}")
     step("跨 doc_id 的 targets 都按行处理（未涉及块不被牵连）", rev_map(out).get("b-2", {}).get("graph_status") == "pending" and rev_map(out).get("b-1", {}).get("graph_status") == "failed" and rev_map(out).get("a-1", {}).get("graph_status") == "failed", f"revs={rev_map(out)}")
 
+    out = scenario(h, "doc_table_missing.db", "doc_table_missing_compat")
+    aggregate = obj_marker(out, "__AGGREGATION__")
+    step("文档表尚未迁移时聚合兼容返回空", aggregate.get("result") == [], f"aggregate={aggregate}")
+
+    out = scenario(h, "doc_aggregation_error.db", "doc_aggregation_db_failure")
+    aggregate_error = obj_marker(out, "__AGGREGATION_ERROR__")
+    step("文档聚合数据库异常向上抛出", aggregate_error.get("type") == "RuntimeError", f"error={aggregate_error}")
+
+    out = scenario(h, "worker_doc_aggregation_error.db", "worker_doc_aggregation_failure")
+    worker_error = exception_of(out)
+    step(
+        "worker 文档聚合异常不得报告成功",
+        worker_error.get("type") == "RuntimeError"
+        and parse_marker(out, "__RESULT__", None) is None
+        and "document aggregation database unavailable" in str(worker_error.get("code")),
+        f"error={worker_error} out={out[-400:]}",
+    )
+
 
 # ---------------------------------------------------------------------------
 # F. 索引侧真实代码路径（非 mock）

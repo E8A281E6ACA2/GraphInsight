@@ -417,6 +417,51 @@ def scenario_doc_aggregation() -> None:
     )
 
 
+def scenario_doc_table_missing_compat() -> None:
+    from services.chunk_projection_state import aggregate_document_states
+
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE knowledge_base_documents"))
+    result = aggregate_document_states(KB, [DOC])
+    print("__AGGREGATION__" + json.dumps({"result": result}, ensure_ascii=False))
+
+
+def scenario_doc_aggregation_db_failure() -> None:
+    import services.chunk_projection_state as state
+
+    original = state._document_table_exists
+
+    def fail(_conn):
+        raise RuntimeError("document aggregation database unavailable")
+
+    state._document_table_exists = fail
+    try:
+        state.aggregate_document_states(KB, [DOC])
+    except Exception as exc:  # noqa: BLE001 - assert database errors propagate
+        print("__AGGREGATION_ERROR__" + json.dumps({"type": type(exc).__name__, "message": str(exc)}, ensure_ascii=False))
+    else:
+        print("__AGGREGATION_ERROR__" + json.dumps({"type": None}, ensure_ascii=False))
+    finally:
+        state._document_table_exists = original
+
+
+def scenario_worker_doc_aggregation_failure() -> None:
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1")
+    _install()
+    original = worker.aggregate_document_states
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("document aggregation database unavailable")
+
+    worker.aggregate_document_states = fail
+    try:
+        _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+    finally:
+        worker.aggregate_document_states = original
+
+
 def scenario_dispatch_separation() -> None:
     """reindex（全文索引）与 reindex_chunks 必须各走各的分支，不能互相顶替。"""
     marker = {"chunk": 0, "fulltext": 0}
@@ -627,6 +672,9 @@ SCENARIOS = {
     "idempotent_rerun": scenario_idempotent_rerun,
     "cross_kb_isolation": scenario_cross_kb_isolation,
     "doc_aggregation": scenario_doc_aggregation,
+    "doc_table_missing_compat": scenario_doc_table_missing_compat,
+    "doc_aggregation_db_failure": scenario_doc_aggregation_db_failure,
+    "worker_doc_aggregation_failure": scenario_worker_doc_aggregation_failure,
     "dispatch_separation": scenario_dispatch_separation,
     "existing_fields_merge": scenario_existing_fields_merge,
     "upsert_guard": scenario_upsert_guard_blocks_dynamic_field,
