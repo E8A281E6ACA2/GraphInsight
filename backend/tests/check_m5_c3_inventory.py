@@ -9,7 +9,7 @@ from types import SimpleNamespace
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
-from admin.report_m5_c3_inventory import c3_report
+from admin.report_m5_c3_inventory import _resolve_targets, c3_report
 
 
 def main() -> int:
@@ -45,8 +45,13 @@ def main() -> int:
         milvus_collection="graphinsight_chunks_v2",
         milvus_revision_field=False,
     )
-    report = c3_report(inventory, {"closed": False, "needs_reindex": 1, "blocked": 1})
+    report = c3_report(
+        inventory,
+        {"closed": False, "needs_reindex": 1, "blocked": 1},
+        "archived",
+    )
     assert report["kb_id"] == "kb-a"
+    assert report["kb_status"] == "archived"
     assert report["inventory_gate"]["closed"] is False
     assert report["shared_production_gate"] == "OPEN"
     assert report["counts"] == {
@@ -60,6 +65,18 @@ def main() -> int:
     assert report["c3"]["blocked"][0]["chunk_id"] == "blocked-1"
     assert report["c3"]["orphan_revisions"] == [{"chunk_id": "orphan-1", "reason": "ORPHAN_REVISION"}]
     assert report["needs_reindex_targets"][0]["target_revision"] == 3
+    assert _resolve_targets(
+        {"kb-active": "active", "kb-archived": "archived", "kb-deleting": "deleting"},
+        [],
+    ) == [
+        ("kb-active", "active"),
+        ("kb-archived", "archived"),
+        ("kb-deleting", "deleting"),
+    ]
+    assert _resolve_targets({"kb-active": "active"}, ["kb-active", "kb-missing"]) == [
+        ("kb-active", "active"),
+        ("kb-missing", "unregistered"),
+    ]
     print("C3_INVENTORY_CONTRACT_OK")
     return 0
 
