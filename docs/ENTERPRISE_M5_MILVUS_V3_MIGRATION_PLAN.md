@@ -97,11 +97,22 @@ S3  稳态：读写皆 v3，v2 只读留存备回滚       —— GATED
 
 ### 5.1 §8.5 单目标 schema canary（当前代码可做，但仍 GATED）
 目的：在**隔离的合成 KB**上证明——v3 能被现网代码建出、`content_revision` 是显式 INT64、
-upsert→直接读回 revision 正确、幂等重跑不翻倍、v2 零改动。
-- 作用域：合成 `kb_id`（如 `canary-synthetic-<rand>`），**无任何生产读流量指向它**。
-- 读写同源：该合成 kb 读源=写源=同一 v3 collection，不违反 §16.1 不变量（生产读写仍 v2）。
-- 仍需授权：它**确实向 Milvus 写入**，故标 `GATED / NOT-EXECUTED`，本文档不执行。
-- 它**不**证明双写、不证明切换安全——只是建集合与字段契约的冒烟。
+upsert→直接读回 revision 正确、幂等重跑不翻倍。
+
+- **运行形态（硬约束）：必须在独立进程 / 专用一次性脚本里跑，自带一份指向合成
+  collection 的连接配置；绝不修改共享 runtime config——不得 flip 现网服务的
+  `vector_store.collection`、不得热改配置中心、不得改任何被生产读写的单例。** 现网代码只是
+  被这段脚本"以独立实例"复用（`VectorStore(...)` 传入合成 collection 名），生产进程全程不动。
+- 作用域：合成 `kb_id`（如 `canary-synthetic-<rand>`）+ 合成 collection（如
+  `graphinsight_chunks_v3_canary_<rand>`），**无任何生产读流量指向它，也不与生产 collection
+  同名**。
+- 读写同源：该合成 collection 读源=写源=同一个 v3 目标，不违反 §16.1 不变量（生产读写全程
+  停在 v2、配置未变）。
+- 仍需授权：它**确实向 Milvus 写入**（建集合 + upsert 合成数据），故标
+  `GATED / NOT-EXECUTED`，本文档不执行；执行前后必须断言共享 config 文件与生产 collection
+  字节级零变化。
+- 它**不**证明双写、不证明切换安全——只是"隔离进程里建集合与字段契约"的冒烟，且必须可被
+  事后销毁（只 drop 合成 collection，绝不碰 v2 / 生产 v3 目标）。
 
 ### 5.2 双写 / 切换 canary（被阻塞，禁止宣称闭环）
 目的：证明 S1 双写一致性与 S2 切换后检索无损。
@@ -111,7 +122,7 @@ upsert→直接读回 revision 正确、幂等重跑不翻倍、v2 零改动。
 
 ---
 
-## 6. 验收判据（迁移前/后对照，per-KB）
+## 6. 验收判据（写冻结水位 / 一致性对账，per-KB）
 
 对每个真实 KB（迁移窗口内，非合成 canary），逐 KB 记录：
 
@@ -121,7 +132,16 @@ upsert→直接读回 revision 正确、幂等重跑不翻倍、v2 零改动。
 - 幂等：同一批次 upsert 重跑，v3_count 不增、无重复主键。
 - 直接读回（Neo4j/Milvus 双侧）：QA citation 的 current/indexed revision 语义与 §11 对齐，
   无 stale 命中回升。
-- v2 零改动证明：迁移前后 v2 的 per-KB count 与抽样 revision 不变（回滚落脚点完好）。
+- **对账口径改写**（替换"v2 零改动"）：真实 KB 在 S1 双写窗口内 v2 **本就持续被写**，"v2 前后
+  count/revision 不变"不是有效判据、会自相矛盾。改用**写冻结水位对账**：
+  - 迁移前记录该 KB 的**冻结点** `W0 = max(content_revision)`（及 per-KB chunk 计数快照）；
+  - 切读前对每个 KB 施加**写冻结**（§16.1 回滚五步里的同一步），使 `content_revision` 停在
+    水位 `W1`，禁止新写进入；
+  - 对账 `v3 已覆盖到 W1`：per-KB 逐 chunk `v3.content_revision == 当前投影 revision`，且
+    `v3_count == W1 时的期望 chunk 数`；
+  - **v2 只需作为"到 W0/W1 为止的合法回滚点"被验证可读**，不要求 count 不变——校验"v2 能
+    读到 ≤W1 的全部历史"即可，不比对"前后是否相等"。
+  - 解冻后新增 revision 由 `dual_write` 保证 v2/v3 同步，无需再断言 v2 静止。
 - 残留检查：`scope_mismatches / orphan_revisions / unrecoverable / scope_unresolved` 归零或
   进入 §7 的显式处置清单，不得静默吸收。
 - 每个写步骤执行前后各打印一次 C3 全状态汇总（`C3_SUMMARY`，含 by_status/c3_totals/
