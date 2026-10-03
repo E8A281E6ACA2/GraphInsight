@@ -465,3 +465,98 @@ cd backend && PYTHONPATH=. python tests/check_m5a_live_execution.py            #
     §6.1 增该运行、§6.3 由"未闭合"改写为"已闭合，但闭合的是哪一条"；
     §2.4 的断言引用改为本轮 110 项矩阵复跑原文（初稿凭记忆写的三条标签不准确，已勘误），
     §2.3 活栈断言名标明"取自源文件，实跑记录见报告 §3.3"。
+  - v1.3（2026-10-02）：追加 §11——验收基础设施整改轮（UTF-8 链 + 复跑取证 + M5-A/M5-B 依赖方案）；
+    §11.6 对本包 §7 与报告 §6 的"门收敛在 M5-B 之前不可能取证"作**措辞勘误**（前置是 M5-B0 + Milvus v3，不是整个 M5-B），
+    §11.5 澄清一条扫描命中的实际形态（已打码，非泄露）。**立场与结论未变**。
+
+---
+
+## 11. 追加轮：验收基础设施整改（2026-10-02，UTF-8 链 / 复跑取证 / 依赖方案）
+
+### 11.1 交付范围与 git 状态
+
+| 笔 | 内容 | 类型 |
+| --- | --- | --- |
+| `7c1ccba` | 5 个验收脚本自强制 UTF-8 + `returncode` 断言 + 失败全量转储 + 静态防回归守卫 | 代码 |
+| `7b9e09a` | 报告新增 §10（含 §10.4 全仓同类缺口清单）、§8 v4；M4R1 报告 `:110` 就地标注失效 | 文档 |
+| `634444e` | 新增 `docs/ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md` v1（提案，未改代码）+ 报告 §11/§8 v5 | 文档 |
+
+远端权威态仍为 `origin/main = 2542691`；**本轮三笔只在本地**（`git rev-list --left-right --count origin/main...HEAD` = `0 3`，工作区干净），未 push、未 force。
+
+### 11.2 三项指令 → 落点对照（逐条可验）
+
+| 要求 | 落点 | 证据 |
+| --- | --- | --- |
+| 父进程 stdout/stderr 强制 UTF-8 | `check_kb_migrations_smoke.py`、`check_m5a_live_stack_readonly.py`、`check_m5a_live_execution.py`、`run_unified_boundary_guards.py`、`check_migration_cleanup_guards.py` 均在导入后立即 `sys.stdout/stderr.reconfigure(encoding="utf-8", errors="replace")` | 静态守卫逐文件断言，§11.3 第 5 条命令即其执行入口 |
+| 所有 Python 子进程传 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8` | 统一 `_utf8_env()`（只读、执行两脚本）与 `env=` 注入（smoke、守卫入口） | 守卫用 `ast` 精确识别 `subprocess.run/check_output/call/check_call` 缺 `env=` 的行号并判红 |
+| 已登记 KB 的 CLI 检查必须断言 `returncode == 0` | 原步骤 `CLI dry-run 有结构化输出（exit=1）` 是**假绿灯**（子进程已崩仍判通过），现改为 `proc.returncode == 0 and "[capabilities]" in out and "[inventory]" in out` | `check_m5a_live_stack_readonly.py`；未登记 KB 腿改为断言 `exit == 2`（`SCOPE_UNRESOLVED` 语义） |
+| 失败时输出完整 exit code 与 stderr | `_dump_failure()`（smoke）与 `_run_backfill_cli`/`run_cli` 内联转储；守卫入口对失败腿取消 12000 字符截断 | 报告 §10.2 |
+| 不允许用 `-X utf8` 掩盖脚本缺陷 | 该"运行前提"已废止，M4R1 报告原地处打失效标注；本包所有复跑命令一律 `env -u PYTHONUTF8 -u PYTHONIOENCODING python …` | §11.3 |
+| 第二项五条命令普通 `python` 全 exit 0 | 见 §11.3 实测 | 已复核 |
+| 第三项依赖方案 | 新文档；本包 §11.6 记其对旧措辞的勘误 | 已交付（**提案，未实现**） |
+
+### 11.3 审计人员独立复核（Windows，只读 / 临时库）
+
+前置自检（证明默认码仍是 gbk，避免"被环境变量偶然救场"）：
+
+```bash
+python -c "import sys; print(sys.stdout.encoding)"      # 期望 gbk / cp936
+```
+
+五条命令（**不要**加 `-X utf8`）：
+
+```bash
+env -u PYTHONUTF8 -u PYTHONIOENCODING python backend/tests/check_m5a_revision_backfill.py
+env -u PYTHONUTF8 -u PYTHONIOENCODING python backend/admin/m5a_schema_check.py both
+env -u PYTHONUTF8 -u PYTHONIOENCODING python backend/tests/check_m5a_live_stack_readonly.py
+env -u PYTHONUTF8 -u PYTHONIOENCODING python backend/tests/check_kb_migrations_smoke.py
+env -u PYTHONUTF8 -u PYTHONIOENCODING python backend/tests/check_migration_cleanup_guards.py
+```
+
+本轮最后一次实跑结果（2026-10-02）：五条全部 `EXIT=0`；断言数按 `grep -c "^  ✓"` 口径为
+**矩阵 110 / 只读 20 / 迁移 smoke 19**，schema 校验 69 项通过，守卫输出末行 `MIGRATION_CLEANUP_GUARDS_OK`。
+统一守卫入口 `backend/tests/run_unified_boundary_guards.py` 同批 `EXIT=0`，末行 `SUMMARY total=16 failed=0`。
+
+判据说明（避免误判为"应该 exit 0 却不是"）：backfill CLI 的退出码是语义化的——已登记 KB dry-run = 0；
+`SCOPE_UNRESOLVED`/`SCOPE_MISMATCH` = 2；执行完成但前置门 OPEN = 3；未带 `--confirm` = 2。
+期望值不为 0 属设计上的刻意不收敛，不是缺陷。
+
+`check_m5a_live_execution.py --confirm` **本轮未执行**（写 dev 活栈需单独授权，其 `EXIT=2` 只打印计划）。
+
+### 11.4 越界声明与我方认账
+
+1. **越界**：用户点名 3 个脚本，实际改了 5 个（多出统一守卫入口与静态守卫文件）。理由：同一链路同一缺陷类，统一入口直跑必崩；不越界则"整改后全绿"不成立。已如实登记。
+2. **未越界但留坑**：全仓同类 UTF-8 缺口共 22 个文件（13 个 `migrate_*.py` + backfill/reset/seed CLI + 4 个套件入口 + 18 处子进程调用）本轮**未修改**，清单见报告 §10.4。这些文件直跑仍会崩，需拍板是否收。
+3. **假绿灯性质最重**：只读脚本曾长期在子进程崩溃的情况下判"通过"，属"门禁自身说谎"，不是环境问题；整改采用"断言只加不减"，未放宽任何既有阈值。
+
+### 11.5 需澄清的一条扫描命中（防误报为泄露）
+
+`check_artifact_secrets.py` 对 `docs/ENTERPRISE_M5A_FIX_ACCEPTANCE_REPORT.md:277` 报 1 条
+`dsn_with_credentials`（`match_sha256=49c06b1a354b`，40 字符）。该行是一条本地开发库连接串，
+**其口令字段确认为 4 个星号（已打码）**，与本包 §10 立场声明"未写入真实密码"一致。
+（此处刻意不复述该串形状：初稿复述过一次，直接把本包自身从 `findings=0` 打成 `findings=1`，
+即"门禁被自己的输出判红"，已删除。）复核方法（只输出布尔值，不打印明文）：
+
+```bash
+python -c "import re;l=open('docs/ENTERPRISE_M5A_FIX_ACCEPTANCE_REPORT.md',encoding='utf-8').read().splitlines();c=re.search(r'://([^@\s]*)@',l[276]).group(1);print(set(c.split(':',1)[1])=={'*'})"
+```
+
+期望 `True`（本轮实测 `True`）。当前四份文档合计 `findings=10`（M5A 报告 1 条形状命中 + M4R1 报告 9 条历史标注样本），
+新增设计文档单独扫描 `findings=0`。**本包自身必须保持 `findings=0`，任何后续追加章节都要复扫自证。**
+此前汇报过的"11"取自不同路径集合，非同一基线，特此对齐。
+
+### 11.6 对 §7 / 报告 §6 的措辞勘误（重要，请以此为准）
+
+旧表述："`reindex_chunks` 无消费方 ⇒ 门收敛这条腿**在 M5-B 之前不可能取证**"。该句把"消费方"与"M5-B"错误绑定。代码事实：
+
+1. 入队方与执行方都在 Python（`backfill_chunk_revisions.py:816-866` 直连 SQL 入队；`job_service.py:233-301` 是唯一执行器；`job_service.py:361-369` 按 `RUNNABLE_JOB_TYPES = {build_graph, clear_kb, reindex}` 过滤 ⇒ `reindex_chunks` 永远停在 `pending`，不执行也不报错）；Go 只做 INSERT / 列表 / 唤醒，从不执行 job（`admin_jobs_native.go:727-751`）。
+2. 因此门收敛的前置是 **C1 Milvus v3 显式 `content_revision` 字段** + **C2 Python worker 消费 `reindex_chunks`**，两者构成不触碰 Go 的最小切片（M5-B0）；只做 C1 收敛不了任何既有 `needs_reindex_targets`，只做 C2 会被 v2 缺字段的拒写路径（`backfill_chunk_revisions.py:397-410`，`MILVUS_REVISION_FIELD_ABSENT`）拦回 `pending`。
+3. 另有 **C3**：`blocked` / 孤儿 revision / `unrecoverable` / `scope_*` 归零属人工数据治理，reindex 无法解决——门 CLOSED 的判据里已把它们与"可收敛"分开（`backfill_chunk_revisions.py:869-888`）。
+
+**该勘误不改变任何结论**：M5-A 仍不宣布通过，M5-B Go API 仍冻结，"门收敛腿无证据"这一判定不变，只是把"等什么、谁负责"说准。依赖方案另暴露两处既有口径问题（`content_revision` 硬编码为 `1` 的版本假降风险；`job_type` 白名单在 Python/Go 共 4 份且零对账守卫），均登记未修。
+
+### 11.7 待裁定方 / 用户拍板的三点
+
+1. 是否授权 **M5-B0** 开工（会改 `RUNNABLE_JOB_TYPES` 并新增真实写索引的执行体）。不授权则"CLOSED 腿"只能以结构性不可达结案。
+2. Milvus v3 迁移窗口（dev 共享环境建 collection + S1 双写 + 回滚预演）的时间与授权。
+3. §11.4 第 2 条那 22 个文件是否纳入本轮验收面（推荐：M5-B0 前收，CI 直跑入口风险最高）。

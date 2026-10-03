@@ -139,6 +139,76 @@ jobs:
           python -m pip install --quiet pyyaml
           python backend/tests/check_workflow_contexts.py --path .github/workflows
 
+      - name: Verify credential-scan fails closed on missing required secret
+        shell: bash
+        run: |
+          # CI 负向探针（任务 #207 / #209）：门禁最怕的失效形态是"退化成永久绿灯"，
+          # 而"只判非零退出"又会把普通崩溃/参数错误误记成 FAILCLOSED_OK。故这里捕获
+          # 退出码与输出，对三条契约做精确断言，任一不符（码或字段）即让 job 失败：
+          #   CASE1 纯空白受保护变量 → 必须等同未设：exit 2 + reason=protected_credential_unset
+          #          + artifacts_withheld=true（守护 strip-before-presence 修复）；
+          #   CASE2 已设且产物含其字面值 → 必须 exit 1 + kind=run_credential；
+          #   CASE3 已设且产物干净 → 必须 exit 0 + findings=0 + result=pass。
+          set -uo pipefail
+          scanner=backend/tests/check_artifact_secrets.py
+          probe_dir="$(mktemp -d)"
+          probe_secret="ci-probe-$(python -c 'import secrets; print(secrets.token_hex(8))')"
+          rc=0
+
+          printf 'health check ok, nothing sensitive\n' > "$probe_dir/clean.log"
+          # GitHub 的 `shell: bash` 以 -e 调用，命令替换里预期非零会打断 step；故把赋值放进
+          # if 条件位（-e 抑制），退出码走 else 分支的 $? 捕获。
+          if out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE='   ' \
+              python "$scanner" --path "$probe_dir/clean.log" \
+                --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; then
+            code=0
+          else
+            code=$?
+          fi
+          if [ "$code" -eq 2 ] \
+            && printf '%s' "$out" | grep -q 'reason=protected_credential_unset' \
+            && printf '%s' "$out" | grep -q 'artifacts_withheld=true'; then
+            echo "FAILCLOSED_OK whitespace_required_secret_fails_closed_exit2"
+          else
+            echo "::error::CASE1 expected exit 2 + protected_credential_unset + artifacts_withheld=true, got exit=$code"
+            printf '%s\n' "$out"; rc=1
+          fi
+
+          printf 'payload %s end\n' "$probe_secret" > "$probe_dir/hit.log"
+          if out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
+              python "$scanner" --path "$probe_dir/hit.log" \
+                --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; then
+            code=0
+          else
+            code=$?
+          fi
+          if [ "$code" -eq 1 ] && printf '%s' "$out" | grep -q 'kind=run_credential'; then
+            echo "PROTECTED_LITERAL_OK required_secret_literal_detected_exit1"
+          else
+            echo "::error::CASE2 expected exit 1 + kind=run_credential, got exit=$code"
+            printf '%s\n' "$out"; rc=1
+          fi
+
+          printf 'health check ok, nothing sensitive\n' > "$probe_dir/absent.log"
+          if out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
+              python "$scanner" --path "$probe_dir/absent.log" \
+                --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; then
+            code=0
+          else
+            code=$?
+          fi
+          if [ "$code" -eq 0 ] \
+            && printf '%s' "$out" | grep -q 'findings=0' \
+            && printf '%s' "$out" | grep -q 'result=pass'; then
+            echo "PASS_EMPTY_OK clean_artifact_with_required_secret_exit0"
+          else
+            echo "::error::CASE3 expected exit 0 + findings=0 result=pass, got exit=$code"
+            printf '%s\n' "$out"; rc=1
+          fi
+
+          rm -rf "$probe_dir"
+          exit "$rc"
+
   backend-unified-guards:
     name: Backend unified boundary guards
     runs-on: ubuntu-latest
@@ -341,6 +411,10 @@ jobs:
         id: secret_scan
         shell: bash
         run: |
+          # 可选凭据：登录走 ADMIN_TOKEN 或 ADMIN_PASSWORD 二选一，单个变量合法可空，
+          # 故用 --secret-env-var（未设打 NOTE）而非受保护的 --require-secret-env-var。
+          # 上传的 playwright-report / test-results 属打包产物，赋值形状默认排除，
+          # 仍扫注入凭据字面值与 jwt/dsn/bcrypt 高置信形状。
           if python3 backend/tests/check_artifact_secrets.py \
             --path frontend/playwright-report \
             --path frontend/test-results \
@@ -530,14 +604,24 @@ jobs:
         shell: bash
         run: |
           # 上传路径必须过一次扫描：命中本次运行注入的凭据字面值或凭据形状就不发布产物。
+          # 分层口径（任务 #207）：
+          #   * ADMIN_PASSWORD / ADMIN_SECRET_KEY 由上面的 "Provision single-use stack
+          #     credentials" 步骤每次运行必定写入，属受保护凭据——用 --require-secret-env-var，
+          #     万一 provision 静默失败也必须 fail-closed，而不是扫 0 字面量后假绿；
+          #   * LLM_API_KEY 仅在 LLM_ENABLED=1 时非空，属可选凭据，用 --secret-env-var
+          #     （未设只打 NOTE，与关闭 LLM 的合法态一致）；
+          #   * 本 job 的 env 里根本没有 ADMIN_TOKEN（用的是随机口令），旧写法把它列为
+          #     扫描目标只是制造"已检查 admin token"的假象，故删除。
+          # 赋值形状策略：playwright-report/ 与 minified 打包产物由扫描器默认排除赋值形状，
+          # 仍扫字面值与 jwt/dsn/bcrypt 高置信形状（策略由 check_artifact_secrets_selftest.py 断言）。
           if backend/.venv/bin/python backend/tests/check_artifact_secrets.py \
             --path "$RELEASE_ACCEPTANCE_ARTIFACTS_DIR" \
             --path logs/dev/python.log \
             --path logs/dev/go.log \
             --path frontend/playwright-report \
-            --secret-env-var ADMIN_PASSWORD \
-            --secret-env-var ADMIN_SECRET_KEY \
-            --secret-env-var ADMIN_TOKEN \
+            --require-secret-env-var ADMIN_PASSWORD \
+            --require-secret-env-var ADMIN_SECRET_KEY \
+            --secret-env-var LLM_API_KEY \
             --allow-fixture graphinsight-dev-password \
             --allow-fixture change-this-password \
             --allow-fixture ci-internal-token; then
@@ -730,12 +814,13 @@ jobs:
         id: matrix_secret_scan
         shell: bash
         run: |
+          # ADMIN_PASSWORD / ADMIN_SECRET_KEY 由本 job 的 provision 步骤必定写入 → 受保护，
+          # 未设即 fail-closed。本 job env 里没有 ADMIN_TOKEN（旧写法是虚假声明，删除）。
           if backend/.venv/bin/python backend/tests/check_artifact_secrets.py \
             --path "$ROLLBACK_MATRIX_ARTIFACTS_DIR" \
             --path logs/dev/go.log \
-            --secret-env-var ADMIN_PASSWORD \
-            --secret-env-var ADMIN_SECRET_KEY \
-            --secret-env-var ADMIN_TOKEN \
+            --require-secret-env-var ADMIN_PASSWORD \
+            --require-secret-env-var ADMIN_SECRET_KEY \
             --allow-fixture graphinsight-dev-password \
             --allow-fixture change-this-password \
             --allow-fixture ci-internal-token; then
@@ -848,6 +933,10 @@ jobs:
         id: secret_scan
         shell: bash
         run: |
+          # 可选凭据：登录走 ADMIN_TOKEN 或 ADMIN_PASSWORD 二选一，单个变量合法可空，
+          # 故用 --secret-env-var（未设打 NOTE）而非受保护的 --require-secret-env-var。
+          # 上传的 playwright-report / test-results 属打包产物，赋值形状默认排除，
+          # 仍扫注入凭据字面值与 jwt/dsn/bcrypt 高置信形状。
           if python3 backend/tests/check_artifact_secrets.py \
             --path frontend/playwright-report \
             --path frontend/test-results \

@@ -15,6 +15,13 @@ TESTS_DIR = Path(__file__).resolve().parent
 # 首选 Linux 后端虚拟环境；允许用 GUARD_PYTHON 显式覆盖，便于在容器 / 非默认布局中运行。
 PYTHON_EXE = ROOT / ".venv" / "bin" / "python"
 
+# 本文件会把子进程输出原样回显，子进程带 ✓/✗ 与中文；父进程不强制 UTF-8 时，
+# Windows 默认码（cp936）会在 print 处 UnicodeEncodeError 崩掉整条守卫链（2026-10-02 实测）。
+# 这是脚本自身契约，不靠命令行 `-X utf8`。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def _utf8_env(base: dict[str, str]) -> dict[str, str]:
     env = base.copy()
@@ -77,7 +84,7 @@ def _resolve_python() -> Path:
     return fallback
 
 
-def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str]:
+def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str, int]:
     started = time.perf_counter()
     proc = subprocess.run(  # noqa: S603
         [str(python_bin), str(TESTS_DIR / case.script)],
@@ -96,7 +103,7 @@ def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str]:
     combined = output
     if err:
         combined = f"{combined}\n[stderr]\n{err}".strip()
-    return proc.returncode == 0, duration, combined
+    return proc.returncode == 0, duration, combined, proc.returncode
 
 
 def main() -> int:
@@ -106,15 +113,18 @@ def main() -> int:
         print("=" * 72)
         print(f"CASE {case.name}: {case.description}")
         try:
-            success, duration, output = _run_case(python_bin, case)
+            success, duration, output, code = _run_case(python_bin, case)
         except subprocess.TimeoutExpired:
             failed += 1
             print(f"[FAIL] {case.name} timeout>{case.timeout_seconds}s")
             continue
 
-        print(output[:12000] if output else "(no output)")
-        print(f"[{'OK' if success else 'FAIL'}] {case.name} duration={duration:.1f}s")
-        if not success:
+        # 失败腿不截断，完整给出子进程输出（含 stderr）；通过腿仍截到 12000 字符
+        print(output if not success else (output[:12000] if output else "(no output)"))
+        if success:
+            print(f"[OK] {case.name} duration={duration:.1f}s")
+        else:
+            print(f"[FAIL] {case.name} exit={code} duration={duration:.1f}s")
             failed += 1
 
     print("=" * 72)

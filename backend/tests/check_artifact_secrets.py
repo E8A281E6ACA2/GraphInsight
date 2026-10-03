@@ -19,6 +19,12 @@
     那一次字符集调整把 password=ab;cdefghij、"password": "..." 这类真凭据一起放过了。
     被排除的文件仍然扫字面值与高置信形状，注入凭据不会因为排除而隐身。
 
+字面值层再分可选与受保护（CI 凭据扫描契约，任务 #207）：
+  * --secret-env-var 是可选凭据，未设只打 NOTE 继续扫（如多腿登录里可能为空的 ADMIN_TOKEN）；
+  * --require-secret-env-var 是受保护凭据，必须已设且非空——未设即在读取任何文件前
+    fail-closed（exit 2 + artifacts_withheld）。否则"该 job 必定注入却因配置静默失败而
+    扫 0 字面量"会伪装成永久绿灯，正是扫描器最危险的失效形态。
+
 扫描结果只打印匹配位置的哈希与脱敏片段，绝不回显命中的凭据本身。
 """
 from __future__ import annotations
@@ -96,6 +102,12 @@ STRUCTURAL_VALUE_HEADS = {
 # 自检里有一条用例把这个缺口钉在明面上，不允许它悄悄扩大。
 CODE_CALL_VALUE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\(")
 
+# 首段命中结构字面量后，紧随其后的字符必须真的是代码边界，否则右侧仍承载真实凭据。
+# `null;const` / `self.password` 里首段之后是 `;` 或 `.`（语句分隔符 / 属性访问）——是骨架；
+# 而 `undefined-SECRET123` / `null-SECRET123` / `self-SECRET123` 里首段之后是 `-`，
+# 那是把真凭据拼在结构前缀上（漏报回归 2026-10-03），必须照常报。
+STRUCTURAL_VALUE_TAIL_BOUNDARY = frozenset(".;,)]}")
+
 
 def _walk(paths: Iterable[Path], excludes: Sequence[str]) -> Iterable[tuple[Path, bool]]:
     """产出 (文件, 是否扫描赋值形状)。排除只作用于赋值形状，不作用于字面值与高置信形状。"""
@@ -131,8 +143,19 @@ def _redact(match: str) -> str:
 
 
 def _is_structural_value(value: str) -> bool:
+    """True only when the WHOLE value is code structure, not just a structural prefix.
+
+    A leading run of letters matching STRUCTURAL_VALUE_HEADS is necessary but not
+    sufficient: the character right after that run must be a genuine code boundary
+    (`;` statement separator, `.` property access, `,` `)` `}` `]`) or end of the
+    token. `undefined-SECRET123` / `null-SECRET123` / `self-SECRET123` glue a real
+    credential onto the structural prefix with `-`, so they are NOT structural.
+    """
     head = re.match(r"[^A-Za-z]*([A-Za-z]+)", value)
-    return bool(head) and head.group(1).lower() in STRUCTURAL_VALUE_HEADS
+    if not head or head.group(1).lower() not in STRUCTURAL_VALUE_HEADS:
+        return False
+    rest = value[head.end():]
+    return rest == "" or rest[0] in STRUCTURAL_VALUE_TAIL_BOUNDARY
 
 
 def _is_code_value(value: str) -> bool:
@@ -196,6 +219,16 @@ def main() -> int:
         help="Name of an environment variable whose literal value must not appear. Repeatable.",
     )
     parser.add_argument(
+        "--require-secret-env-var",
+        action="append",
+        default=[],
+        help=(
+            "Like --secret-env-var but the variable is protected: it MUST be set and "
+            "non-empty. An unset protected variable fails closed instead of silently "
+            "scanning zero literals. Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--allow-fixture",
         action="append",
         default=[],
@@ -237,12 +270,37 @@ def main() -> int:
     literals: list[str] = []
     provided: list[str] = []
     for name in args.secret_env_var:
-        value = os.getenv(name, "")
+        value = (os.getenv(name) or "").strip()
         if value:
-            literals.append(value.strip())
+            literals.append(value)
             provided.append(name)
         else:
             print(f"SECRET_SCAN_NOTE env_var_unset name={name}")
+    # Protected credentials must be present or the run is misconfigured: scanning zero
+    # literals and returning "pass" would be a false green light (an unset ADMIN_PASSWORD
+    # on a stack that always provisions one means provisioning silently failed). Fail
+    # closed before reading any file so artifacts stay withheld.
+    protected: list[str] = []
+    unset_required: list[str] = []
+    for name in args.require_secret_env_var:
+        # Strip BEFORE testing presence: a whitespace-only value ("   ") is a misconfigured
+        # provision, not a set credential. Without this, os.getenv returns a truthy "   ",
+        # .strip() yields "", and the run would count it as protected and scan zero literals.
+        value = (os.getenv(name) or "").strip()
+        if value:
+            literals.append(value)
+            provided.append(name)
+            protected.append(name)
+        else:
+            unset_required.append(name)
+    if unset_required:
+        for name in unset_required:
+            print(f"SECRET_SCAN_PREREQ_MISSING required_secret_env_var_unset name={name}")
+        print(
+            "SECRET_SCAN_SUMMARY result=fail reason=protected_credential_unset "
+            f"unset_required={len(unset_required)} artifacts_withheld=true"
+        )
+        return 2
     allowed = {item.strip() for item in args.allow_fixture if item.strip()}
 
     files, shape_files, total_bytes, findings = scan(_walk(existing, excludes), literals, allowed)
@@ -261,7 +319,8 @@ def main() -> int:
         f"paths={len(existing)} files={files} bytes={total_bytes} "
         f"shape_scanned_files={shape_files} shape_excluded_files={excluded_files} "
         f"exclude_rules={len(excludes)} "
-        f"credential_env_vars={len(provided)} allowed_fixtures={len(allowed)} "
+        f"credential_env_vars={len(provided)} protected_env_vars={len(protected)} "
+        f"allowed_fixtures={len(allowed)} "
         f"findings={len(findings)} result={'pass' if not findings else 'fail'}"
     )
     return 0 if not findings else 1

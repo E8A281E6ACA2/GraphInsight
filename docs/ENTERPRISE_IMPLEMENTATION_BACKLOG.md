@@ -241,3 +241,32 @@
 1. 每个 backlog 项必须有验收标准。
 2. 每次合并必须更新本看板状态。
 3. 每个 `done` 项必须附回归结果。
+
+## M5 Chunk Revision / Reindex（2026-10-02）
+
+1. `M5-B0` Python `reindex_chunks` worker
+状态：`in_progress`
+
+验收进展：
+
+1. Python worker、Milvus v3 schema/type 守卫、真实 upsert 数量校验、CAS 回写和文档聚合已实现。
+2. SQLite 隔离验收与唯一临时 v3 collection 真实读回均通过；临时 PG/Neo4j/Milvus 清理后无残留。
+3. 文档聚合异常已改为 fail-closed：仅“表尚未迁移”兼容，其它数据库异常向上抛出；worker/backfill 不得伪报成功或 `CLOSED`。
+4. 共享生产 v3 迁移、逐 KB C3 数据治理和共享生产 `CLOSED` 尚未完成。
+5. M5-A/B0 dry-run contract v1 已统一三个入口：固定 `DRY_RUN_RESULT` JSON 标记、`writes=0` 和退出码语义；仅为隔离验收契约，不代表共享生产迁移完成。
+6. 2026-10-03 共享只读 C3 inventory 已运行：1 个 KB，`blocked/orphan/unrecoverable/scope_unresolved/scope_mismatches` 全为 0；当前读取到 `graphinsight_chunks_v2` 且无显式 `content_revision`，所以共享生产 gate 仍为 OPEN。
+
+2. `M5-B0-C3` 共享 KB 不可自动收敛清单
+状态：`todo`
+
+验收标准：只读输出每个 KB 的 `blocked`、`orphan_revisions`、`unrecoverable`、`scope_unresolved`、`scope_mismatches`，并为人工处置项保留 `chunk_id` 和原因。
+
+3. `M5-V3` 共享生产 Milvus v3 迁移
+状态：`todo`
+
+验收标准：独立迁移方案、canary、真实读回、幂等复跑、回滚路径和 v2 不变性证据齐全；未授权前不得写共享 dev/v2。
+
+4. `M5-B1` Go 管理 API
+状态：`todo`
+
+验收标准：M5-B0 共享前置条件通过并取得审计授权后，才实现 job type 对账、chunk 读/PATCH/rollback、reindex-chunks、reindex-document 和 Python worker 唤醒。当前保持冻结。

@@ -108,6 +108,10 @@ strict 语义：代码中不存在 `KB_SCOPE_ENFORCE` 开关或 default KB 兜�
 | `check_kb_migrations_smoke.py`（`python -X utf8`） | 12✓ EXIT=0 |
 
 注：不带 `-X utf8` 直接跑 `check_kb_migrations_smoke.py` 时，父进程在 GBK 控制台打印 `✓` 会 `UnicodeEncodeError`；这是运行命令前提（见 §5），子进程捕获已修复，不在本轮改动面内。
+**【2026-10-02 失效标注】**上面这条"运行命令前提"已作废：脚本自身已强制 UTF-8（父进程 `reconfigure` + 子进程 `PYTHONUTF8`/`PYTHONIOENCODING`），
+普通 `python backend/tests/check_kb_migrations_smoke.py` 在 Windows 默认码（`sys.stdout.encoding=gbk`）下实测 `EXIT=0`、19 项断言全绿。
+同轮还复现出该前提掩盖的两处真实缺陷（只读脚本的已登记 KB CLI 步骤不看 `returncode` 形成假绿灯；统一守卫入口父进程无 `reconfigure` 直接崩），
+整改与证据见 `docs/ENTERPRISE_M5A_FIX_ACCEPTANCE_REPORT.md` §10。原文按留痕原则保留。
 
 #### 7.4.1 统一活栈复跑（身份头剥离改动后）
 

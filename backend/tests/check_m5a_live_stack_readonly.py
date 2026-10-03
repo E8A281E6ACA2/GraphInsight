@@ -20,6 +20,7 @@ M5-A 活栈只读取证（非 mock）：真实 PostgreSQL / Neo4j / Milvus 读�
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,39 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 FAILURES: list = []
+
+
+def _utf8_env() -> dict:
+    """子进程必须自带 UTF-8：否则 backfill CLI 在 Windows 默认码下 print 中文会
+    UnicodeEncodeError 崩掉，把 fail-closed 的 exit 2 变成 exit 1（本轮实测）。
+    这是脚本自身的契约，不靠命令行 `-X utf8`。"""
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _run_backfill_cli(kb: str, expect_code: int, dry_run: bool) -> subprocess.CompletedProcess:
+    argv = [sys.executable, str(backend_dir / "admin" / "backfill_chunk_revisions.py"), "--kb", kb]
+    if dry_run:
+        argv.append("--dry-run")
+    proc = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(backend_dir),
+        env=_utf8_env(),
+        timeout=600,
+    )
+    if proc.returncode != expect_code:
+        print(f"    !! backfill CLI exit={proc.returncode}，期望 exit={expect_code}")
+        for line in (proc.stdout.splitlines() or ["<stdout 为空>"]):
+            print(f"    [stdout] {line}")
+        for line in (proc.stderr.splitlines() or ["<stderr 为空>"]):
+            print(f"    [stderr] {line}")
+    return proc
 
 
 def step(name: str, ok: bool, detail: str = "") -> None:
@@ -182,18 +216,14 @@ def main() -> int:
     # ---------------- 真实 CLI dry-run ----------------
     print("[CLI] 真实入口 backfill --dry-run（写库前返回，零写入）")
     for kb in (targets or [])[:1]:
-        proc = subprocess.run(
-            [sys.executable, str(backend_dir / "admin" / "backfill_chunk_revisions.py"), "--kb", kb, "--dry-run"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(backend_dir),
-            timeout=600,
-        )
+        proc = _run_backfill_cli(kb, expect_code=0, dry_run=True)
         out = proc.stdout + proc.stderr
         print("\n".join(f"    {line}" for line in out.splitlines()[:25]))
-        step(f"CLI dry-run 有结构化输出（exit={proc.returncode}）", "[capabilities]" in out and "[inventory]" in out, "")
+        step(
+            "已登记 KB 的 CLI dry-run exit 0 且有结构化输出",
+            proc.returncode == 0 and "[capabilities]" in out and "[inventory]" in out,
+            f"exit={proc.returncode}",
+        )
 
     # ---------------- 未登记 KB 的真实 fail-closed（审计修复 #4 的活栈腿） ----------------
     print("[Readonly] 未登记 KB 真实 dry-run：SCOPE_UNRESOLVED 必须 exit 2 且零写入")
@@ -211,15 +241,7 @@ def main() -> int:
             len(inv.scope_unresolved) > 0 and len(inv.unrecoverable) == 0 and inv.kb_scope_missing,
             f"scope_unresolved={len(inv.scope_unresolved)} unrecoverable={len(inv.unrecoverable)}",
         )
-        proc = subprocess.run(
-            [sys.executable, str(backend_dir / "admin" / "backfill_chunk_revisions.py"), "--kb", kb, "--dry-run"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(backend_dir),
-            timeout=600,
-        )
+        proc = _run_backfill_cli(kb, expect_code=2, dry_run=True)
         out = proc.stdout + proc.stderr
         print("\n".join(f"    {line}" for line in out.splitlines()[:14]))
         step(

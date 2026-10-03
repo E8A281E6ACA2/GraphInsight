@@ -35,11 +35,12 @@ JOB_STATUS_CANCELLED = "cancelled"
 
 ALLOWED_RETRY_FROM = {JOB_STATUS_FAILED, JOB_STATUS_CANCELLED}
 ALLOWED_CANCEL_FROM = {JOB_STATUS_PENDING, JOB_STATUS_RUNNING}
-SUPPORTED_JOB_TYPES = {"build_graph", "clear_kb", "reindex"}
-RUNNABLE_JOB_TYPES = {"build_graph", "clear_kb", "reindex"}
+SUPPORTED_JOB_TYPES = {"build_graph", "clear_kb", "reindex", "reindex_chunks"}
+RUNNABLE_JOB_TYPES = {"build_graph", "clear_kb", "reindex", "reindex_chunks"}
 # 知识数据类任务：创建时必须携带 kb_id 且 KB 必须存在且为 active；
 # reindex 只重建 Neo4j 全文索引（基础设施操作），kb_id 可选。
-KB_SCOPED_JOB_TYPES = {"build_graph", "clear_kb"}
+# reindex_chunks 是 chunk 投影重建（§8.2），targets 必须限定在单个 kb 内 → 归知识数据类。
+KB_SCOPED_JOB_TYPES = {"build_graph", "clear_kb", "reindex_chunks"}
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -562,6 +563,7 @@ class JobService:
                 duration_seconds = round(time.monotonic() - started_monotonic, 3)
             error_type = type(exc).__name__
             error_message = f"{error_type}: {str(exc)}"
+            error_details = getattr(exc, "details", None)
             logger.error("后台任务执行失败", context={"job_id": job_id, "error": error_message}, exc_info=True)
             try:
                 failed = db.query(AdminJob).filter(AdminJob.id == job_id).first()
@@ -576,6 +578,7 @@ class JobService:
                             "job_id": job_id,
                             "error_type": error_type,
                             "error": str(exc),
+                            "details": error_details,
                             "runtime": {
                                 "duration_seconds": duration_seconds,
                                 "timeout_seconds": JOB_EXECUTION_TIMEOUT_SECONDS,
@@ -595,6 +598,7 @@ class JobService:
                             "status": failed.status,
                             "error_type": error_type,
                             "runtime_seconds": duration_seconds,
+                            "error_details": error_details,
                         },
                         error_message=error_message[:1000],
                     )

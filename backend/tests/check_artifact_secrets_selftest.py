@@ -33,6 +33,10 @@ FAILURES: list[str] = []
 RUN_LITERAL_ENV = "GRAPHINSIGHT_SELFTEST_RUN_CREDENTIAL"
 RUN_LITERAL = "selftest-once-credential-4f0c9b7e21"
 
+# 纯空白受保护变量：证明 strip-before-presence 生效——空白值等同未设，必须 fail-closed。
+WS_REQVAR_ENV = "GRAPHINSIGHT_SELFTEST_WS_REQVAR"
+WS_REQVAR_VALUE = "   \t "
+
 BCRYPT_SAMPLE = "$2b$12$N9u6E9lOZ3xK4mQ7pRsT2vW8yB5cD1fG6hJ0kL3mN4oP7qR9sT2uV"
 JWT_SAMPLE = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5E_Xw"
 
@@ -69,7 +73,7 @@ def run_cli(paths: list[Path], extra_args: list[str] | None = None, with_literal
         encoding="utf-8",
         errors="replace",
         cwd=str(backend_dir.parent),
-        env=_utf8_env(os.environ, {RUN_LITERAL_ENV: RUN_LITERAL}),
+        env=_utf8_env(os.environ, {RUN_LITERAL_ENV: RUN_LITERAL, WS_REQVAR_ENV: WS_REQVAR_VALUE}),
         timeout=120,
     )
     return proc.returncode, proc.stdout + proc.stderr
@@ -143,6 +147,14 @@ def positive_assignment_shapes() -> None:
     expect_hit("带口令 DSN 正样本", "dsn.log",
                "connect postgresql://appuser:s3cr3tpass@10.0.0.5:5432/graphinsight", "dsn_with_credentials")
     expect_hit("JWT 正样本", "jwt.log", f"authorization payload {JWT_SAMPLE}", "jwt")
+    # 漏报回归（2026-10-03）：结构前缀（null/undefined/self）后用连字符拼上真实凭据，
+    # 旧 _is_structural_value 只看首段就整体放行。收窄后必须照常命中。
+    expect_hit("结构前缀拼真凭据回归：undefined 前缀 + 连字符 + 值", "under.log",
+               "password=undefined-SECRET123", "credential_assignment")
+    expect_hit("结构前缀拼真凭据回归：null 前缀 + 连字符 + 值", "nulld.log",
+               "password=null-SECRET123", "credential_assignment")
+    expect_hit("结构前缀拼真凭据回归：self 前缀 + 连字符 + 值", "selfd.log",
+               "password=self-SECRET123", "credential_assignment")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +270,53 @@ def _int_after(line: str, key: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# E. 输出与退出码契约（不得回显凭据明文）
+# E. 受保护字面值层：--require-secret-env-var 未设必须 fail-closed（CI 契约 #207）
+# ---------------------------------------------------------------------------
+def protected_env_var_layer() -> None:
+    clean = write("cases/protected_clean.log", "health check ok, nothing sensitive\n")
+
+    # 已设 + 产物干净：正常放行，SUMMARY 记 protected_env_vars=1。
+    code, out = run_cli([clean], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    step("受保护变量已设且产物干净时放行并计数 protected_env_vars",
+         code == 0 and "findings=0" in out and "protected_env_vars=1" in out,
+         f"exit={code} {summary_of(out)}")
+
+    # 未设：即使产物干净也必须 exit 2 且 withheld——否则"必定注入却静默失败"会扫 0 字面量后假绿。
+    code, out = run_cli([clean], extra_args=["--require-secret-env-var", "GRAPHINSIGHT_SELFTEST_UNSET_REQVAR"])
+    step("受保护变量未设时 fail-closed（exit 2 + artifacts_withheld），不被干净产物掩盖",
+         code == 2 and "required_secret_env_var_unset" in out and "artifacts_withheld=true" in out,
+         f"exit={code} {summary_of(out)}")
+
+    # 已设 + 产物含其字面值：命中 run_credential，证明受保护就是"会扫且不可放行的字面值"。
+    hit = write("cases/protected_hit.log", f"deploy payload={RUN_LITERAL} done")
+    code, out = run_cli([hit], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    step("受保护变量已设且产物含其字面值时命中 run_credential",
+         code == 1 and "kind=run_credential" in out, f"exit={code} {summary_of(out)}")
+
+    # 对照：可选变量未设只打 NOTE 并放行，与受保护未设的 exit 2 形成明确区分。
+    code, out = run_cli([clean], extra_args=["--secret-env-var", "GRAPHINSIGHT_SELFTEST_UNSET_REQVAR"])
+    step("可选变量未设仅 NOTE 并放行（区别于受保护未设的 fail-closed）",
+         code == 0 and "env_var_unset" in out and "findings=0" in out, f"exit={code}")
+
+    # 纯空白受保护变量：strip-before-presence 必须把它当作未设——exit 2、withheld、且不进文件扫描。
+    code, out = run_cli([clean], extra_args=["--require-secret-env-var", WS_REQVAR_ENV])
+    step("纯空白受保护变量按未设 fail-closed（exit 2 + protected_credential_unset + withheld）",
+         code == 2 and "reason=protected_credential_unset" in out and "artifacts_withheld=true" in out,
+         f"exit={code} {summary_of(out)}")
+    step("纯空白受保护变量不进入文件扫描（无 files= 汇总、不计入 protected_env_vars）",
+         "files=" not in out and "protected_env_vars" not in out, f"exit={code} {out[:200]}")
+
+    # 三种退出码在同一受保护变量下必须互斥且明确：未设/空白=2、含凭据=1、干净=0。
+    code_unset, _ = run_cli([clean], extra_args=["--require-secret-env-var", WS_REQVAR_ENV])
+    code_dirty, _ = run_cli([hit], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    code_clean, _ = run_cli([clean], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    step("受保护变量三态退出码互斥且精确（空白=2 / 含凭据=1 / 干净=0）",
+         code_unset == 2 and code_dirty == 1 and code_clean == 0,
+         f"unset={code_unset} dirty={code_dirty} clean={code_clean}")
+
+
+# ---------------------------------------------------------------------------
+# F. 输出与退出码契约（不得回显凭据明文）
 # ---------------------------------------------------------------------------
 def output_contract() -> None:
     secret = "SuperSecret123"
@@ -322,6 +380,7 @@ def main() -> int:
         negative_structural()
         literal_layer()
         exclusion_scope()
+        protected_env_var_layer()
         output_contract()
         label_echo_guard()
 

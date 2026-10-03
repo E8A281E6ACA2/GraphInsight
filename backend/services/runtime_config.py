@@ -165,6 +165,23 @@ def get_vector_store_runtime_config() -> Dict[str, Any]:
     }
 
 
+def get_projection_capabilities() -> Dict[str, bool]:
+    """投影重建能力判定（§15.3：graph = LLM_ENABLED；vector = embedding 已配置且 vector_store 开启）。
+
+    backfill（M5-A 前置门）与 reindex worker（M5-B0 消费端）必须共用这一份判定：
+    两边口径不一致时，门会按"能力已配置"要求投影收敛，而 worker 按另一套口径写
+    `skipped`（或反之），造成前置门永不 CLOSED 或假性 CLOSED_DEGRADED。
+    """
+    embedding = get_embedding_runtime_config()
+    store = get_vector_store_runtime_config()
+    return {
+        "graph": bool(getattr(settings, "llm_enabled", False)),
+        "vector": bool(embedding.get("enabled"))
+        and bool(str(embedding.get("api_key") or "").strip())
+        and bool(store.get("enabled")),
+    }
+
+
 def get_document_parser_runtime_config() -> Dict[str, Any]:
     loaded = _load_category("document_parser")
     return {

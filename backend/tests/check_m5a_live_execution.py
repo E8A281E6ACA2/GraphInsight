@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,16 @@ sys.path.insert(0, str(backend_dir))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _utf8_env() -> dict:
+    """子进程必须自带 UTF-8：backfill CLI 在 Windows 默认码下 print 中文会
+    UnicodeEncodeError 崩掉，真实退出码会被 1 顶掉（同轮 readonly 脚本实测）。
+    脚本自身契约，不靠命令行 `-X utf8`。"""
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 SYNTHETIC_PREFIX = "m5a-live-"
 DOC_ID = "m5alive-doc1"
@@ -256,7 +267,7 @@ def cleanup(kb: str) -> dict:
     return report
 
 
-def run_cli(kb: str, extra: list) -> tuple:
+def run_cli(kb: str, extra: list, expect_code: int) -> tuple:
     proc = subprocess.run(
         [sys.executable, str(backend_dir / "admin" / "backfill_chunk_revisions.py"), "--kb", kb] + extra,
         capture_output=True,
@@ -264,10 +275,15 @@ def run_cli(kb: str, extra: list) -> tuple:
         encoding="utf-8",
         errors="replace",
         cwd=str(backend_dir),
+        env=_utf8_env(),
         timeout=900,
     )
-    out = proc.stdout + proc.stderr
-    lines = [ln for ln in out.splitlines() if ln.strip() and not ln.startswith("Received notification from DBMS")]
+    lines = [ln for ln in (proc.stdout + proc.stderr).splitlines() if ln.strip() and not ln.startswith("Received notification from DBMS")]
+    if proc.returncode != expect_code:
+        # 失败给完整 exit code 与 stderr，不截断，便于区分"真实 fail-closed"与"子进程自己崩了"
+        print(f"    !! backfill CLI exit={proc.returncode}，期望 exit={expect_code}")
+        for ln in (proc.stderr.splitlines() or ["<stderr 为空>"]):
+            print(f"    [stderr] {ln}")
     print("\n".join(f"    {ln}" for ln in lines[:18]))
     return proc.returncode, "\n".join(lines)
 
@@ -343,7 +359,7 @@ def main() -> int:
 
         # ---- 真实作用域冲突 fail-closed（审计修复 #4 的活栈腿） ----
         print("[P2] 真实作用域冲突：backfill 必须 SCOPE_MISMATCH 拒绝且零新增写入")
-        code, out = run_cli(kb, ["--dry-run"])
+        code, out = run_cli(kb, ["--dry-run"], expect_code=2)
         step("SCOPE_MISMATCH 拒绝（exit 2）", code == 2, f"exit={code}")
         step("冲突明细给出 expected/actual",
              f"revision.project_id" in out and f"expected={project}" in out and f"actual={bad_project}" in out, out[-300:])
@@ -354,7 +370,7 @@ def main() -> int:
         # ---- 修正作用域后跑真实写入分支 ----
         print("[P3] 修正 scope 后跑真实写入分支（非 dry-run）")
         fix_revision_scope(kb, project)
-        code, out = run_cli(kb, [])
+        code, out = run_cli(kb, [], expect_code=3)
         rows = pg_state(kb)["revisions"]
         step("3 个 chunk 全部落 revision 行", len(rows) == 3, f"rows={len(rows)}")
         step("新行 content_revision=1 且 revision_status=current",
@@ -398,8 +414,9 @@ def main() -> int:
 
         print("[P7] 幂等重跑：不新建行、不新建 job")
         before_rerun = pg_state(kb)
-        code2, out2 = run_cli(kb, [])
+        code2, out2 = run_cli(kb, [], expect_code=3)
         after_rerun = pg_state(kb)
+        step("幂等重跑按契约退出（exit 3，前置门仍 OPEN）", code2 == 3, f"exit={code2}")
         step("幂等重跑：rows_new=0 且 insert_conflicts_skipped=0（本轮无待插 chunk）",
              "rows_new=0" in out2 and "insert_conflicts_skipped=0" in out2, out2[-400:])
         step("重跑后 revision 行数不变", len(after_rerun["revisions"]) == len(before_rerun["revisions"]), str(len(after_rerun["revisions"])))

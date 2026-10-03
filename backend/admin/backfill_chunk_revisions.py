@@ -65,6 +65,7 @@ backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
 
 from admin.database import engine  # noqa: E402
+from admin.dry_run_contract import emit_dry_run_result  # noqa: E402
 from config import get_settings  # noqa: E402
 from services.scope_contract import milvus_kb_filter, normalize_scope_id  # noqa: E402
 
@@ -100,6 +101,7 @@ class Inventory:
     needs_reindex_targets: List[Dict[str, Any]] = field(default_factory=list)
     converged: int = 0
     blocked: int = 0
+    blocked_targets: List[Dict[str, Any]] = field(default_factory=list)
     orphan_revisions: List[str] = field(default_factory=list)
     rows_skipped_existing: int = 0
     scope_mismatches: List[Dict[str, str]] = field(default_factory=list)
@@ -125,24 +127,15 @@ class Inventory:
 
 
 def _graph_capability_enabled() -> bool:
-    return bool(getattr(settings, "llm_enabled", False))
+    from services.runtime_config import get_projection_capabilities
+
+    return bool(get_projection_capabilities()["graph"])
 
 
 def _vector_capability_enabled() -> bool:
-    try:
-        from services.runtime_config import get_embedding_runtime_config, get_vector_store_runtime_config
+    from services.runtime_config import get_projection_capabilities
 
-        embedding = get_embedding_runtime_config()
-        store = get_vector_store_runtime_config()
-    except Exception:
-        embedding = {
-            "enabled": bool(getattr(settings, "embedding_enabled", False)),
-            "api_key": getattr(settings, "llm_api_key", "") or getattr(settings, "openai_api_key", ""),
-        }
-        store = {"enabled": bool(getattr(settings, "vector_store_enabled", False))}
-    return bool(embedding.get("enabled")) and bool(str(embedding.get("api_key") or "").strip()) and bool(
-        store.get("enabled")
-    )
+    return bool(get_projection_capabilities()["vector"])
 
 
 def _sha256(value: str) -> str:
@@ -314,17 +307,9 @@ def _milvus_client():
 
 
 def _milvus_has_revision_field(client, collection: str) -> bool:
-    if not client.has_collection(collection):
-        return False
-    try:
-        description = client.describe_collection(collection)
-    except Exception:
-        return False
-    fields = description.get("fields") if isinstance(description, dict) else None
-    if not isinstance(fields, list):
-        return False
-    names = {f.get("name") for f in fields if isinstance(f, dict)}
-    return "content_revision" in names
+    from services.vector_store import content_revision_field_is_int64
+
+    return content_revision_field_is_int64(client, collection)
 
 
 MILVUS_BASE_OUTPUT_FIELDS = ["chunk_id", "doc_id", "text", "tenant_id", "project_id", "parser_version"]
@@ -436,7 +421,9 @@ def _backfill_milvus(kb_id: str, plans: List[ChunkPlan]) -> Dict[str, str]:
             for item, vector in zip(chunk, vectors)
         ]
         try:
-            client.upsert(collection_name=collection, data=rows)
+            from services.vector_store import require_upsert_count
+
+            require_upsert_count(client.upsert(collection_name=collection, data=rows), len(rows))
         except Exception:  # noqa: BLE001 - upsert 失败逐 chunk 记 failed
             for item in chunk:
                 outcome[item.chunk_id] = "failed"
@@ -674,9 +661,27 @@ def build_inventory(kb_id: str) -> Inventory:
                 )
             elif "blocked" in (graph_state, vector_state):
                 inventory.blocked += 1
+                inventory.blocked_targets.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "doc_id": row["doc_id"],
+                        "reason": "PROJECTION_BLOCKED",
+                        "graph_state": graph_state,
+                        "vector_state": vector_state,
+                    }
+                )
             elif is_orphan:
                 # 孤儿行不得判为 converged：两侧索引都没有该 chunk，门必须保持 OPEN
                 inventory.blocked += 1
+                inventory.blocked_targets.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "doc_id": row["doc_id"],
+                        "reason": "ORPHAN_REVISION",
+                        "graph_state": graph_state,
+                        "vector_state": vector_state,
+                    }
+                )
             else:
                 inventory.converged += 1
             continue
@@ -787,30 +792,21 @@ def _update_projection_state(
     graph_content_revision: Optional[int] = None,
     vector_status: Optional[str] = None,
     vector_content_revision: Optional[int] = None,
-) -> None:
-    assignments: List[str] = []
-    params: Dict[str, Any] = {"kb_id": kb_id, "chunk_id": chunk_id}
-    if graph_status is not None:
-        assignments.append("graph_status = :graph_status")
-        params["graph_status"] = graph_status
-        assignments.append("graph_content_revision = :graph_content_revision")
-        params["graph_content_revision"] = graph_content_revision
-    if vector_status is not None:
-        assignments.append("vector_status = :vector_status")
-        params["vector_status"] = vector_status
-        assignments.append("vector_content_revision = :vector_content_revision")
-        params["vector_content_revision"] = vector_content_revision
-    if not assignments:
-        return
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                f"UPDATE chunk_revisions SET {', '.join(assignments)} "
-                "WHERE kb_id = :kb_id AND chunk_id = :chunk_id AND content_revision = 1 "
-                "AND revision_status = 'current'"
-            ),
-            params,
-        )
+) -> int:
+    """落投影状态。backfill 只处理本轮新建的 revision 1 行，故 CAS 固定在 revision 1；
+    与 reindex worker 共用 services.chunk_projection_state 的同一份回写实现。
+    """
+    from services.chunk_projection_state import update_projection_state
+
+    return update_projection_state(
+        kb_id,
+        chunk_id,
+        expected_revision=1,
+        graph_status=graph_status,
+        graph_content_revision=graph_content_revision,
+        vector_status=vector_status,
+        vector_content_revision=vector_content_revision,
+    )
 
 
 def _enqueue_reindex_jobs(targets: List[Dict[str, Any]], trace_id: str) -> Dict[str, int]:
@@ -960,20 +956,58 @@ def run(kb_id: str, dry_run: bool) -> int:
     # 作用域冲突 fail-closed：先于任何写入与 dry-run 分支拒绝（审计修复 #4）
     if inventory.scope_mismatches:
         _print_report(inventory, gate, dry_run=dry_run)
+        if dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={"reason": "SCOPE_MISMATCH", "count": len(inventory.scope_mismatches)},
+            )
         print(f"✗ 拒绝执行：SCOPE_MISMATCH {len(inventory.scope_mismatches)} 处，零写入")
         return 2
 
     if dry_run:
         _print_report(inventory, gate, dry_run=True)
         if inventory.unrecoverable:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={
+                    "reason": "UNRECOVERABLE_MISMATCH",
+                    "count": len(inventory.unrecoverable),
+                },
+            )
             print("✗ UNRECOVERABLE_MISMATCH：dry-run 终止，禁止写入，请走受控清库分支")
             return 2
         if inventory.scope_unresolved:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={
+                    "reason": "SCOPE_UNRESOLVED",
+                    "count": len(inventory.scope_unresolved),
+                },
+            )
             print(
                 f"✗ SCOPE_UNRESOLVED：{len(inventory.scope_unresolved)} 个 chunk 作用域三件套不全，"
                 "dry-run 终止，禁止写入（先补 knowledge_bases 登记或走 reindex 重建，不得伪造作用域落库）"
             )
             return 2
+        emit_dry_run_result(
+            operation="backfill_chunk_revisions",
+            status=("CLOSED_DEGRADED" if gate["degraded_skipped"] else "CLOSED")
+            if gate["closed"]
+            else "OPEN",
+            exit_code=0,
+            details={
+                "needs_reindex": gate["needs_reindex"],
+                "blocked": gate["blocked"],
+                "unrecoverable": gate["unrecoverable"],
+                "scope_unresolved": gate["scope_unresolved"],
+            },
+        )
         print("✓ dry-run completed，未写库")
         return 0
 
@@ -1011,7 +1045,9 @@ def run(kb_id: str, dry_run: bool) -> int:
         "milvus_failed": 0,
         "milvus_skipped": 0,
         "revision_field_absent": 0,
+        "state_write_failed": 0,
     }
+    state_write_failed: List[str] = []
     for plan in fresh_plans:
         if not inventory.graph_enabled:
             graph_status, graph_rev = "skipped", None
@@ -1037,7 +1073,21 @@ def run(kb_id: str, dry_run: bool) -> int:
         else:
             vector_status, vector_rev = "failed", None
             counts["milvus_failed"] += 1
-        _update_projection_state(kb_id, plan.chunk_id, graph_status, graph_rev, vector_status, vector_rev)
+        rowcount = _update_projection_state(kb_id, plan.chunk_id, graph_status, graph_rev, vector_status, vector_rev)
+        if rowcount != 1:
+            state_write_failed.append(plan.chunk_id)
+            counts["state_write_failed"] += 1
+
+    from services.chunk_projection_state import aggregate_document_states
+
+    document_states = aggregate_document_states(
+        kb_id,
+        sorted({plan.doc_id for plan in fresh_plans if plan.doc_id}),
+    )
+    if document_states:
+        print(f"  document_states={json.dumps(document_states, ensure_ascii=False, sort_keys=True)}")
+    if state_write_failed:
+        print("  state_write_failed=" + ",".join(sorted(state_write_failed)))
 
     print(
         f"  rows_new={counts['rows_new']} insert_conflicts_skipped={pg['existing']} "
@@ -1051,6 +1101,9 @@ def run(kb_id: str, dry_run: bool) -> int:
             "（collection 无显式 content_revision 字段，vector 投影保持 pending；"
             "按 §8.5/§15.4 迁移 v3 collection 后重跑 reindex）"
         )
+
+    if state_write_failed:
+        print("✗ projection state CAS did not update exactly one current row; gate remains OPEN")
 
     # 入队必须基于写入之后的新鲜 inventory（活栈执行态取证发现的静默漏排）：
     # 决策时清单只包含"本轮之前就有 current 行"的 chunk，本轮新写入但投影未收敛的 chunk
@@ -1094,9 +1147,23 @@ def main() -> int:
         kb_id = normalize_scope_id("kb_id", args.kb)
     except Exception as exc:  # noqa: BLE001 - SCOPE_INVALID 必须显式报告
         print(f"✗ kb_id 非法: {exc}")
+        if args.dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={"reason": "SCOPE_INVALID"},
+            )
         return 2
     if not kb_id:
         print("✗ kb_id 不能为空")
+        if args.dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="rejected",
+                exit_code=2,
+                details={"reason": "SCOPE_INVALID"},
+            )
         return 2
 
     print("=" * 60)
@@ -1105,11 +1172,25 @@ def main() -> int:
     with engine.begin() as conn:
         if not _table_exists(conn, "chunk_revisions"):
             print("✗ chunk_revisions 表不存在，请先执行 migrate_chunk_revisions.py")
+            if args.dry_run:
+                emit_dry_run_result(
+                    operation="backfill_chunk_revisions",
+                    status="rejected",
+                    exit_code=2,
+                    details={"reason": "MIGRATION_REQUIRED", "table": "chunk_revisions"},
+                )
             return 2
     try:
         return run(kb_id, dry_run=bool(args.dry_run))
     except Exception as exc:  # noqa: BLE001 - 运维脚本失败必须显式退出码
         print(f"✗ backfill 执行失败: {exc}")
+        if args.dry_run:
+            emit_dry_run_result(
+                operation="backfill_chunk_revisions",
+                status="error",
+                exit_code=1,
+                details={"reason": "RUNTIME_ERROR"},
+            )
         return 1
 
 

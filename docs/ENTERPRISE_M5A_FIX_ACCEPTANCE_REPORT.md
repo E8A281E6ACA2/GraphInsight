@@ -1,13 +1,13 @@
 # M5-A 审计整改轮验收报告（2026-10-01）
 
-基线：`63f9932`（v1/v2 交付基线；v3 追加轮 §9 在其后单独提交）。**远端状态更新（2026-10-02）**：本报告全部整改笔与后续 #55/#31 轮次共 10 笔已 fast-forward push，远端 `main` 现为 `1c49dfe`；push 前后各取权威远端 SHA 复核，未 force。本报告只记录**已验证事实**与**明确未验证项**，不含推测性结论。
+基线：`63f9932`（v1/v2 交付基线；v3 追加轮 §9 在其后单独提交）。2026-10-02 的 M5-B0 返工提交为 `df29a72`、`373544e`、`44393e7`，验收记录为 `4640cab`；当前本地 `main` 未 push。本报告只记录**已验证事实**与**明确未验证项**，不含推测性结论。
 
 ## 1. 结论（TLDR）
 
 1. 审计提出的四项阻断问题（#1 孤儿 revision、#2 严格 UNRECOVERABLE、#3 v2 Milvus 真实查询路径、#4 作用域 fail-closed）与两项补充（schema/index 结构校验、`rows_skipped_existing`）**代码已落地并通过契约测试矩阵**（临时 SQLite，断言全绿，退出码 0；断言数为 **110**，v1/v2 写的 111 是计数口径虚高，见 §9.5）。
 2. 活栈取证已完成的部分：**真实 PostgreSQL 结构校验通过**、**真实 Milvus / Neo4j / PG 只读路径通过（非 mock，含零写入自证；断言 20 项，§3.3）**，并按用户授权（"dev 上用专用合成 KB 跑 / 只用合成专用 KB"）在 dev 活栈跑通**真实写入执行态**：PG revision 行 + Neo4j `content_revision=1` + `admin_jobs` 入队 + 幂等重跑，全绿退出码 0（§3.4；其历史"34 项"含子进程回显与汇总行，统一口径下的准确数需带 `--confirm` 复跑才能取，见 §9.5）。写入面严格限制在合成 kb_id `m5a-live-20261001`，取证后已按 kb_id 整块回收并复核回到基线计数（`chunk_revisions=0`、`admin_jobs=21`），未触碰现有真实 KB。
 3. 执行态取证又暴露并修复了一个静默缺陷：**同一轮新写入但未收敛的 chunk 没有排入 reindex job**（§5.4）。修复后活栈幂等重跑才复用 `targets_hash`。
-4. **仍未取得证据的腿见 §6**：reindex 收敛闭环（当前代码库根本没有该 job 的消费方，属结构性缺口而非"没跑"）、Milvus 向量侧真实写入、真实上传→解析链路、规模与并发。因此**本轮不宣布 M5-A 验收通过，M5-B Go API 继续冻结**。
+4. **仍未取得共享生产证据的腿见 §6**：B0 的 Python worker 消费闭环和临时 v3 向量写入已经验证，但共享 v3 迁移、C3 数据治理、真实上传→解析链路、规模与并发仍未验证。因此**本轮不宣布 M5-A 共享生产验收通过，M5-B Go API 继续冻结**。
 5. 活栈探测额外发现并已修复四处问题（§5.1–§5.4，其中 §5.3 是口径纠偏），这些缺陷都是纯 mock/SQLite 测试结构上不可能发现的。
 6. v3 追加轮闭合存量风险任务 **#55**：`check_kb_migrations_smoke.py` 原用"置空 env 覆盖变量 + 注入 sqlite 地址"的**伪隔离**，其 `rollback` 步实际会打到开发 PostgreSQL 的两张真实表。已改为 env 文件真隔离并在任何破坏性动作前加方言守卫，同时新增静态防回归守卫；历史影响面的可证否部分与**不可判定窗口**见 §9.2。
 
@@ -211,11 +211,11 @@ $ cd backend && PYTHONPATH=. python tests/check_m5a_live_execution.py --confirm
 
 ## 6. 明确未验证项（不得当作已通过）
 
-1. **needs_reindex 的收敛闭环（结构性缺口，不是"没跑"）**：`admin_jobs` 侧只验证到"真实入队 + `targets_hash` 复用 + 门保持 OPEN"（§3.4 P6/P7）。全仓搜索 `reindex_chunks` 只命中 backfill 与 M5-A 测试三处，**没有任何 worker/执行器消费该 job**——消费方属 M5-B Go API。因此"投影从 pending 收敛到 indexed、前置门 CLOSED"这条腿在当前代码库上不可能取证；只要一个 KB 存在未收敛投影，backfill 就永远 exit 3。这是设计上的刻意不收敛（§15.3 步骤 7），但必须承认验收链在此断掉。
-2. **Milvus 向量侧真实写入**：活栈 collection 无 `content_revision` 字段，按 §8.5 禁止改 schema，因此"向量投影真实 backfill 成功"这条腿在当前 v2 collection 上不可能取证，必须等 v3 collection 迁移。
+1. **共享生产 needs_reindex 收敛仍未取证**：M5-B0 已在 SQLite 和唯一临时 v3 namespace 验证 backfill 入队 → Python worker 消费 → 两侧投影回写 → 幂等复跑；共享生产 KB 的 C3（blocked/orphan/unrecoverable/scope）逐 KB 清单和实际收敛仍未完成，因此共享生产门保持 OPEN。
+2. **Milvus 向量侧共享生产写入仍未取证**：临时 v3 collection 已证明显式 `content_revision INT64`、真实 upsert 数量和读回；共享 v2 collection 仍禁止改 schema，共享 v3 collection 尚未迁移。
 3. **真实业务链路**：执行态取证用的是合成 `knowledge_bases` 行 + 合成解析产物（`parsed_documents/m5a-live-20261001/`），不是"用户上传→解析→出 chunks.jsonl"的真实链路。backfill 读写契约已验，端到端业务链路未验。
 4. **规模与并发**：未做。合成 KB 只有 3 个 chunk，dev 全库也只有 10 个 chunk，不具备容量与并发取证条件；`insert_conflicts_skipped` 作为竞态指标也因此没有真实触发样本。
-5. `docs/ENTERPRISE_ROADMAP_CHECKLIST.md` / `ENTERPRISE_IMPLEMENTATION_BACKLOG.md` 尚无 M5-A 条目（本轮未擅自标注状态）。
+5. `docs/ENTERPRISE_ROADMAP_CHECKLIST.md` / `ENTERPRISE_IMPLEMENTATION_BACKLOG.md` 已同步 M5-B0 当前状态；共享生产迁移和 C3 治理仍明确标为未完成。
 
 ## 7. 复现命令
 
@@ -253,8 +253,10 @@ cd backend && PYTHONPATH=. python tests/check_m5a_live_execution.py --confirm --
 ## 8. 修订记录
 
 - v1（2026-10-01）：审计整改轮首版交付报告。四项阻断修复 + 两项补充落地；活栈完成真实 PG 结构校验与只读非 mock 取证；写入执行态未取证，M5-A 不宣布通过，M5-B 保持冻结。
-- v2（2026-10-01）：补真实写入执行态取证（§3.4，合成 KB 授权窗口，34 项断言全绿、清理后复核回基线）。执行态又命中并修复一个静默缺陷（§5.4：未收敛的新 chunk 未在同一轮排入 reindex job），SQLite 矩阵从 108 增至 111 项并新增 `rfa_rerun` 回归；计数改名 `insert_conflicts_skipped`（§2）；未登记 KB 的 `SCOPE_UNRESOLVED` 拒绝腿固化进只读脚本（§3.3）；§6 改写为当前结构性缺口清单，其中 reindex job 无消费方一条决定了"门收敛"这条腿在 M5-B 之前不可能取证。设计文档 §15.3 步骤 7/8 同步补两处口径说明（§5.4 入队时机、§5.5 幂等文字歧义），**未改动任何验收阈值**。M5-A 仍不宣布通过，M5-B 保持冻结。（v3 复核注：本条与 v1 的"111 项 / 34 项"是 `grep -c "✓"` 得到的 ✓ 行数，含汇总行与子进程回显，统一口径下的断言数见 §9.5；退出码与通过/失败判定不变。）
+- v2（2026-10-01，历史记录）：补真实写入执行态取证并记录当时的 reindex 消费缺口；该状态已由 2026-10-02 的 M5-B0 实现和临时 v3 取证 supersede，当前结论见本报告 §6。
 - v3（2026-10-01）：闭合任务 #55（迁移测试 DB 伪隔离）。新增 §9 记录根因、"历史是否曾在活 PG drop 表"的取证结论与不可判定窗口、整改后的三层守卫输出与静态防回归。**本节追加在修订记录之后，是为了保持审计已引用的 §1–§8 编号不变**。M5-A 结论不变：仍不宣布通过，M5-B 保持冻结。
+- v4（2026-10-02）：新增 §10——Windows UTF-8 验收链修复（验收基础设施）。基线复现出四条真实失败腿与**一处假绿灯**（只读脚本的"已登记 KB CLI"步骤不看 `returncode`，子进程已崩仍判通过），整改 5 个文件（三个被点名脚本 + 统一守卫入口 + 迁移 smoke 的父进程侧），取消"必须带 `-X utf8`"这个历史前提；第二项五条命令用普通 `python` 复跑全部 `EXIT=0`。§10.4 如实登记全仓同类缺口 22 个文件（本轮未越界修改），§10.5 勘误 M4R1 报告里"运行前提"的旧表述。**M5-A 仍不宣布通过，M5-B 保持冻结，未 push。**
+- v5（2026-10-02，历史记录）：新增 §11 依赖方案。当时文档为 v1 提案；随后 `df29a72`/`373544e`/`44393e7` 完成 M5-B0，依赖方案已更新为 v2。M5-A 共享生产结论不变：仍不宣布通过，M5-B Go API 保持冻结，未 push。
 
 ---
 
@@ -378,4 +380,127 @@ dialect = postgresql | db = graphinsight_admin
 
 影响面：**不改变任何结论**。四个套件当时与现在的退出码都是 0、失败断言都是 0，虚高只出现在"数量表述"，不涉及阈值、不涉及通过/失败判定，也未掩盖任何缺陷。§3.4 的准确断言数按上表标注为待复跑项，不在本文里猜数。
 
+---
 
+## 10. 追加轮：Windows UTF-8 验收链修复（2026-10-02，验收基础设施）
+
+裁定口径：**M5-A 本轮仍不验收**；这一轮只修验收基础设施——此前所有 Windows 取证都把
+`python -X utf8` 当成运行前提（`docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md:110` 明文写着"这是运行命令前提"），
+本轮取消这个前提：**脚本自身必须能用普通 `python` 直接通过**。
+
+### 10.1 基线复现（普通 `python`，显式清掉 `PYTHONUTF8`/`PYTHONIOENCODING`）
+
+前置证据：`python -c "import sys; print(sys.version.split()[0], sys.stdout.encoding)"` → `3.14.7 gbk`，
+即下列失败都发生在 Windows 默认码下，不是我把环境配坏了。
+
+| # | 腿 | 基线结果 | 根因 |
+| --- | --- | --- | --- |
+| 1 | `check_kb_migrations_smoke.py` | **EXIT=1**，`UnicodeEncodeError: 'gbk' codec can't encode character '\u2713' in position 2`（崩在 `step()` 的 print） | 父进程没有 `reconfigure`，只有子进程侧有 `_utf8_env()` |
+| 2 | `check_m5a_live_stack_readonly.py` | **EXIT=1**，两条断言失败：`✗ kb=… 真实 CLI 因 SCOPE_UNRESOLVED 拒绝（exit 2） (exit=1)` | 子进程没有 `env=`，`backfill_chunk_revisions.py` 自己在 `print` 处崩，真实退出码 2 被 1 顶掉 |
+| 3 | CLI 侧独立取证 | `python backend/admin/backfill_chunk_revisions.py --kb 5ac90b8f… --dry-run` → **EXIT=1**，输出字节流 `utf8-decodable: NO`（invalid start byte at 47），末尾 `UnicodeEncodeError: 'gbk' codec can't encode character '\u2717'`（`backfill_chunk_revisions.py:1112`） | CLI 自身未强制 UTF-8 |
+| 4 | `run_unified_boundary_guards.py` | **EXIT=1**，`UnicodeEncodeError`（`run_unified_boundary_guards.py:115` 的 `print(output[:12000])`） | 统一入口把子进程输出原样回显，父进程没强制 UTF-8 |
+| 5 | **假绿灯（最严重）** | 基线日志第 63 行：`✓ CLI dry-run 有结构化输出（exit=1）` | 该步骤只断言输出含 `[capabilities]`/`[inventory]`，**没有断言 `returncode == 0`**，子进程已经崩了仍判通过 |
+
+第 5 条单独认账：这不是"编码显示问题"，而是**编码缺陷把一条断言变成永久绿灯**——
+只要 CLI 在 Windows 默认码下必崩，这条检查就既显示通过、又与真实退出码无关。
+
+### 10.2 整改内容（五个文件，逐条对应裁定要求）
+
+| 要求 | 落点 |
+| --- | --- |
+| 父进程 stdout/stderr 强制 UTF-8 | `check_kb_migrations_smoke.py:36-38`（本轮新增）、`run_unified_boundary_guards.py:19-24`（本轮新增）；`check_m5a_live_stack_readonly.py`、`check_m5a_live_execution.py` 原有 |
+| 所有 Python 子进程传 `PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8` | readonly 新增 `_utf8_env()` + `_run_backfill_cli()`（两处 CLI 调用收敛为一个入口）；live_execution `run_cli(..., env=_utf8_env())`；migrations smoke 原有 `_base_env()`（守卫自证用的 `probe_env` 同样继承） |
+| 已登记 KB 的 CLI 检查断言 `returncode == 0` | readonly 新增步骤 `已登记 KB 的 CLI dry-run exit 0 且有结构化输出`，断言式 `proc.returncode == 0 and "[capabilities]" in out and "[inventory]" in out` |
+| 失败时输出完整 exit code 和 stderr | readonly `_run_backfill_cli(expect_code=…)`、live_execution `run_cli(..., expect_code=…)` 在退出码≠期望值时打印 `!! … exit=N，期望 exit=M` + 完整 `[stderr]`；migrations smoke `_dump_failure()` 打印完整 stdout/stderr 不截断；守卫入口 `_run_case` 改为返回真实退出码，失败腿不再截断到 12000 字符并打印 `[FAIL] <case> exit=N` |
+| 不得用 `-X utf8` 掩盖 | 本轮全部复跑命令一律 `env -u PYTHONUTF8 -u PYTHONIOENCODING python …`（§10.3）；§7 复现命令表本就是普通 `python`；那条"运行前提"表述按 §10.5 勘误 |
+
+退出码契约同步写实：live_execution 三处 `run_cli` 现在显式声明期望码（作用域冲突 dry-run=2、真实写入=3、幂等重跑=3），
+并把原先**完全没有断言**的幂等重跑退出码补成步骤 `幂等重跑按契约退出（exit 3，前置门仍 OPEN）`。
+这里的期望值不是 0，是设计语义：`exit 3` 表示前置门 OPEN，属刻意不收敛（§6.1），不是失败。
+
+### 10.3 整改后真实输出（普通 `python`，Windows 默认码）
+
+```
+EXIT=0  checks_pass=110  backend/tests/check_m5a_revision_backfill.py
+EXIT=0  checks_pass=69   backend/admin/m5a_schema_check.py both
+EXIT=0  checks_pass=20   backend/tests/check_m5a_live_stack_readonly.py
+EXIT=0  checks_pass=19   backend/tests/check_kb_migrations_smoke.py
+EXIT=0                   backend/tests/check_migration_cleanup_guards.py   （MIGRATION_CLEANUP_GUARDS_OK）
+```
+
+补充取证：
+
+- readonly 关键三行：`✓ 已登记 KB 的 CLI dry-run exit 0 且有结构化输出`、
+  `✓ kb=5ac90b8f-… 真实 CLI 因 SCOPE_UNRESOLVED 拒绝（exit 2）`、`✓ 零写入自证：chunk_revisions 行数不变`；
+  末行 `✓ live-stack read-only evidence collected (non-mock)`。零写入自证仍成立（`chunk_revisions rows=0`、`admin_jobs rows=21` 前后一致）。
+- 乱码核查：整改后只读取证日志按 UTF-8 解码，`U+FFFD` 计数 = **0**（整改前同一份日志里 `SCOPE_WARNING` 等中文行全是替换符）。
+- 已登记 KB 的 dry-run 真实退出码单独复核过（不是为断言编期望值）：
+  `kb=34905f75-38ca-4cfa-bf22-c89c96107fa8` → `EXIT 0`，输出 `[capabilities] … milvus_revision_field=no`、
+  `[inventory] … new_chunks=2 … scope_unresolved=0`、`[gate] CLOSED mode=dry-run needs_reindex=0 blocked=0`。
+- 统一守卫入口：`python backend/tests/run_unified_boundary_guards.py` → **EXIT=0**、`SUMMARY total=16 failed=0`
+  （含 `secret_scanner_selftest` 3.0s）。整改前同一条命令 EXIT=1。
+- `check_m5a_live_execution.py` 不带 `--confirm`：`EXIT=2` 且只打印计划（fail-closed 未变）。
+  带 `--confirm` 的真实写入腿**本轮未执行**——按裁定需单独授权才能写 dev 活栈。
+
+### 10.4 同类缺口的全量扫描结果（如实登记，本轮未越界修改）
+
+用"打印 `✓` 但父进程无 `reconfigure`"与"起子进程但不传 `PYTHONUTF8`"两条规则扫全仓，除本轮五个文件外仍有命中，
+**都不在 M5-A 五条验收命令链路上**，因此不影响 §10.3 的 exit 0 结论，但属同一类缺陷：
+
+- CLI 侧（直接手工调用仍会在 GBK 控制台崩；经本轮改造后的取证套件调用时由 `env=` 兜住）：
+  `admin/backfill_chunk_revisions.py`、`admin/migrate_*.py`（13 个迁移脚本）、`admin/reset_legacy_knowledge_data.py`、
+  `scripts/seed_e2e_local_stack.py`。
+- 套件侧（经 `run_unified_boundary_guards.py` 调用时被父进程 `_utf8_env()` 覆盖，单独直跑仍可能崩）：
+  `check_artifact_secrets_selftest.py`、`check_dual_kb_blackbox.py`、`check_kb_scope_isolation.py`、`check_scope_contract.py`，
+  以及 `run_backend_smoke_suite.py`、`run_perf_soak.py`、`run_rollback_drill.py`、`run_migration_rollback_smoke.py` 等 18 个"起子进程不传 UTF-8"的入口。
+
+推荐处置：M5-A 链路已闭合；第二批应在 M5-B 开工前一并收（尤其 CI 里会直跑的入口），避免再次出现"编码缺陷把断言变成绿灯"。
+是否现在就扩到这两批文件需要拍板——**本轮没有擅自改动这 22 个文件**。
+
+### 10.5 对历史文档的勘误（不改写当轮事实，只标注失效）
+
+`docs/ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md:110` 当轮记录："不带 `-X utf8` 直接跑 `check_kb_migrations_smoke.py` 时，
+父进程在 GBK 控制台打印 `✓` 会 `UnicodeEncodeError`；这是运行命令前提"。
+**该"前提"自 2026-10-02 起作废**：脚本自身已强制 UTF-8（§10.2），普通 `python` 实测 `EXIT=0`（§10.3）。
+原文按版本留痕原则保留，仅在 M4R1 报告原地处标注失效并回指本节。
+
+### 10.6 本轮边界
+
+1. 未宣布 M5-A 验收通过；M5-B Go API 仍冻结（第 3 项依赖方案另见新增设计文档）。
+2. `check_m5a_live_execution.py --confirm` 未执行（写活栈需单独授权），其 P1–P8 断言数仍按 §9.5 口径待复跑。
+3. §10.2 的断言变更**只加不减**：新增 `returncode == 0` 断言与幂等重跑退出码断言，未放宽任何既有阈值；
+   readonly 步骤总数仍为 20（旧步骤 `CLI dry-run 有结构化输出` 改为带 `exit 0` 的更强表述，不是新增计数）。
+4. 未 push（本轮改动留在本地待复核）。
+
+---
+
+## 11. 追加轮：M5-A / M5-B 依赖方案交付（2026-10-02，第三项）
+
+同样追加在修订记录之后，保持 §1–§10 编号不变。
+
+### 11.1 交付物
+
+`docs/ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md`（已更新为 v2：B0 已实现，生产迁移和 C3 仍未完成）。该方案回答四项：`reindex_chunks` 由谁消费、job service / worker / Go API 的最小接入边界、Milvus v3 如何提供 `content_revision`、`needs_reindex_targets` 何时真正收敛 CLOSED；当前实现证据见 `ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md`。
+
+### 11.2 对 §6 措辞的精确化（主动认账）
+
+§6 的历史文字曾写"reindex job 无消费方 ⇒ '门收敛'这条腿**在 M5-B 之前不可能取证**"。该表述已被 B0 实现取代，不能作为当前代码状态：
+
+1. 入队方（backfill）和执行方（Python 进程内 worker）都在 Python 侧，Go 只提供人工触发与列表界面；
+2. 因此存在一个不触碰 Go 的最小切片（依赖方案 §3.1 的 **M5-B0**）即可让门变得可取证；
+3. 正确的阻断表述是：**在 M5-B0（Python worker 消费 `reindex_chunks`）+ Milvus v3（显式 `content_revision`）之前不可能取证**，两者缺一不可（只做 v3 收敛不了任何既有 `needs_reindex_targets`，只做 worker 会被 §8.5 的 v2 缺字段拒写拦回 `pending`）。
+
+这不改变本轮任何验收阈值与结论，只把"等什么"说准。
+
+### 11.3 依赖方案顺带暴露的两处后续风险
+
+1. `backfill_chunk_revisions.py` 的 Milvus `content_revision` 在 backfill 直接路径仍固定为 revision 1；新 chunk 路径成立，但回放/回滚已有 revision 时可能版本假降，留给后续 #73。
+2. Python/Go 仍有多份 job type 白名单，B1 开工前需要跨语言对账静态守卫；当前 Go API 仍冻结，不能把该风险误写成 B0 未实现。
+
+### 11.4 门禁自证
+
+`check_artifact_secrets.py` 对新增文档单独扫描：`files=1 findings=0 result=pass EXIT=0`（普通 `python`，未加 `-X utf8`）。既有四份文档同批扫描 `findings=10`（M5A 报告 1 条 DSN + M4R1 报告 9 条历史标注），本轮新增命中 0。
+
+### 11.5 待用户拍板（依赖方案 §7）
+
+B0 是否授权开工（会改 `RUNNABLE_JOB_TYPES` 并新增真实写索引的执行体）、v3 迁移窗口（共享 dev Milvus 环境变更 + 回滚预演）、不可收敛清单的处置口径（删孤儿行 vs 永久标注 blocked）。

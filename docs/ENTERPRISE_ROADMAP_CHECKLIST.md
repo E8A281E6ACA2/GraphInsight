@@ -387,3 +387,15 @@
 - [x] 阶段 4 已完成：`docqa/health`、模型连通性测试、问答质量看板、问答链路追踪已落地。
 - [x] 阶段 5 已完成：健康检查、告警、SLO、统一指标快照、日志分级统计与 error/warn 告警路由已落地。
 - [x] 阶段 6 已完成当前发布基线：后端自动化测试、运维手册、上线验收清单、前端业务 E2E、发布级 smoke、完整发布链路与发布级性能基线均已落档；容量上限与长稳 soak 测试作为后续增强。
+
+## M5 Chunk Revision 状态快照（2026-10-02）
+
+- [x] M5-B0 Python `reindex_chunks` worker 已实现：job 接线、四道 current 复核、Neo4j/Milvus 投影、CAS 状态回写、文档级聚合和失败分流均已落地。
+- [x] B0 SQLite 隔离矩阵通过；唯一临时 v3 collection 已完成真实 Neo4j/Milvus 读回和三类资源清理复核。
+- [x] Milvus v3 临时契约已验证：`content_revision` 必须是显式 `INT64`，实际 upsert 数量/状态不匹配不得标记 `indexed`。
+- [ ] 共享生产 v3 collection 迁移尚未执行；共享 v2 collection 禁止修改。
+- [ ] 共享 KB 的 C3 数据治理（blocked/orphan/unrecoverable/scope 冲突）尚未逐 KB 清单化并处置。
+- [x] 2026-10-03 已生成共享 KB C3 只读 inventory（1 个 KB，五类清单均为 0）；这不是处置完成，且共享读取仍落在无 `content_revision` 的 v2 collection，生产 gate 继续 OPEN。
+- [ ] M5-B1 Go API 保持冻结，必须等待共享迁移前置条件和审计授权。
+- [ ] 当前不宣布共享生产 `CLOSED`；验收记录见 `docs/ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md`。
+- [x] M5-A/B0 dry-run contract v1 已落地并由 SQLite 验收覆盖；真实共享迁移前仍必须保持 `writes=0` 预览边界。
