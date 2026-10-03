@@ -104,7 +104,7 @@ def summarize(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Aggregate C3 reports into a stable, secret-free full-scope rollup.
 
     Returns total KB count, per-status counts (active/archived/deleting and any
-    unregistered explicit ids), the five C3 category totals, and needs_reindex.
+    unregistered explicit ids), the six C3 category totals, and needs_reindex.
     """
     by_status: Dict[str, int] = {}
     c3_totals = {key: 0 for key in C3_COUNT_KEYS}
@@ -123,6 +123,11 @@ def summarize(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
         "needs_reindex_total": needs_reindex_total,
         "read_only": True,
     }
+
+
+def summary_line(summary: Dict[str, Any]) -> str:
+    """Serialize the rollup as the single parseable C3_SUMMARY line the CLI emits."""
+    return "C3_SUMMARY " + json.dumps(summary, ensure_ascii=True, sort_keys=True)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -171,7 +176,7 @@ def main() -> int:
             f"needs_reindex_total={summary['needs_reindex_total']} "
             f"blocked_total={totals['blocked']} read_only=true"
         )
-    print("C3_SUMMARY " + json.dumps(summary, ensure_ascii=True, sort_keys=True))
+    print(summary_line(summary))
     return 0
 
 
