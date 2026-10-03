@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -131,11 +132,50 @@ def _python_enforced_permissions() -> set[str]:
     return codes
 
 
+SCANNABLE_SUFFIXES = (".go", ".py", ".ts")
+# 扫描范围只取 git 跟踪的源文件；rglob 兜底时排除忽略目录与嵌套 worktree，
+# 避免 .claude/worktrees、study/、虚拟环境里的副本被误判成预留码强制点。
+EXCLUDE_DIR_TOKENS = (
+    ".git",
+    "node_modules",
+    ".claude",
+    ".worktrees",
+    "worktrees",
+    "study",
+    ".venv",
+    "venv",
+)
+
+
+def _scannable_source_files() -> list[Path]:
+    try:
+        raw = subprocess.check_output(
+            ["git", "-C", str(REPO), "ls-files", "-z"], text=True, errors="replace"
+        )
+    except Exception:  # noqa: BLE001 - git 不可用时走兜底扫描
+        raw = None
+    if raw:
+        files = []
+        for rel in raw.split("\0"):
+            if not rel or not rel.endswith(SCANNABLE_SUFFIXES):
+                continue
+            path = REPO / rel
+            if path.is_file():
+                files.append(path)
+        if files:
+            return sorted(files)
+    fallback = []
+    for suffix in SCANNABLE_SUFFIXES:
+        for path in REPO.rglob(f"*{suffix}"):
+            if any(tok in path.parts for tok in EXCLUDE_DIR_TOKENS):
+                continue
+            fallback.append(path)
+    return sorted(fallback)
+
+
 def _reserved_code_references() -> list[str]:
     hits: list[str] = []
-    for path in list(REPO.rglob("*.go")) + list(REPO.rglob("*.py")) + list(REPO.rglob("*.ts")):
-        if ".git" in path.parts or "node_modules" in path.parts:
-            continue
+    for path in _scannable_source_files():
         rel = path.relative_to(REPO).as_posix()
         if rel in RESERVED_ALLOWLIST:
             continue
