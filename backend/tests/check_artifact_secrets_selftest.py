@@ -266,7 +266,37 @@ def _int_after(line: str, key: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# E. 输出与退出码契约（不得回显凭据明文）
+# E. 受保护字面值层：--require-secret-env-var 未设必须 fail-closed（CI 契约 #207）
+# ---------------------------------------------------------------------------
+def protected_env_var_layer() -> None:
+    clean = write("cases/protected_clean.log", "health check ok, nothing sensitive\n")
+
+    # 已设 + 产物干净：正常放行，SUMMARY 记 protected_env_vars=1。
+    code, out = run_cli([clean], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    step("受保护变量已设且产物干净时放行并计数 protected_env_vars",
+         code == 0 and "findings=0" in out and "protected_env_vars=1" in out,
+         f"exit={code} {summary_of(out)}")
+
+    # 未设：即使产物干净也必须 exit 2 且 withheld——否则"必定注入却静默失败"会扫 0 字面量后假绿。
+    code, out = run_cli([clean], extra_args=["--require-secret-env-var", "GRAPHINSIGHT_SELFTEST_UNSET_REQVAR"])
+    step("受保护变量未设时 fail-closed（exit 2 + artifacts_withheld），不被干净产物掩盖",
+         code == 2 and "required_secret_env_var_unset" in out and "artifacts_withheld=true" in out,
+         f"exit={code} {summary_of(out)}")
+
+    # 已设 + 产物含其字面值：命中 run_credential，证明受保护就是"会扫且不可放行的字面值"。
+    hit = write("cases/protected_hit.log", f"deploy payload={RUN_LITERAL} done")
+    code, out = run_cli([hit], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    step("受保护变量已设且产物含其字面值时命中 run_credential",
+         code == 1 and "kind=run_credential" in out, f"exit={code} {summary_of(out)}")
+
+    # 对照：可选变量未设只打 NOTE 并放行，与受保护未设的 exit 2 形成明确区分。
+    code, out = run_cli([clean], extra_args=["--secret-env-var", "GRAPHINSIGHT_SELFTEST_UNSET_REQVAR"])
+    step("可选变量未设仅 NOTE 并放行（区别于受保护未设的 fail-closed）",
+         code == 0 and "env_var_unset" in out and "findings=0" in out, f"exit={code}")
+
+
+# ---------------------------------------------------------------------------
+# F. 输出与退出码契约（不得回显凭据明文）
 # ---------------------------------------------------------------------------
 def output_contract() -> None:
     secret = "SuperSecret123"
@@ -330,6 +360,7 @@ def main() -> int:
         negative_structural()
         literal_layer()
         exclusion_scope()
+        protected_env_var_layer()
         output_contract()
         label_echo_guard()
 
