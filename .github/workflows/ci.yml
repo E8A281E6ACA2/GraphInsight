@@ -156,9 +156,15 @@ jobs:
           rc=0
 
           printf 'health check ok, nothing sensitive\n' > "$probe_dir/clean.log"
-          out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE='   ' \
-            python "$scanner" --path "$probe_dir/clean.log" \
-              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; code=$?
+          # GitHub 的 `shell: bash` 以 -e 调用，命令替换里预期非零会打断 step；故把赋值放进
+          # if 条件位（-e 抑制），退出码走 else 分支的 $? 捕获。
+          if out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE='   ' \
+              python "$scanner" --path "$probe_dir/clean.log" \
+                --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; then
+            code=0
+          else
+            code=$?
+          fi
           if [ "$code" -eq 2 ] \
             && printf '%s' "$out" | grep -q 'reason=protected_credential_unset' \
             && printf '%s' "$out" | grep -q 'artifacts_withheld=true'; then
@@ -169,9 +175,13 @@ jobs:
           fi
 
           printf 'payload %s end\n' "$probe_secret" > "$probe_dir/hit.log"
-          out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
-            python "$scanner" --path "$probe_dir/hit.log" \
-              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; code=$?
+          if out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
+              python "$scanner" --path "$probe_dir/hit.log" \
+                --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; then
+            code=0
+          else
+            code=$?
+          fi
           if [ "$code" -eq 1 ] && printf '%s' "$out" | grep -q 'kind=run_credential'; then
             echo "PROTECTED_LITERAL_OK required_secret_literal_detected_exit1"
           else
@@ -180,9 +190,13 @@ jobs:
           fi
 
           printf 'health check ok, nothing sensitive\n' > "$probe_dir/absent.log"
-          out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
-            python "$scanner" --path "$probe_dir/absent.log" \
-              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; code=$?
+          if out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
+              python "$scanner" --path "$probe_dir/absent.log" \
+                --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; then
+            code=0
+          else
+            code=$?
+          fi
           if [ "$code" -eq 0 ] \
             && printf '%s' "$out" | grep -q 'findings=0' \
             && printf '%s' "$out" | grep -q 'result=pass'; then
