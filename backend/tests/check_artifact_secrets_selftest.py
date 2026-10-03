@@ -143,6 +143,14 @@ def positive_assignment_shapes() -> None:
     expect_hit("带口令 DSN 正样本", "dsn.log",
                "connect postgresql://appuser:s3cr3tpass@10.0.0.5:5432/graphinsight", "dsn_with_credentials")
     expect_hit("JWT 正样本", "jwt.log", f"authorization payload {JWT_SAMPLE}", "jwt")
+    # 漏报回归（2026-10-03）：结构前缀（null/undefined/self）后用连字符拼上真实凭据，
+    # 旧 _is_structural_value 只看首段就整体放行。收窄后必须照常命中。
+    expect_hit("结构前缀拼真凭据回归：undefined 前缀 + 连字符 + 值", "under.log",
+               "password=undefined-SECRET123", "credential_assignment")
+    expect_hit("结构前缀拼真凭据回归：null 前缀 + 连字符 + 值", "nulld.log",
+               "password=null-SECRET123", "credential_assignment")
+    expect_hit("结构前缀拼真凭据回归：self 前缀 + 连字符 + 值", "selfd.log",
+               "password=self-SECRET123", "credential_assignment")
 
 
 # ---------------------------------------------------------------------------

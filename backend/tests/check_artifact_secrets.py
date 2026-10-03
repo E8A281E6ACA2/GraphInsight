@@ -96,6 +96,12 @@ STRUCTURAL_VALUE_HEADS = {
 # 自检里有一条用例把这个缺口钉在明面上，不允许它悄悄扩大。
 CODE_CALL_VALUE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*\(")
 
+# 首段命中结构字面量后，紧随其后的字符必须真的是代码边界，否则右侧仍承载真实凭据。
+# `null;const` / `self.password` 里首段之后是 `;` 或 `.`（语句分隔符 / 属性访问）——是骨架；
+# 而 `undefined-SECRET123` / `null-SECRET123` / `self-SECRET123` 里首段之后是 `-`，
+# 那是把真凭据拼在结构前缀上（漏报回归 2026-10-03），必须照常报。
+STRUCTURAL_VALUE_TAIL_BOUNDARY = frozenset(".;,)]}")
+
 
 def _walk(paths: Iterable[Path], excludes: Sequence[str]) -> Iterable[tuple[Path, bool]]:
     """产出 (文件, 是否扫描赋值形状)。排除只作用于赋值形状，不作用于字面值与高置信形状。"""
@@ -131,8 +137,19 @@ def _redact(match: str) -> str:
 
 
 def _is_structural_value(value: str) -> bool:
+    """True only when the WHOLE value is code structure, not just a structural prefix.
+
+    A leading run of letters matching STRUCTURAL_VALUE_HEADS is necessary but not
+    sufficient: the character right after that run must be a genuine code boundary
+    (`;` statement separator, `.` property access, `,` `)` `}` `]`) or end of the
+    token. `undefined-SECRET123` / `null-SECRET123` / `self-SECRET123` glue a real
+    credential onto the structural prefix with `-`, so they are NOT structural.
+    """
     head = re.match(r"[^A-Za-z]*([A-Za-z]+)", value)
-    return bool(head) and head.group(1).lower() in STRUCTURAL_VALUE_HEADS
+    if not head or head.group(1).lower() not in STRUCTURAL_VALUE_HEADS:
+        return False
+    rest = value[head.end():]
+    return rest == "" or rest[0] in STRUCTURAL_VALUE_TAIL_BOUNDARY
 
 
 def _is_code_value(value: str) -> bool:
