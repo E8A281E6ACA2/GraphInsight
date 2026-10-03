@@ -142,11 +142,13 @@ jobs:
       - name: Verify credential-scan fails closed on missing required secret
         shell: bash
         run: |
-          # CI 负向探针（任务 #207）：门禁最怕的失效形态是"退化成永久绿灯"。这里在 runner 上
-          # 实测受保护凭据的三条契约，任何一条不成立就让本 job 失败：
-          #   1) 受保护变量未设 + 干净产物 → 扫描器必须非零退出（fail-closed），不得扫 0 字面量后放行；
-          #   2) 受保护变量已设 + 产物含其字面值 → 必须命中 run_credential（证明它真参与扫描，不只是存在性闸门）；
-          #   3) 受保护变量已设 + 产物不含它 → 必须放行（证明不是无条件判红）。
+          # CI 负向探针（任务 #207 / #209）：门禁最怕的失效形态是"退化成永久绿灯"，
+          # 而"只判非零退出"又会把普通崩溃/参数错误误记成 FAILCLOSED_OK。故这里捕获
+          # 退出码与输出，对三条契约做精确断言，任一不符（码或字段）即让 job 失败：
+          #   CASE1 纯空白受保护变量 → 必须等同未设：exit 2 + reason=protected_credential_unset
+          #          + artifacts_withheld=true（守护 strip-before-presence 修复）；
+          #   CASE2 已设且产物含其字面值 → 必须 exit 1 + kind=run_credential；
+          #   CASE3 已设且产物干净 → 必须 exit 0 + findings=0 + result=pass。
           set -uo pipefail
           scanner=backend/tests/check_artifact_secrets.py
           probe_dir="$(mktemp -d)"
@@ -154,31 +156,40 @@ jobs:
           rc=0
 
           printf 'health check ok, nothing sensitive\n' > "$probe_dir/clean.log"
-          if GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="" \
+          out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE='   ' \
             python "$scanner" --path "$probe_dir/clean.log" \
-              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE; then
-            echo "::error::scanner PASSED with a required secret unset (fail-open regression)"; rc=1
+              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; code=$?
+          if [ "$code" -eq 2 ] \
+            && printf '%s' "$out" | grep -q 'reason=protected_credential_unset' \
+            && printf '%s' "$out" | grep -q 'artifacts_withheld=true'; then
+            echo "FAILCLOSED_OK whitespace_required_secret_fails_closed_exit2"
           else
-            echo "FAILCLOSED_OK unset_required_secret_fails_closed"
+            echo "::error::CASE1 expected exit 2 + protected_credential_unset + artifacts_withheld=true, got exit=$code"
+            printf '%s\n' "$out"; rc=1
           fi
 
           printf 'payload %s end\n' "$probe_secret" > "$probe_dir/hit.log"
           out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
             python "$scanner" --path "$probe_dir/hit.log" \
-              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"
-          if printf '%s' "$out" | grep -q 'kind=run_credential'; then
-            echo "PROTECTED_LITERAL_OK required_secret_literal_is_detected"
+              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; code=$?
+          if [ "$code" -eq 1 ] && printf '%s' "$out" | grep -q 'kind=run_credential'; then
+            echo "PROTECTED_LITERAL_OK required_secret_literal_detected_exit1"
           else
-            echo "::error::scanner missed a required secret literal present in the artifact"; rc=1
+            echo "::error::CASE2 expected exit 1 + kind=run_credential, got exit=$code"
+            printf '%s\n' "$out"; rc=1
           fi
 
           printf 'health check ok, nothing sensitive\n' > "$probe_dir/absent.log"
-          if GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
+          out="$(GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE="$probe_secret" \
             python "$scanner" --path "$probe_dir/absent.log" \
-              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE; then
-            echo "PASS_EMPTY_OK clean_artifact_with_required_secret_passes"
+              --require-secret-env-var GRAPHINSIGHT_CI_REQUIRED_SECRET_PROBE 2>&1)"; code=$?
+          if [ "$code" -eq 0 ] \
+            && printf '%s' "$out" | grep -q 'findings=0' \
+            && printf '%s' "$out" | grep -q 'result=pass'; then
+            echo "PASS_EMPTY_OK clean_artifact_with_required_secret_exit0"
           else
-            echo "::error::scanner failed a clean artifact while its required secret was set"; rc=1
+            echo "::error::CASE3 expected exit 0 + findings=0 result=pass, got exit=$code"
+            printf '%s\n' "$out"; rc=1
           fi
 
           rm -rf "$probe_dir"
