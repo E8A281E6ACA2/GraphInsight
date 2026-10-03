@@ -270,9 +270,9 @@ def main() -> int:
     literals: list[str] = []
     provided: list[str] = []
     for name in args.secret_env_var:
-        value = os.getenv(name, "")
+        value = (os.getenv(name) or "").strip()
         if value:
-            literals.append(value.strip())
+            literals.append(value)
             provided.append(name)
         else:
             print(f"SECRET_SCAN_NOTE env_var_unset name={name}")
@@ -283,9 +283,12 @@ def main() -> int:
     protected: list[str] = []
     unset_required: list[str] = []
     for name in args.require_secret_env_var:
-        value = os.getenv(name, "")
+        # Strip BEFORE testing presence: a whitespace-only value ("   ") is a misconfigured
+        # provision, not a set credential. Without this, os.getenv returns a truthy "   ",
+        # .strip() yields "", and the run would count it as protected and scan zero literals.
+        value = (os.getenv(name) or "").strip()
         if value:
-            literals.append(value.strip())
+            literals.append(value)
             provided.append(name)
             protected.append(name)
         else:

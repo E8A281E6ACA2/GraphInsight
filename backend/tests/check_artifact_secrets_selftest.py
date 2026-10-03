@@ -33,6 +33,10 @@ FAILURES: list[str] = []
 RUN_LITERAL_ENV = "GRAPHINSIGHT_SELFTEST_RUN_CREDENTIAL"
 RUN_LITERAL = "selftest-once-credential-4f0c9b7e21"
 
+# 纯空白受保护变量：证明 strip-before-presence 生效——空白值等同未设，必须 fail-closed。
+WS_REQVAR_ENV = "GRAPHINSIGHT_SELFTEST_WS_REQVAR"
+WS_REQVAR_VALUE = "   \t "
+
 BCRYPT_SAMPLE = "$2b$12$N9u6E9lOZ3xK4mQ7pRsT2vW8yB5cD1fG6hJ0kL3mN4oP7qR9sT2uV"
 JWT_SAMPLE = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5E_Xw"
 
@@ -69,7 +73,7 @@ def run_cli(paths: list[Path], extra_args: list[str] | None = None, with_literal
         encoding="utf-8",
         errors="replace",
         cwd=str(backend_dir.parent),
-        env=_utf8_env(os.environ, {RUN_LITERAL_ENV: RUN_LITERAL}),
+        env=_utf8_env(os.environ, {RUN_LITERAL_ENV: RUN_LITERAL, WS_REQVAR_ENV: WS_REQVAR_VALUE}),
         timeout=120,
     )
     return proc.returncode, proc.stdout + proc.stderr
@@ -293,6 +297,22 @@ def protected_env_var_layer() -> None:
     code, out = run_cli([clean], extra_args=["--secret-env-var", "GRAPHINSIGHT_SELFTEST_UNSET_REQVAR"])
     step("可选变量未设仅 NOTE 并放行（区别于受保护未设的 fail-closed）",
          code == 0 and "env_var_unset" in out and "findings=0" in out, f"exit={code}")
+
+    # 纯空白受保护变量：strip-before-presence 必须把它当作未设——exit 2、withheld、且不进文件扫描。
+    code, out = run_cli([clean], extra_args=["--require-secret-env-var", WS_REQVAR_ENV])
+    step("纯空白受保护变量按未设 fail-closed（exit 2 + protected_credential_unset + withheld）",
+         code == 2 and "reason=protected_credential_unset" in out and "artifacts_withheld=true" in out,
+         f"exit={code} {summary_of(out)}")
+    step("纯空白受保护变量不进入文件扫描（无 files= 汇总、不计入 protected_env_vars）",
+         "files=" not in out and "protected_env_vars" not in out, f"exit={code} {out[:200]}")
+
+    # 三种退出码在同一受保护变量下必须互斥且明确：未设/空白=2、含凭据=1、干净=0。
+    code_unset, _ = run_cli([clean], extra_args=["--require-secret-env-var", WS_REQVAR_ENV])
+    code_dirty, _ = run_cli([hit], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    code_clean, _ = run_cli([clean], extra_args=["--require-secret-env-var", RUN_LITERAL_ENV])
+    step("受保护变量三态退出码互斥且精确（空白=2 / 含凭据=1 / 干净=0）",
+         code_unset == 2 and code_dirty == 1 and code_clean == 0,
+         f"unset={code_unset} dirty={code_dirty} clean={code_clean}")
 
 
 # ---------------------------------------------------------------------------
