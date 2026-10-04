@@ -233,6 +233,46 @@ orphan_revisions / unrecoverable / scope_unresolved / scope_mismatches / 迁移�
 
 ---
 
+### 9.2 实现落地记录（2026-10-05 · revision 生命周期轮，分支 `m5/dual-write`）
+
+本节同样只记录**代码事实**（可 `git`/文件复查），不改变 §4–§9 的任何门禁判定：真实 v3 迁移仍关闭。
+它解决的是 §6 对账判据"`v3.content_revision == current_revision`"此前**无源**的问题——
+S1 双写要落显式 INT64 revision，前提是本仓建图路径自己能建立权威 revision。
+
+- 新增 `backend/services/chunk_revision_lifecycle.py:write_revisions_for_build_graph`：单事务内
+  为每个 chunk 建立/推进权威 current revision。无 current → `rev=1`；`content_hash` 与既有
+  current 相同 → 保持不动（幂等重试）；内容变化 → 老行 `UPDATE … WHERE revision_id=? AND
+  revision_status='current'` 转 superseded（rowcount≠1 即 `RuntimeError` 整体回滚），再 INSERT
+  `rev=max+1` 的 current。`content_hash = sha256(text)`，与 §9 backfill
+  （`admin/backfill_chunk_revisions._sha256`）同源。**不新增迁移**：复用 `chunk_revisions` 既有
+  `UNIQUE (kb_id, chunk_id, content_revision)` 与部分唯一索引 `uq_chunk_revisions_current`。
+- `build_graph` 接线（`services/document_graph_service.py`）：revision 在"文档确有变更"分支之后、
+  **任何 Neo4j 投影写入之前**建立；返回的 revision map 逐 chunk 注入 `chunk_payload`，Chunk MERGE
+  写 `ch.content_revision = coalesce(c.content_revision, ch.content_revision)`，同一 map 传给
+  `retrieval_orchestrator.index_chunks(content_revisions=…)` → `VectorChunk.content_revision`，
+  §8.5 影子 collection 的显式 INT64 字段自此有源。
+- 投影回写：每个 doc 建图后按 CAS 回写 `chunk_revisions` 投影状态（graph 落 indexed+版本；
+  `index_chunks` 有失败则 vector 保持 pending 且版本置 NULL），并在 `build_graph` 末尾按 §6.2
+  优先级重算文档级 `graph_status/vector_status`，结果以 `document_states` 返回。
+- 自动化验证：`backend/tests/check_m5_build_graph_revision.py`（临时 SQLite + 假 Milvus client，
+  不连真实 Neo4j/Milvus，22 条断言）。除单元口径外含**真实 build_graph 端到端取证**：revision 行
+  先于 Document/Chunk MERGE 存在、Chunk 参数带 `content_revision`、`content_revisions` 传到
+  `index_chunks`、CAS 回写 indexed、§6.2 聚合更新 `knowledge_base_documents`、`force=False`
+  未变更跳过且不再建 revision、内容变更推进到 rev=2。已注册为统一门禁
+  `m5_build_graph_revision`；本轮门禁全量 `SUMMARY total=19 failed=0`。
+- 测试隔离修复（如实认账）：`backend/tests/check_kb_scope_isolation.py` 自称"纯单元"，但其
+  scenario [g] 跑真实 `build_graph`，Wave 2 接线后曾把 1 条 revision 行写进**共享开发库**。
+  现该脚本在任何 backend 模块导入前把 `ADMIN_DATABASE_URL` 钉到临时 SQLite
+  （`GRAPHINSIGHT_BACKEND_ENV_FILE`，唯一能盖过 `backend/.env` 的入口），入口断言方言必须为
+  sqlite（否则 exit 9），并新增"revision 行只落临时库"复核（passed=55 failed=0）。
+  泄漏发生时开发库的完整行内容已留档：`kb_id='kb-a', doc_id='doc-a', chunk_id='doc-a-000',
+  content_revision=1, revision_status=current, graph_status=indexed, vector_status=indexed,
+  reason='build_graph_m5_wave2'`；该行不属于任何真实 KB，**删除需单独授权，本轮未动**。
+- **未做**：真实 Neo4j/Milvus 侧的 revision 写入验证、v3 建集合、切读源、§5.1/§5.2 canary——
+  这些仍需单独授权；影子失败持久转交与连续场景在下一波（Wave 3）。
+
+---
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。

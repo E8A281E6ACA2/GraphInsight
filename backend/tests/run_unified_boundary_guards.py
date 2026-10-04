@@ -62,6 +62,12 @@ CASES: tuple[GuardCase, ...] = (
         "M5 §16.1 S1 build_graph→dual_write 影子失败→作业重试调用链守卫",
     ),
     GuardCase(
+        "m5_build_graph_revision",
+        "check_m5_build_graph_revision.py",
+        120,
+        "M5 §16.1 S1 Wave 2 revision 生命周期（CAS + 先于投影写入 + VectorChunk content_revision）守卫",
+    ),
+    GuardCase(
         "secret_scanner_selftest",
         "check_artifact_secrets_selftest.py",
         180,

@@ -568,6 +568,27 @@ class DocumentGraphService:
                         logger.info("文档未变更，跳过", context={"doc": doc.name, "kb_id": doc_kb_id})
                         continue
 
+                    # Wave 2 / §16.1 S1：权威 revision 必须先于任何投影写入建立（此处已确认
+                    # 文档内容确有变化）。放在 Neo4j 写入之前，建图失败时 revision 仍在，
+                    # chunk 以 pending 暴露给 reindex/backfill 收敛；反过来（先写投影后建
+                    # revision）会让 §8.5 的 shadow content_revision 缺源。
+                    from services.chunk_revision_lifecycle import write_revisions_for_build_graph
+
+                    revision_result = write_revisions_for_build_graph(
+                        kb_id=doc_kb_id,
+                        tenant_id=doc_tenant_id,
+                        project_id=doc_project_id,
+                        doc_id=doc_id,
+                        chunks=chunk_payload,
+                        parser_version=parsed.parser_version,
+                        reason="build_graph_m5_wave2",
+                    )
+                    authoritative_revisions: Dict[str, int] = dict(revision_result.get("revisions") or {})
+                    for item in chunk_payload:
+                        revision = authoritative_revisions.get(str(item.get("chunk_id") or ""))
+                        if revision is not None:
+                            item["content_revision"] = int(revision)
+
                     session.run(
                         """
                         MERGE (d:Document {doc_id: $doc_id, kb_id: $kb_id})
@@ -636,6 +657,7 @@ class DocumentGraphService:
                             UNWIND $chunks AS c
                             MERGE (ch:Chunk {chunk_id: c.chunk_id, kb_id: $kb_id})
                             SET ch.text = c.text,
+                                ch.content_revision = coalesce(c.content_revision, ch.content_revision),
                                 ch.index = c.index,
                                 ch.doc_id = $doc_id,
                                 ch.kb_id = $kb_id,
@@ -799,9 +821,21 @@ class DocumentGraphService:
                     kb_id=doc_kb_id,
                     tenant_id=doc_tenant_id,
                     project_id=doc_project_id,
+                    content_revisions=authoritative_revisions,
                 )
                 vector_indexed += int(vector_result.get("indexed") or 0)
                 vector_failures.extend([str(item) for item in (vector_result.get("failures") or [])])
+
+                # 建图后回写投影状态（CAS：期望 revision 就是本轮建立的 authoritative_revisions；
+                # 若并发建图抢先移动 current，update_projection_state rowcount=0 视作过期，
+                # 不宣布本轮 indexed。vector_failures 非空 → 该 doc 的 chunk vector 保持 pending，
+                # 由调用方上层按 dual-write 语义决定是否重试）。
+                self._write_back_projection_state(
+                    kb_id=doc_kb_id,
+                    revisions=authoritative_revisions,
+                    chunk_payload=chunk_payload,
+                    vector_failures_present=bool(vector_result.get("failures")),
+                )
 
                 doc_count += 1
                 processed_doc_ids.append(doc_id)
@@ -816,6 +850,13 @@ class DocumentGraphService:
                 continue
 
         entity_count = len(entity_names)
+
+        # §6.2：chunk 投影状态回写后重算文档级 graph_status/vector_status，
+        # 否则 chunk 已是 pending 而 knowledge_base_documents 仍显示上一轮的 indexed。
+        from services.chunk_projection_state import aggregate_document_states
+
+        document_states = aggregate_document_states(normalized_kb, sorted(set(processed_doc_ids)))
+
         return {
             "documents": doc_count,
             "chunks": chunk_count,
@@ -834,10 +875,54 @@ class DocumentGraphService:
             "project_id": doc_project_id,
             "target_doc_ids": clean_doc_ids,
             "processed_doc_ids": processed_doc_ids,
+            "document_states": document_states,
             "reasoning_profile": reasoning_profile or "",
             "complex_extraction": complex_extraction,
             "parser_provider": parser_provider or "",
         }
+
+    def _write_back_projection_state(
+        self,
+        *,
+        kb_id: str,
+        revisions: Dict[str, int],
+        chunk_payload: List[Dict[str, Any]],
+        vector_failures_present: bool,
+    ) -> None:
+        """建图后 CAS 回写 chunk_revisions 投影状态（Wave 2）。
+
+        - graph：Neo4j Chunk/Entity/Relation 写已在上一步完成，因此本轮 indexed 目标
+          revision 的 chunk 一律 graph_status='indexed' + graph_content_revision=rev。
+        - vector：`index_chunks` 有失败即视为整批未收敛，vector_status 保持 'pending'
+          （回写向量内容 revision=NULL）；无失败才落 'indexed' + 版本。上层 dual_write
+          影子失败按 §6 判未收敛，走 job 重试而不是这里回滚。
+        - rowcount=0（current 被并发移动）跳过本 chunk，不重试也不虚报；调用方通过
+          aggregate_document_states 得到最终文档态。
+
+        不新增迁移：完全复用 services.chunk_projection_state.update_projection_state。
+        """
+        if not revisions:
+            return
+        from services.chunk_projection_state import update_projection_state
+
+        for chunk in chunk_payload:
+            chunk_id = str(chunk.get("chunk_id") or "").strip()
+            if not chunk_id:
+                continue
+            expected = revisions.get(chunk_id)
+            if expected is None:
+                continue
+            kwargs: Dict[str, Any] = {
+                "graph_status": "indexed",
+                "graph_content_revision": int(expected),
+            }
+            if vector_failures_present:
+                kwargs["vector_status"] = "pending"
+                kwargs["vector_content_revision"] = None
+            else:
+                kwargs["vector_status"] = "indexed"
+                kwargs["vector_content_revision"] = int(expected)
+            update_projection_state(kb_id, chunk_id, expected_revision=int(expected), **kwargs)
 
     def _require_kb_scope(self, kb_id: Optional[str]) -> str:
         """delete/clear 类操作的 kb 强制点：缺失/非法时在任何 DB 访问之前拒绝。"""

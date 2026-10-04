@@ -244,8 +244,18 @@ class RetrievalOrchestrator:
         kb_id: str,
         tenant_id: str = "",
         project_id: str = "",
+        content_revisions: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
-        """写入 chunk 向量；kb_id 必填（无作用域禁止任何 Milvus 写入）。"""
+        """写入 chunk 向量；kb_id 必填（无作用域禁止任何 Milvus 写入）。
+
+        `content_revisions`（Wave 2 / P1#2）：chunk_id → 权威 content_revision 映射，
+        来自 services.chunk_revision_lifecycle.write_revisions_for_build_graph。
+        §8.5 要求 shadow collection 显式 INT64 `content_revision` 字段——upsert 缺该字段
+        时 vector_store 会包成 DualWriteShadowError 抛出。build_graph 调用点必须先建
+        revision、再传 map 进来，不允许默默写无版本向量。不传 map 时逐 chunk 保持 None
+        （reindex_chunks / backfill 不走本方法，它们直接 `vector_store.upsert_chunks`
+        并自带 target_revision；这里只剩测试旁路，保持原行为不炸）。
+        """
         # 作用域强制点：先于任何 enabled 检查，缺失即拒绝
         from services.scope_contract import require_kb_scope
 
@@ -288,6 +298,11 @@ class RetrievalOrchestrator:
                         tenant_id=str(tenant_id or ""),
                         project_id=str(project_id or ""),
                         metadata=self._chunk_vector_metadata(item),
+                        content_revision=(
+                            content_revisions.get(str(item.get("chunk_id") or ""))
+                            if content_revisions is not None
+                            else None
+                        ),
                     )
                     for item in batch
                 ]
