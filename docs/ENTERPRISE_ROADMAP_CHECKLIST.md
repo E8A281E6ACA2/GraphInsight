@@ -405,3 +405,10 @@
   SCOPE_SLICE 封顶）；隔离验收 `check_m5_c3_inventory.py` 与 `check_m5_gate0_coverage.py`
   通过。仅为隔离合同实现（Gate 0 contract implementation complete），共享生产 Gate 0 仍 OPEN，
   未授权不写共享 dev/v2/v3。
+- [x] 2026-10-04（审计修订 2）Gate 0 证据合同按审计退回意见整改：五类证据源全部改为显式
+  `value/ok/reason`（权限/连接/SQL/缺表/统计不可读不再折算 0）；before/after 任一 degraded
+  reason 强制 `FAILED` + exit 2 + `writes=UNVERIFIED_EVIDENCE`；resolved current collection
+  缺失即 FAILED；`configured_raw` 与 `resolved` 名称分离报告；显式非敏感 environment_id
+  （`GRAPHINSIGHT_ENVIRONMENT_ID`）且 PG 正式运行缺失拒 FULL；负向测试扩至"四源分别失败
+  且前后值等价 0"矩阵 + scope_unresolved 仍被探测场景（12 场景全绿）。同时修正文档中
+  "所有异常均 fail-closed"与 worktree 清洁状态的过度表述。仍为隔离层，Gate 0 保持 OPEN。
