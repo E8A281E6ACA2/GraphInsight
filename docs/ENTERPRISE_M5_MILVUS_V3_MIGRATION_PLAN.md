@@ -216,7 +216,7 @@ gate 报告，支撑 §7 处置清单作为迁移前置门禁的可审计性。�
 
 隔离验证：`backend/tests/check_m5_c3_inventory.py`（formatter/verdict/分类/对账/
 value-ok-reason/环境标识契约）与 `backend/tests/check_m5_gate0_coverage.py`（SQLite +
-假 pymilvus/neo4j 的 CLI 正负场景 12 个：全覆盖、状态排除、缺 scope、单 KB 读取异常、
+假 pymilvus/neo4j 的 CLI 正负场景 13 个：全覆盖、状态排除、缺 scope、单 KB 读取异常、
 多 collection、计数漂移、注册表降级、**PG chunk_revisions/admin_jobs/Neo4j/Milvus
 四源分别失败且前后值等价 0 的负向矩阵**、active KB 带 scope_unresolved 仍被探测并进入
 C3 报告）。
