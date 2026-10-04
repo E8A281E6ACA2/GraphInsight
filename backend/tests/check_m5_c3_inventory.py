@@ -265,6 +265,18 @@ def main() -> int:
             assert env_id == "", f"invalid value must not be emitted: {bad!r}"
             assert failure == "ENVIRONMENT_ID_INVALID: value rejected by strict allowlist"
             assert "postgres" not in (env_id or "") and "pass" not in (env_id or "")
+        # 审计修订 4：原始值直接校验，禁止先 strip 再匹配——前导/尾随/内部空白
+        # 与纯空白一律 INVALID，绝不静默裁剪后放行；纯空白不是 MISSING。
+        for padded in (" prod", "prod ", "\tprod", "prod\n", "   "):
+            os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = padded
+            env_id, failure = resolve_environment_id("postgresql")
+            assert env_id == "", f"padded value must not be emitted: {padded!r}"
+            assert failure == "ENVIRONMENT_ID_INVALID: value rejected by strict allowlist", (
+                f"padded value must be INVALID (not MISSING): {padded!r}"
+            )
+            assert "prod" not in (env_id or "")
+            env_id, failure = resolve_environment_id("sqlite")
+            assert env_id == "" and failure is not None, f"INVALID must hold on any dialect: {padded!r}"
         # 边界：首字符必须字母数字，长度上限 64。
         os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "-leading-dash"
         env_id, failure = resolve_environment_id("sqlite")

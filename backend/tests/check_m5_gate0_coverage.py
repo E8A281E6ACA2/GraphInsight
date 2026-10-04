@@ -229,7 +229,7 @@ def _patch_sandbox(fail_kb_ids: List[str]) -> Tuple[_Sandbox, Dict[str, Any]]:
     report.engine = engine
     report._resolve_commit_sha = lambda: COMMIT_SHA
     backfill.build_inventory = stub_build
-    # raw(legacy) != resolved(v2)：确定性演示 §11.1/D3 归一化分离（audit 修订 4）。
+    # raw(legacy) != resolved(v2)：确定性演示 §11.1/D3 归一化分离（audit 修订 2）。
     backfill._milvus_collection_name = lambda: "graphinsight_chunks_v2"
     report._milvus_raw_collection_name = lambda: "graphinsight_chunks"
     os.environ["C3_INVENTORY_ALLOW_NON_PG"] = "1"
@@ -696,6 +696,44 @@ def scenario_environment_id_invalid_fail_closed() -> None:
     assert sorted(box.probes) == ["kb-active-a", "kb-active-b"]
 
 
+# ---------------------------------------------------------------------------
+# 场景 14（audit 修订 4）：environment_id 填充空白 —— 原始值直接严格匹配，
+# 禁止先 strip 再校验。前导/尾随/内部空白与纯空白一律 INVALID + fail-closed，
+# 纯空白不得归类为 MISSING，且原值中的可见 token 不得出现在任何输出行。
+# ---------------------------------------------------------------------------
+
+
+def scenario_environment_id_whitespace_rejected() -> None:
+    padded_values = (" prod", "prod ", "\tprod", "prod\n", "   ")
+    for padded in padded_values:
+        box, restore = _patch_sandbox([])
+        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = padded
+        try:
+            code, stdout = _run_cli_capture([])
+        finally:
+            _restore(restore)
+        summary = _summary_of(stdout)
+        assert code == 2, f"padded environment id must exit 2, got {code}: {padded!r}"
+        assert summary["coverage_verdict"] == "FAILED", f"verdict must be FAILED: {padded!r}"
+        assert summary["writes"] == "UNVERIFIED_EVIDENCE", f"writes must be UNVERIFIED_EVIDENCE: {padded!r}"
+        assert summary["environment_id_invalid"] is True, f"must be INVALID, not MISSING: {padded!r}"
+        assert "ENVIRONMENT_ID_INVALID" in stdout
+        # 纯空白无可查 token；其余值断言裁剪后的可见 token 零泄露。
+        # 按词边界匹配：排除 shared_production_gate 等合法词的子串误报，
+        # 但 environment_id=prod 这类真实泄露仍会被命中。
+        if padded.strip():
+            assert not re.search(r"(?<![A-Za-z_])prod(?![A-Za-z])", stdout), (
+                f"leak detected after trimming: {padded!r}"
+            )
+        kv = _parse_kv_line(
+            next(l for l in stdout.splitlines() if l.startswith("GATE0_COVERAGE ")),
+            "GATE0_COVERAGE",
+        )
+        assert kv["environment_id"] == "INVALID"
+        # 探测仍执行（身份校验独立于探测），但结果必须 fail-closed。
+        assert sorted(box.probes) == ["kb-active-a", "kb-active-b"]
+
+
 SCENARIOS = (
     scenario_full_coverage_positive,
     scenario_scope_slice_and_unregistered,
@@ -710,6 +748,7 @@ SCENARIOS = (
     scenario_milvus_stats_failure,
     scenario_active_scope_unresolved_still_probed,
     scenario_environment_id_invalid_fail_closed,
+    scenario_environment_id_whitespace_rejected,
 )
 
 
