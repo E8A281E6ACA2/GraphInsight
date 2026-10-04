@@ -172,6 +172,43 @@ orphan_revisions / unrecoverable / scope_unresolved / scope_mismatches / 迁移�
   必须**先处置后迁移**，否则把脏投影复制进 v3 只是把问题搬家。
 - 该清单是"迁移前置门禁"的数据来源，产出动作本身是只读的。
 
+### 7.1 Gate 0 全量覆盖证据合同（2026-10-04 已实现，仅隔离层）
+
+`backend/admin/report_m5_c3_inventory.py` 已从"逐 KB C3 输出"升级为带全量覆盖证据的
+gate 报告，支撑 §7 处置清单作为迁移前置门禁的可审计性：
+
+1. **覆盖计数**：`registered_kb_total / active_kb_total / eligible_kb_total /
+   probed_kb_total / omitted_kb_total / failed_kb_total`，输出在 `C3_SUMMARY` 与
+   `GATE0_COVERAGE` 行。
+2. **逐项原因**：`omitted_kbs / failed_kbs` 每项含 `kb_id / status / reason`
+   （`STATUS_NOT_ELIGIBLE:<status>`、`UNREGISTERED_KB`、`KB_PROBE_FAILED:<ExcType>`、
+   `KB_REGISTRY_QUERY_FAILED:<ExcType>`）。
+3. **纳入策略**：仅 `active` KB 可探测（eligible）；`archived/deleting/soft-deleted`
+   等一切非 active 状态一律 omitted 且**绝不探测**；`--kb` 显式指定但注册表无行的
+   id 记 `UNREGISTERED_KB`；注册表查询失败降级为可审计原因，绝不伪装成"零 KB 注册"。
+4. **覆盖判定**：`coverage_verdict = FULL / PARTIAL / FAILED`。目标 KB 读取失败、
+   before/after 计数漂移、注册表降级、Milvus 证据降级、§8.5 v3 目标 collection 已存在
+   ——任一命中即 fail-closed 置 `FAILED` 并以退出码 2 结束，**不得宣称全量覆盖成功**。
+5. **collection 只读枚举**：`list_collections` 枚举实例上真实 collection 并分类
+   `current`（现读写解析名）/ `target`（§8.5 v3）/ `historical`（legacy 归一名）/
+   `unknown`；只读，绝不创建、修改或删除任何 collection。
+6. **零写对账**：PG（`chunk_revisions/knowledge_bases`）、Neo4j（Chunk 计数）、
+   Milvus（entities 计数）、`admin_jobs` 行数在探测前后各快照一次；漂移即
+   `writes=UNVERIFIED_COUNTER_DRIFT` 并 fail-closed。
+7. **环境标识**：输出 `timestamp / commit_sha / environment_id`（如
+   `admin_db:postgresql`），全程不输出 URI、token、密码。
+8. **局部探测**：`--kb` 运行标 `scope=SCOPE_SLICE`，verdict 封顶 `PARTIAL`，
+   永远不得表述为 `FULL`。
+
+隔离验证：`backend/tests/check_m5_c3_inventory.py`（formatter/verdict/分类/对账契约）
+与 `backend/tests/check_m5_gate0_coverage.py`（SQLite + 假 pymilvus/neo4j 的 CLI 正负
+场景：全覆盖、状态排除、缺 scope、单 KB 读取异常、多 collection、计数漂移、注册表降级）。
+
+**边界声明：以上仅为隔离测试证明的合同实现（Gate 0 contract implementation
+complete）。共享生产 Gate 0 仍未 CLOSED——共享证据采集仍须在授权后于真实
+PostgreSQL/Neo4j/Milvus 上运行本报告，且 §5.1 canary runner、§7 处置、§9 其余门禁
+照旧未满足。**
+
 ---
 
 ## 8. 明确不做（本方案与本轮的边界）

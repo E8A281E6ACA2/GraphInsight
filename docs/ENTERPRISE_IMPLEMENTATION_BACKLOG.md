@@ -255,11 +255,12 @@
 4. 共享生产 v3 迁移、逐 KB C3 数据治理和共享生产 `CLOSED` 尚未完成。
 5. M5-A/B0 dry-run contract v1 已统一三个入口：固定 `DRY_RUN_RESULT` JSON 标记、`writes=0` 和退出码语义；仅为隔离验收契约，不代表共享生产迁移完成。
 6. 2026-10-03 共享只读 C3 inventory 已运行：1 个 KB，`blocked/orphan/unrecoverable/scope_unresolved/scope_mismatches` 全为 0；当前读取到 `graphinsight_chunks_v2` 且无显式 `content_revision`，所以共享生产 gate 仍为 OPEN。
+7. 2026-10-04 C3 inventory 已升级为 Gate 0 全量覆盖证据报告：输出 `registered/active/eligible/probed/omitted/failed` 六项 KB 计数与 `omitted_kbs/failed_kbs` 逐项 `kb_id/status/reason`；仅 `active` 可探测，非 active 一律 omitted 且不探测，未注册 `--kb` 记 `UNREGISTERED_KB`；`coverage_verdict=FULL/PARTIAL/FAILED` 对探测失败、计数漂移、注册表降级、Milvus 证据降级、v3 目标已存在 fail-closed；Milvus collection 只读枚举分类 `current/target/historical/unknown`；before/after 只读计数对账 `writes=0`；输出 `timestamp/commit_sha/environment_id` 且不含 URI/token/密码；`--kb` 运行标 `SCOPE_SLICE` 并封顶 `PARTIAL`。隔离验收：`check_m5_c3_inventory.py` 与 `check_m5_gate0_coverage.py`（7 个正负场景）通过。仅为隔离合同实现，不代表共享生产 Gate 0 关闭。
 
 2. `M5-B0-C3` 共享 KB 不可自动收敛清单
 状态：`todo`
 
-验收标准：只读输出每个 KB 的 `blocked`、`orphan_revisions`、`unrecoverable`、`scope_unresolved`、`scope_mismatches`，并为人工处置项保留 `chunk_id` 和原因。
+验收标准：只读输出每个 KB 的 `blocked`、`orphan_revisions`、`unrecoverable`、`scope_unresolved`、`scope_mismatches`，并为人工处置项保留 `chunk_id` 和原因；全量覆盖运行必须给出 `coverage_verdict=FULL` 且 `failed_kb_total=0`、`writes=0`，出现 FAILED 或 SCOPE_SLICE 时不得作为处置完成依据。
 
 3. `M5-V3` 共享生产 Milvus v3 迁移
 状态：`todo`

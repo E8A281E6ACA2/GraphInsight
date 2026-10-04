@@ -399,3 +399,9 @@
 - [ ] M5-B1 Go API 保持冻结，必须等待共享迁移前置条件和审计授权。
 - [ ] 当前不宣布共享生产 `CLOSED`；验收记录见 `docs/ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md`。
 - [x] M5-A/B0 dry-run contract v1 已落地并由 SQLite 验收覆盖；真实共享迁移前仍必须保持 `writes=0` 预览边界。
+- [x] 2026-10-04 Gate 0 全量覆盖证据合同已实现（`report_m5_c3_inventory.py`：六项覆盖计数、
+  omitted/failed 逐项原因、active/archived/deleting/soft-deleted/unregistered 纳入策略、
+  FULL/PARTIAL/FAILED fail-closed verdict、Milvus collection 只读分类、before/after 零写对账、
+  SCOPE_SLICE 封顶）；隔离验收 `check_m5_c3_inventory.py` 与 `check_m5_gate0_coverage.py`
+  通过。仅为隔离合同实现（Gate 0 contract implementation complete），共享生产 Gate 0 仍 OPEN，
+  未授权不写共享 dev/v2/v3。
