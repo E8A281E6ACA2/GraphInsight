@@ -344,6 +344,85 @@ def scenario_graph_write_failed() -> None:
     _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
 
 
+def scenario_dual_write_shadow_failure() -> None:
+    """调用链：dual_write 影子(v3)写失败 → worker 判 write_failed → job 抛错重试。
+
+    向量腿走真实 `chunk_projection_reindex._write_milvus_projection` + 真实
+    `vector_store.upsert_chunks`（dual_write 生效、影子 client upsert 抛错），Neo4j 腿与
+    embedding 用假实现隔离；不联网、不碰真实 Milvus。锁死三件事：
+      1. upsert_chunks 抛的 DualWriteShadowError 被 _write_milvus_projection 的宽 except
+         吸收成 write_failed（不冒泡成别的类型、也不被当成成功）；
+      2. reindex_chunks 因 failed_chunks 非空抛 RuntimeError（按 max_retries 退避重试），
+         而非 ValidationException（不重试）——即"影子脏写 = 可重放"，不是"永久失败"；
+      3. 主库(v2)确已写、影子(v3)未写；c-1 的 vector 投影保持未收敛（不虚报 indexed）。
+    """
+    from services.embedding_service import embedding_service
+    from services.vector_store import vector_store
+
+    primary = "graphinsight_chunks_v2"
+    shadow = "graphinsight_chunks_v3"
+
+    class ShadowFailingClient:
+        def __init__(self) -> None:
+            self.upserts: Dict[str, list] = {}
+            self.shadow_attempted = False
+
+        def has_collection(self, name):
+            return True
+
+        def upsert(self, *, collection_name, data):  # noqa: A002 - 匹配 pymilvus 关键字
+            if collection_name == shadow:
+                self.shadow_attempted = True
+                raise RuntimeError("simulated v3 shadow upsert failure")
+            self.upserts.setdefault(collection_name, []).append(data)
+            return {"upsert_count": len(data)}
+
+    client = ShadowFailingClient()
+
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+
+    # 只把 Neo4j 腿与能力判定换成假实现，向量腿保持真实代码路径
+    worker._write_neo4j_projection = W.fake_graph
+    worker.get_projection_capabilities = lambda: {"graph": True, "vector": True}
+    worker._existing_milvus_fields = lambda kb_id, chunk_ids: {}  # 跳过读回，聚焦扇出
+
+    # embedding 假实现（不联网）
+    embedding_service.embed_texts = lambda texts: [[0.1, 0.2] for _ in texts]
+    embedding_service.config = lambda: {"model": "m-test"}
+    embedding_service.content_hash = lambda value: "h-test"
+
+    # 真实 vector_store 单例：dual_write 生效，影子 client upsert 抛错
+    vector_store._get_client = lambda: client
+    vector_store._revision_field = {primary: True, shadow: True}
+    vector_store.is_enabled = lambda: True
+    vector_store.config = lambda: {
+        "enabled": True,
+        "provider": "milvus",
+        "collection": primary,
+        "dual_write": True,
+        "shadow_collection": shadow,
+    }
+    vector_store.ensure_collection = lambda **k: None
+    vector_store.has_content_revision_field = lambda *a, **k: True
+
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+
+    # 原始证据：主库已写、影子被尝试但未落地（"v2 已写 / v3 未收敛"，非危险的反向）
+    print(
+        "__DUAL_EVIDENCE__"
+        + json.dumps(
+            {
+                "primary_written": primary in client.upserts,
+                "shadow_attempted": client.shadow_attempted,
+                "shadow_written": shadow in client.upserts,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def scenario_current_moved() -> None:
     _seed_kb()
     _seed_doc(DOC)
@@ -667,6 +746,7 @@ SCENARIOS = {
     "capability_off": scenario_capability_off,
     "revision_field_absent": scenario_revision_field_absent,
     "graph_write_failed": scenario_graph_write_failed,
+    "dual_write_shadow_failure": scenario_dual_write_shadow_failure,
     "current_moved": scenario_current_moved,
     "current_deleted_race": scenario_current_deleted_race,
     "idempotent_rerun": scenario_idempotent_rerun,

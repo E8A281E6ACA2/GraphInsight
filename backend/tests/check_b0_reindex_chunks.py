@@ -459,8 +459,38 @@ def section_e(h: Harness) -> None:
 
 
 # ---------------------------------------------------------------------------
-# F. 索引侧真实代码路径（非 mock）
+# E2. dual_write 影子失败调用链（build_graph → shadow failure → job retry/fail）
 # ---------------------------------------------------------------------------
+
+
+def section_e2(h: Harness) -> None:
+    print("[E2] dual_write 影子(v3)写失败 → 投影未收敛 → job 抛 RuntimeError 重试")
+    out = scenario(h, "dual_shadow_fail.db", "dual_write_shadow_failure")
+    exc = exception_of(out)
+    step(
+        "影子失败被判为可重放：reindex_chunks 抛 RuntimeError（非 ValidationException=不重试）",
+        exc.get("type") == "RuntimeError",
+        f"exc={exc}",
+    )
+    counts = counts_of(out)
+    step("向量腿记 write_failed（未收敛），计数=1", counts.get("vector_failed") == 1, f"counts={counts}")
+    step("Neo4j 主腿不受影子失败牵连，仍如实 indexed（失败隔离在影子）", counts.get("graph_indexed") == 1, f"counts={counts}")
+    step("整批判未收敛：failed_chunks=1 且 vector_indexed=0（不虚报收敛）", counts.get("failed_chunks") == 1 and counts.get("vector_indexed") == 0, f"counts={counts}")
+    evidence = obj_marker(out, "__DUAL_EVIDENCE__")
+    step(
+        "原始证据：主库(v2)已写、影子(v3)被尝试但未落地（非危险的反向）",
+        evidence.get("primary_written") is True and evidence.get("shadow_attempted") is True and evidence.get("shadow_written") is False,
+        f"evidence={evidence}",
+    )
+    revs = rev_map(out)
+    step(
+        "c-1 的 vector 投影保持未收敛（状态非 indexed 且版本 NULL），等重放",
+        revs.get("c-1", {}).get("vector_status") != "indexed" and revs.get("c-1", {}).get("vector_content_revision") is None,
+        f"revs={revs}",
+    )
+
+
+
 
 
 def section_f(h: Harness) -> None:
@@ -527,6 +557,7 @@ def main() -> int:
         section_c(h)
         section_d(h)
         section_e(h)
+        section_e2(h)
         section_f(h)
         section_f2(h)
         section_g(h)
