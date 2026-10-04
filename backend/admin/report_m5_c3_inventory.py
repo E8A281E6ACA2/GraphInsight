@@ -6,7 +6,7 @@ the existing inventory readers. It never calls backfill, enqueues jobs, or
 writes projection state. Shared production must remain migration-frozen while
 this report is collected.
 
-Gate 0 coverage evidence contract (audit/m5-gate0-completion):
+Gate 0 coverage evidence contract (audit/m5-gate0-completion, audit revision 2):
 1. Coverage counters: registered_kb_total / active_kb_total / eligible_kb_total
    / probed_kb_total / omitted_kb_total / failed_kb_total.
 2. omitted_kbs / failed_kbs entries each carry kb_id / status / reason.
@@ -15,15 +15,24 @@ Gate 0 coverage evidence contract (audit/m5-gate0-completion):
    STATUS_NOT_ELIGIBLE:<status>; explicit --kb ids absent from
    knowledge_bases are omitted with UNREGISTERED_KB.
 4. coverage_verdict: FULL (all eligible probed) / PARTIAL (some probed) /
-   FAILED (none probed, or any probed KB read failed -- fail-closed, never
-   reported as full coverage).
+   FAILED (fail-closed; see 6). A failed probe must never be reported as
+   full coverage.
 5. Milvus collections are enumerated read-only (list_collections only) and
-   classified current / target / historical / unknown; nothing is created,
+   classified current / target / historical / unknown; raw configured name and
+   normalized resolved name are reported separately. Nothing is created,
    modified, or deleted.
-6. PG / Neo4j / Milvus / admin_jobs counters are snapshotted before and after
-   the probe; any drift fails closed (writes must be 0).
-7. Output carries timestamp, commit_sha, and a non-sensitive environment_id;
-   URIs, tokens, and passwords are never emitted.
+6. Fail-closed evidence contract (audit revision 2 -- enumerated, not a blanket
+   "all exceptions" claim): every counter source reports an explicit
+   value/ok/reason triple; errors are NEVER folded to a silent 0. Any degraded
+   reason in before or after snapshots, any counter drift, any KB probe or
+   registry failure, Milvus evidence degradation, the resolved current
+   collection being absent, the §8.5 v3 target existing, or a formal
+   PostgreSQL run lacking an explicit environment id -- each forces
+   coverage_verdict=FAILED, writes=UNVERIFIED_EVIDENCE (or
+   UNVERIFIED_COUNTER_DRIFT when values drifted), and exit code 2.
+7. Output carries timestamp, commit_sha, and an explicit non-sensitive
+   environment_id (from GRAPHINSIGHT_ENVIRONMENT_ID); URIs, tokens, and
+   passwords are never emitted. A PostgreSQL run without that id refuses FULL.
 8. --kb slice probes are marked scope=SCOPE_SLICE and capped at PARTIAL.
 Isolated contract tests only prove this formatter/state machine; they do not
 constitute shared-production Gate 0 closure.
@@ -51,6 +60,33 @@ from admin import backfill_chunk_revisions as backfill  # noqa: E402
 
 MILVUS_TARGET_COLLECTION = "graphinsight_chunks_v3"
 MILVUS_HISTORICAL_COLLECTIONS = frozenset({"graphinsight_chunks"})
+ENVIRONMENT_ID_VAR = "GRAPHINSIGHT_ENVIRONMENT_ID"
+_ENVIRONMENT_ID_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
+)
+
+
+def _failed_entry(reason: str) -> Dict[str, Any]:
+    """Honest failed counter entry: value stays unknown, never folded to 0."""
+    return {"value": None, "ok": False, "reason": reason}
+
+
+def _ok_entry(value: int) -> Dict[str, Any]:
+    return {"value": int(value), "ok": True, "reason": None}
+
+
+def _entry_value(entry: Any) -> Optional[int]:
+    if isinstance(entry, dict):
+        value = entry.get("value")
+        return int(value) if value is not None else None
+    return None
+
+
+def _entry_reason(entry: Any) -> Optional[str]:
+    if isinstance(entry, dict):
+        reason = entry.get("reason")
+        return str(reason) if reason else None
+    return None
 
 
 def _utc_now_iso() -> str:
@@ -72,6 +108,28 @@ def _resolve_commit_sha() -> str:
         return "UNKNOWN"
     sha = (proc.stdout or "").strip()
     return sha if proc.returncode == 0 and sha else "UNKNOWN"
+
+
+def _environment_id_sanitized(raw: str) -> str:
+    """Keep only a conservative non-sensitive charset; drop everything else."""
+    return "".join(ch for ch in raw.strip() if ch in _ENVIRONMENT_ID_ALLOWED)
+
+
+def resolve_environment_id(dialect_name: str) -> Tuple[str, bool]:
+    """Resolve the explicit non-sensitive environment id.
+
+    Returns (environment_id, missing_for_formal_pg). A formal PostgreSQL run
+    without an explicit GRAPHINSIGHT_ENVIRONMENT_ID refuses to produce FULL
+    verdicts: evidence without environment identity is not gate evidence.
+    """
+    raw = os.environ.get(ENVIRONMENT_ID_VAR, "")
+    sanitized = _environment_id_sanitized(raw)
+    if sanitized:
+        return sanitized, False
+    if str(dialect_name or "").strip().lower() == "postgresql":
+        return "", True
+    # 隔离/降级运行（SQLite 等）允许派生标识，但仍须显式可读。
+    return f"admin_db:{dialect_name}", False
 
 
 def _count_rows(conn: Any, table: str) -> int:
@@ -106,22 +164,42 @@ def _load_kbs() -> Dict[str, str]:
     return _load_kbs_with_fallback()[0]
 
 
+def _milvus_raw_collection_name() -> str:
+    """Raw configured collection name (may be a legacy alias like graphinsight_chunks).
+
+    Deliberately NOT normalized: the audit requires raw configured and
+    normalized resolved names to be reported separately.
+    """
+    try:
+        from services.runtime_config import get_vector_store_runtime_config
+
+        name = str(get_vector_store_runtime_config().get("collection") or "").strip()
+        if name:
+            return name
+    except Exception:  # noqa: BLE001 - 退回 settings 直读
+        pass
+    return str(getattr(backfill.settings, "milvus_collection", "") or "").strip()
+
+
 def classify_collections(
-    configured: str,
+    configured_raw: str,
+    resolved: str,
     existing: List[str],
 ) -> Dict[str, Any]:
     """Read-only classification of Milvus collections for gate evidence.
 
-    - current: the collection the live read/write path resolves to (must be a
-      normalized v2 name per §11.1/D3).
-    - target: the §8.5 v3 migration target (must NOT exist while migration is
-      gated; its existence is reported as a fail-closed signal).
+    - configured_raw: the un-normalized configured name (may be legacy).
+    - resolved: the normalized name the live read/write path uses (§11.1/D3).
+      `current` membership is judged against RESOLVED, never the raw alias.
+    - target: the §8.5 v3 migration target (must NOT exist while gated).
     - historical: legacy pre-isolation names kept only for reference.
     - unknown: any other collection discovered on the instance.
 
-    This function never creates, modifies, or deletes anything.
+    current_missing is fail-closed evidence: a run whose resolved current
+    collection does not exist cannot claim any vector-side coverage.
     """
-    configured_norm = str(configured or "").strip()
+    configured_norm = str(configured_raw or "").strip()
+    resolved_norm = str(resolved or "").strip()
     existing_sorted = sorted({str(name or "").strip() for name in existing if str(name or "").strip()})
     categories = {
         "current": [],
@@ -130,7 +208,7 @@ def classify_collections(
         "unknown": [],
     }
     for name in existing_sorted:
-        if name == configured_norm:
+        if name == resolved_norm and resolved_norm:
             categories["current"].append(name)
         elif name == MILVUS_TARGET_COLLECTION:
             categories["target"].append(name)
@@ -138,16 +216,22 @@ def classify_collections(
             categories["historical"].append(name)
         else:
             categories["unknown"].append(name)
+    current_exists = bool(resolved_norm) and resolved_norm in existing_sorted
     return {
+        "configured_raw": configured_norm,
         "configured": configured_norm,
-        "resolved": configured_norm,
+        "resolved": resolved_norm,
         "existing": existing_sorted,
         "categories": categories,
         "existing_total": len(existing_sorted),
         "read_only": True,
         "target_exists": bool(categories["target"]),
+        "current_missing": not current_exists,
+        "name_normalization_note": (
+            "configured_raw is reported un-normalized; current membership is judged "
+            "against the resolved name only (§11.1/D3 legacy alias normalization)"
+        ),
         "classification_note": (
-            "legacy graphinsight_chunks normalizes to graphinsight_chunks_v2 (§11.1/D3); "
             "target existence is reported but never modified"
         ),
     }
@@ -291,6 +375,10 @@ def summarize(
         "failed_kbs": list(cov.get("failed_kbs", [])),
         "writes": cov.get("writes", "unknown"),
         "counter_drift": list(cov.get("counter_drift", [])),
+        "degraded_reasons": list(cov.get("degraded_reasons", [])),
+        "environment_id_missing": bool(cov.get("environment_id_missing", False)),
+        "counters_before": cov.get("counters_before", {}),
+        "counters_after": cov.get("counters_after", {}),
         "milvus_collections": cov.get("milvus_collections", {}),
         "timestamp": cov.get("timestamp", ""),
         "commit_sha": cov.get("commit_sha", "UNKNOWN"),
@@ -310,8 +398,22 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _milvus_snapshot() -> Tuple[int, Optional[str]]:
-    """Count Milvus entities on the current collection; degrade with a reason."""
+def _read_pg_count_entry(table: str) -> Dict[str, Any]:
+    """Read one PG table count as value/ok/reason; errors are never folded to 0.
+
+    Each source opens its own connection so one broken table/connection cannot
+    mask or corrupt the evidence of the others.
+    """
+    try:
+        with engine.connect() as conn:
+            value = int(conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar() or 0)  # noqa: S608
+        return _ok_entry(value)
+    except Exception as exc:  # noqa: BLE001 - 权限/连接/SQL/缺表全部保留为显式原因
+        return _failed_entry(f"PG_COUNT_FAILED[{table}]: {type(exc).__name__}")
+
+
+def _milvus_snapshot() -> Dict[str, Any]:
+    """Milvus entity count entry; stats failures stay explicit, never 0."""
     try:
         from pymilvus import MilvusClient
 
@@ -329,19 +431,19 @@ def _milvus_snapshot() -> Tuple[int, Optional[str]]:
             db_name=str(cfg.get("db_name") or getattr(backfill.settings, "milvus_db_name", "default")),
         )
         if not client.has_collection(collection):
-            return 0, None
+            return _failed_entry(f"MILVUS_CURRENT_COLLECTION_MISSING: {collection}")
         stats = client.get_collection_stats(collection)
         if isinstance(stats, dict):
             for key in ("row_count", "rowNum", "num_entities"):
                 if stats.get(key) is not None:
-                    return int(stats[key]), None
-        return 0, "MILVUS_STATS_UNREADABLE"
-    except Exception as exc:  # noqa: BLE001 - 只保留非敏感错误类别
-        return 0, f"MILVUS_COUNT_FAILED: {type(exc).__name__}"
+                    return _ok_entry(int(stats[key]))
+        return _failed_entry("MILVUS_STATS_UNREADABLE: no numeric row count in stats payload")
+    except Exception as exc:  # noqa: BLE001 - 连接/权限失败保留显式原因
+        return _failed_entry(f"MILVUS_COUNT_FAILED: {type(exc).__name__}")
 
 
-def _neo4j_snapshot() -> Tuple[int, Optional[str]]:
-    """Count Neo4j Chunk nodes; degrade with a reason instead of crashing."""
+def _neo4j_snapshot() -> Dict[str, Any]:
+    """Neo4j Chunk count entry; errors stay explicit, never folded to 0."""
     try:
         from neo4j import GraphDatabase
 
@@ -356,45 +458,34 @@ def _neo4j_snapshot() -> Tuple[int, Optional[str]]:
                 database=getattr(settings, "neo4j_database", None) or None
             ) as session:
                 record = session.run("MATCH (c:Chunk) RETURN count(c) AS n").single()
-                return int(record["n"] if record else 0), None
+                return _ok_entry(int(record["n"] if record else 0))
         finally:
             driver.close()
-    except Exception as exc:  # noqa: BLE001 - 只保留非敏感错误类别
-        return 0, f"NEO4J_COUNT_FAILED: {type(exc).__name__}"
+    except Exception as exc:  # noqa: BLE001 - 连接/权限失败保留显式原因
+        return _failed_entry(f"NEO4J_COUNT_FAILED: {type(exc).__name__}")
 
 
-def _admin_jobs_snapshot() -> int:
-    try:
-        with engine.connect() as conn:
-            return _count_rows(conn, "admin_jobs")
-    except Exception:  # noqa: BLE001
-        return 0
+def _snapshot_degraded(snapshot: Dict[str, Any]) -> List[str]:
+    """List every ok=False reason carried by a snapshot, per source."""
+    reasons: List[str] = []
+    for section in ("pg", "neo4j", "milvus", "admin_jobs"):
+        for key in sorted(snapshot.get(section) or {}):
+            reason = _entry_reason(snapshot[section][key])
+            if reason:
+                reasons.append(f"{section}.{key}: {reason}")
+    return sorted(reasons)
 
 
 def take_counter_snapshot() -> Dict[str, Any]:
-    """Read-only before/after counters for PG / Neo4j / Milvus / admin_jobs."""
-    pg_counts: Dict[str, int] = {}
-    reasons: List[str] = []
-    try:
-        with engine.connect() as conn:
-            pg_counts["chunk_revisions"] = _count_rows(conn, "chunk_revisions")
-            pg_counts["knowledge_bases"] = _count_rows(conn, "knowledge_bases")
-    except Exception as exc:  # noqa: BLE001
-        reasons.append(f"PG_COUNT_FAILED: {type(exc).__name__}")
-    neo4j_count, neo4j_reason = _neo4j_snapshot()
-    milvus_count, milvus_reason = _milvus_snapshot()
-    for reason in (neo4j_reason, milvus_reason, *reasons):
-        if reason:
-            reasons.append(reason)
+    """Read-only before/after counters; every source is value/ok/reason."""
     return {
         "pg": {
-            "chunk_revisions": pg_counts.get("chunk_revisions", 0),
-            "knowledge_bases": pg_counts.get("knowledge_bases", 0),
+            "chunk_revisions": _read_pg_count_entry("chunk_revisions"),
+            "knowledge_bases": _read_pg_count_entry("knowledge_bases"),
         },
-        "neo4j": {"chunk_nodes": neo4j_count},
-        "milvus": {"entities": milvus_count},
-        "admin_jobs": {"rows": _admin_jobs_snapshot()},
-        "degraded_reasons": sorted(set(reasons)),
+        "neo4j": {"chunk_nodes": _neo4j_snapshot()},
+        "milvus": {"entities": _milvus_snapshot()},
+        "admin_jobs": {"rows": _read_pg_count_entry("admin_jobs")},
     }
 
 
@@ -405,8 +496,10 @@ def snapshots_match(before: Dict[str, Any], after: Dict[str, Any]) -> Tuple[bool
         before_section = before.get(section) or {}
         after_section = after.get(section) or {}
         for key in sorted(set(before_section) | set(after_section)):
-            if before_section.get(key) != after_section.get(key):
-                diffs.append(f"{section}.{key}: {before_section.get(key)} -> {after_section.get(key)}")
+            before_value = _entry_value(before_section.get(key))
+            after_value = _entry_value(after_section.get(key))
+            if before_value != after_value:
+                diffs.append(f"{section}.{key}: {before_value} -> {after_value}")
     return not diffs, diffs
 
 
@@ -425,14 +518,19 @@ def _probe_kb(kb_id: str, kb_status: str) -> Tuple[Optional[Dict[str, Any]], Opt
 
 
 def _resolve_milvus_evidence() -> Dict[str, Any]:
-    """Enumerate existing collections read-only and classify them."""
-    configured = ""
+    """Enumerate existing collections read-only; keep raw vs resolved separate."""
+    resolved = ""
+    raw = ""
     existing: List[str] = []
     degraded: List[str] = []
     try:
-        configured = backfill._milvus_collection_name()
+        resolved = backfill._milvus_collection_name()
     except Exception as exc:  # noqa: BLE001
         degraded.append(f"MILVUS_CONFIG_RESOLVE_FAILED: {type(exc).__name__}")
+    try:
+        raw = _milvus_raw_collection_name()
+    except Exception as exc:  # noqa: BLE001
+        degraded.append(f"MILVUS_RAW_CONFIG_READ_FAILED: {type(exc).__name__}")
     try:
         from pymilvus import MilvusClient
 
@@ -452,9 +550,15 @@ def _resolve_milvus_evidence() -> Dict[str, Any]:
         existing = [str(name) for name in (listed or [])]
     except Exception as exc:  # noqa: BLE001
         degraded.append(f"MILVUS_LIST_COLLECTIONS_FAILED: {type(exc).__name__}")
-    classification = classify_collections(configured, existing)
+    classification = classify_collections(raw, resolved, existing)
     if degraded:
         classification["degraded_reasons"] = sorted(set(degraded))
+        classification["coverage_degraded"] = True
+    if classification.get("current_missing"):
+        classification.setdefault("degraded_reasons", [])
+        classification["degraded_reasons"] = sorted(
+            set(classification["degraded_reasons"]) | {"MILVUS_CURRENT_COLLECTION_MISSING"}
+        )
         classification["coverage_degraded"] = True
     return classification
 
@@ -559,7 +663,20 @@ def main() -> int:
 
     after = take_counter_snapshot()
     counters_match, drift = snapshots_match(before, after)
+    # 审计修订 2：before/after 任一 degraded reason 都必须压成
+    # FAILED + UNVERIFIED_EVIDENCE，错误折算 0 的通道已不存在。
+    degraded_reasons = sorted(
+        set(_snapshot_degraded(before)) | set(_snapshot_degraded(after))
+    )
     milvus_collections = _resolve_milvus_evidence()
+    environment_id, env_id_missing = resolve_environment_id(engine.dialect.name)
+
+    if degraded_reasons:
+        writes = "UNVERIFIED_EVIDENCE"
+    elif drift:
+        writes = "UNVERIFIED_COUNTER_DRIFT"
+    else:
+        writes = 0
 
     coverage.update(
         {
@@ -567,22 +684,26 @@ def main() -> int:
             "omitted_kb_total": len(coverage.get("omitted_kbs", [])),
             "failed_kb_total": len(failed),
             "failed_kbs": failed,
-            "writes": 0 if counters_match else "UNVERIFIED_COUNTER_DRIFT",
+            "writes": writes,
             "counter_drift": drift,
+            "degraded_reasons": degraded_reasons,
             "counters_before": before,
             "counters_after": after,
             "milvus_collections": milvus_collections,
             "timestamp": _utc_now_iso(),
             "commit_sha": _resolve_commit_sha(),
-            "environment_id": f"admin_db:{engine.dialect.name}",
+            "environment_id": environment_id,
+            "environment_id_missing": env_id_missing,
         }
     )
     coverage["coverage_fail_closed"] = bool(
         coverage["failed_kb_total"] > 0
         or not counters_match
+        or degraded_reasons
         or coverage.get("registry_degraded")
         or milvus_collections.get("coverage_degraded")
         or milvus_collections.get("target_exists")
+        or env_id_missing
     )
 
     summary = summarize(reports, coverage)
@@ -600,6 +721,7 @@ def main() -> int:
             f"eligible={summary['eligible_kb_total']} probed={summary['probed_kb_total']} "
             f"omitted={summary['omitted_kb_total']} failed={summary['failed_kb_total']} "
             f"coverage_verdict={summary['coverage_verdict']} writes={summary['writes']} "
+            f"environment_id={summary['environment_id'] or 'MISSING'} "
             f"shared_production_gate=OPEN"
         )
         for item in summary["omitted_kbs"]:
@@ -608,12 +730,16 @@ def main() -> int:
             print(f"COVERAGE_FAILED kb={item['kb_id']} status={item['status']} reason={item['reason']}")
         if drift:
             print(f"COVERAGE_COUNTER_DRIFT drift={json.dumps(drift, ensure_ascii=True, sort_keys=True)}")
+        for reason in summary.get("degraded_reasons", []):
+            print(f"COVERAGE_DEGRADED reason={reason}")
         cats = summary["milvus_collections"].get("categories") or {}
         print(
             "MILVUS_COLLECTIONS "
             + json.dumps(
                 {
-                    "configured": summary["milvus_collections"].get("configured", ""),
+                    "configured_raw": summary["milvus_collections"].get("configured_raw", ""),
+                    "resolved": summary["milvus_collections"].get("resolved", ""),
+                    "current_missing": summary["milvus_collections"].get("current_missing", False),
                     "existing_total": summary["milvus_collections"].get("existing_total", 0),
                     "current": cats.get("current", []),
                     "target": cats.get("target", []),
@@ -627,8 +753,9 @@ def main() -> int:
         )
         if summary["coverage_verdict"] == "FAILED":
             print(
-                "COVERAGE_FAIL_CLOSED：存在探测失败/计数漂移/注册表或 Milvus 证据降级，"
-                "本轮不得宣称全量覆盖成功；shared_production_gate 保持 OPEN"
+                "COVERAGE_FAIL_CLOSED：存在探测失败/证据源读取失败（value/ok/reason 显式记录，"
+                "不折算为 0）/计数漂移/注册表或 Milvus 证据降级/current collection 缺失/"
+                "环境标识缺失，本轮不得宣称全量覆盖成功；shared_production_gate 保持 OPEN"
             )
     print(summary_line(summary))
     if summary["coverage_verdict"] == "FAILED":
