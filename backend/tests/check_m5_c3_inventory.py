@@ -14,6 +14,9 @@ from admin.report_m5_c3_inventory import (
     C3_COUNT_KEYS,
     _resolve_targets,
     c3_report,
+    classify_collections,
+    coverage_verdict,
+    snapshots_match,
     summarize,
     summary_line,
 )
@@ -130,6 +133,84 @@ def main() -> int:
     assert payload == summary
     assert payload["kb_count"] == 5 and payload["needs_reindex_total"] == 3
     assert "\n" not in line
+
+    # --- Gate 0 coverage verdict 状态机 ---
+    assert coverage_verdict(probed=3, eligible=3, failed=0, scope="FULL") == "FULL"
+    assert coverage_verdict(probed=2, eligible=3, failed=0, scope="FULL") == "PARTIAL"
+    assert coverage_verdict(probed=0, eligible=0, failed=0, scope="FULL") == "FAILED"
+    assert coverage_verdict(probed=0, eligible=3, failed=0, scope="FULL") == "FAILED"
+    assert coverage_verdict(probed=3, eligible=3, failed=1, scope="FULL") == "FAILED"
+    # 单 KB 失败必须压过其它成功探测，禁止宣称全量覆盖成功。
+    assert coverage_verdict(probed=10, eligible=11, failed=1, scope="FULL") == "FAILED"
+    # SCOPE_SLICE 的封顶在 summarize() 内，verdict 函数本身不做 scope 判定。
+    assert coverage_verdict(probed=1, eligible=1, failed=0, scope="SCOPE_SLICE") == "FULL"
+
+    # --- summarize 的 SCOPE_SLICE 封顶：全探测成功也只能 PARTIAL ---
+    slice_summary = summarize(
+        reports[:1],
+        {
+            "scope": "SCOPE_SLICE",
+            "registered_kb_total": 9,
+            "active_kb_total": 7,
+            "eligible_kb_total": 1,
+            "probed_kb_total": 1,
+            "omitted_kb_total": 0,
+            "failed_kb_total": 0,
+            "writes": 0,
+        },
+    )
+    assert slice_summary["scope"] == "SCOPE_SLICE"
+    assert slice_summary["coverage_verdict"] == "PARTIAL"
+    assert slice_summary["probed_kb_total"] == 1
+    assert slice_summary["registered_kb_total"] == 9
+
+    # --- 失败探测必须把 verdict 压成 FAILED 并保留逐项原因 ---
+    failed_summary = summarize(
+        reports[:1],
+        {
+            "scope": "FULL",
+            "eligible_kb_total": 2,
+            "probed_kb_total": 1,
+            "failed_kb_total": 1,
+            "failed_kbs": [{"kb_id": "kb-x", "status": "active", "reason": "KB_PROBE_FAILED: RuntimeError"}],
+        },
+    )
+    assert failed_summary["coverage_verdict"] == "FAILED"
+    assert failed_summary["coverage_fail_closed"] is True
+    assert failed_summary["failed_kbs"][0]["reason"] == "KB_PROBE_FAILED: RuntimeError"
+
+    # --- Milvus collection 只读分类 ---
+    classification = classify_collections(
+        "graphinsight_chunks_v2",
+        ["graphinsight_chunks_v2", "graphinsight_chunks_v3", "graphinsight_chunks", "team_shared_collection"],
+    )
+    assert classification["configured"] == "graphinsight_chunks_v2"
+    assert classification["resolved"] == "graphinsight_chunks_v2"
+    assert classification["categories"]["current"] == ["graphinsight_chunks_v2"]
+    assert classification["categories"]["target"] == ["graphinsight_chunks_v3"]
+    assert classification["categories"]["historical"] == ["graphinsight_chunks"]
+    assert classification["categories"]["unknown"] == ["team_shared_collection"]
+    assert classification["target_exists"] is True
+    assert classification["read_only"] is True
+    assert classification["existing_total"] == 4
+    legacy_only = classify_collections("graphinsight_chunks_v2", ["graphinsight_chunks"])
+    assert legacy_only["categories"]["historical"] == ["graphinsight_chunks"]
+    assert legacy_only["categories"]["current"] == []
+    assert legacy_only["target_exists"] is False
+    absent = classify_collections("graphinsight_chunks_v2", [])
+    assert absent["categories"] == {"current": [], "target": [], "historical": [], "unknown": []}
+    assert absent["existing_total"] == 0 and absent["target_exists"] is False
+
+    # --- before/after 只读计数对账：一致放行，漂移必须逐项列出 ---
+    same = {"pg": {"chunk_revisions": 3, "knowledge_bases": 2}, "neo4j": {"chunk_nodes": 5},
+            "milvus": {"entities": 7}, "admin_jobs": {"rows": 1}, "degraded_reasons": []}
+    ok, drift = snapshots_match(same, same)
+    assert ok is True and drift == []
+    drifted = {"pg": {"chunk_revisions": 4, "knowledge_bases": 2}, "neo4j": {"chunk_nodes": 5},
+               "milvus": {"entities": 7}, "admin_jobs": {"rows": 1}, "degraded_reasons": []}
+    ok, drift = snapshots_match(same, drifted)
+    assert ok is False
+    assert drift == ["pg.chunk_revisions: 3 -> 4"]
 
     print("C3_INVENTORY_CONTRACT_OK")
     return 0
