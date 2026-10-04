@@ -162,6 +162,10 @@ def get_vector_store_runtime_config() -> Dict[str, Any]:
         "metric_type": _first_non_empty(loaded.get("metric_type"), settings.milvus_metric_type),
         "index_type": _first_non_empty(loaded.get("index_type"), settings.milvus_index_type),
         "search_nprobe": _to_int(loaded.get("search_nprobe"), settings.milvus_search_nprobe),
+        # §16.1 S1 双写开关与影子 collection（配置中心优先，压过 env/settings）。
+        # 默认关闭；shadow_collection 留空时 vector_store 侧判定双写不生效（见 resolve_dual_write）。
+        "dual_write": _to_bool(loaded.get("dual_write"), settings.milvus_dual_write),
+        "shadow_collection": _first_non_empty(loaded.get("shadow_collection"), settings.milvus_shadow_collection),
     }
 
 

@@ -133,6 +133,10 @@ class Settings:
         self.milvus_metric_type = os.getenv("MILVUS_METRIC_TYPE", "COSINE").strip().upper()
         self.milvus_index_type = os.getenv("MILVUS_INDEX_TYPE", "IVF_FLAT").strip().upper()
         self.milvus_search_nprobe = int(os.getenv("MILVUS_SEARCH_NPROBE", "16"))
+        # M5 §16.1 S1 双写（dual_write）：一次 upsert 同时扇出主库(v2)与影子(v3)，读源仍主库。
+        # 默认关闭 = S0 现网安全态；开启是需单独授权的迁移动作，且 shadow_collection 必须异于主库。
+        self.milvus_dual_write = os.getenv("MILVUS_DUAL_WRITE", "false").strip().lower() == "true"
+        self.milvus_shadow_collection = os.getenv("MILVUS_SHADOW_COLLECTION", "").strip()
 
         # HTTP client 配置
         self.http_client_trust_env = os.getenv("HTTP_CLIENT_TRUST_ENV", "false").lower() == "true"
