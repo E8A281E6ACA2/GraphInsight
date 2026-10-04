@@ -31,8 +31,12 @@ Gate 0 coverage evidence contract (audit/m5-gate0-completion, audit revision 2):
    coverage_verdict=FAILED, writes=UNVERIFIED_EVIDENCE (or
    UNVERIFIED_COUNTER_DRIFT when values drifted), and exit code 2.
 7. Output carries timestamp, commit_sha, and an explicit non-sensitive
-   environment_id (from GRAPHINSIGHT_ENVIRONMENT_ID); URIs, tokens, and
-   passwords are never emitted. A PostgreSQL run without that id refuses FULL.
+   environment_id (from GRAPHINSIGHT_ENVIRONMENT_ID, strictly validated against
+   ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$). Illegal input is rejected whole as
+   environment_id_invalid (fail-closed), never sanitized-and-emitted, so URI
+   credential fragments cannot leak through partial stripping; URIs, tokens,
+   and passwords are never emitted. A PostgreSQL run without that id refuses
+   FULL.
 8. --kb slice probes are marked scope=SCOPE_SLICE and capped at PARTIAL.
 Isolated contract tests only prove this formatter/state machine; they do not
 constitute shared-production Gate 0 closure.
@@ -43,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -61,9 +66,7 @@ from admin import backfill_chunk_revisions as backfill  # noqa: E402
 MILVUS_TARGET_COLLECTION = "graphinsight_chunks_v3"
 MILVUS_HISTORICAL_COLLECTIONS = frozenset({"graphinsight_chunks"})
 ENVIRONMENT_ID_VAR = "GRAPHINSIGHT_ENVIRONMENT_ID"
-_ENVIRONMENT_ID_ALLOWED = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:"
-)
+_ENVIRONMENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,63}$")
 
 
 def _failed_entry(reason: str) -> Dict[str, Any]:
@@ -110,26 +113,25 @@ def _resolve_commit_sha() -> str:
     return sha if proc.returncode == 0 and sha else "UNKNOWN"
 
 
-def _environment_id_sanitized(raw: str) -> str:
-    """Keep only a conservative non-sensitive charset; drop everything else."""
-    return "".join(ch for ch in raw.strip() if ch in _ENVIRONMENT_ID_ALLOWED)
+def resolve_environment_id(dialect_name: str) -> Tuple[str, Optional[str]]:
+    """Resolve the explicit environment id under a STRICT allowlist.
 
-
-def resolve_environment_id(dialect_name: str) -> Tuple[str, bool]:
-    """Resolve the explicit non-sensitive environment id.
-
-    Returns (environment_id, missing_for_formal_pg). A formal PostgreSQL run
-    without an explicit GRAPHINSIGHT_ENVIRONMENT_ID refuses to produce FULL
-    verdicts: evidence without environment identity is not gate evidence.
+    Returns (environment_id, failure_reason). Illegal input is rejected, never
+    sanitized-then-emitted (audit revision 3): spaces, slashes, "@", control
+    characters, or any character outside ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$
+    invalidate the whole value, so a URI fragment such as
+    "postgres://user:pass@host" can never leak through partial stripping.
+    The failure reason carries only a category, never the raw value.
     """
-    raw = os.environ.get(ENVIRONMENT_ID_VAR, "")
-    sanitized = _environment_id_sanitized(raw)
-    if sanitized:
-        return sanitized, False
+    candidate = os.environ.get(ENVIRONMENT_ID_VAR, "").strip()
+    if candidate:
+        if _ENVIRONMENT_ID_PATTERN.fullmatch(candidate):
+            return candidate, None
+        return "", "ENVIRONMENT_ID_INVALID: value rejected by strict allowlist"
     if str(dialect_name or "").strip().lower() == "postgresql":
-        return "", True
+        return "", "ENVIRONMENT_ID_MISSING_FOR_FORMAL_PG"
     # 隔离/降级运行（SQLite 等）允许派生标识，但仍须显式可读。
-    return f"admin_db:{dialect_name}", False
+    return f"admin_db:{dialect_name}", None
 
 
 def _count_rows(conn: Any, table: str) -> int:
@@ -377,6 +379,7 @@ def summarize(
         "counter_drift": list(cov.get("counter_drift", [])),
         "degraded_reasons": list(cov.get("degraded_reasons", [])),
         "environment_id_missing": bool(cov.get("environment_id_missing", False)),
+        "environment_id_invalid": bool(cov.get("environment_id_invalid", False)),
         "counters_before": cov.get("counters_before", {}),
         "counters_after": cov.get("counters_after", {}),
         "milvus_collections": cov.get("milvus_collections", {}),
@@ -669,7 +672,12 @@ def main() -> int:
         set(_snapshot_degraded(before)) | set(_snapshot_degraded(after))
     )
     milvus_collections = _resolve_milvus_evidence()
-    environment_id, env_id_missing = resolve_environment_id(engine.dialect.name)
+    environment_id, env_id_failure = resolve_environment_id(engine.dialect.name)
+    # 审计修订 3：缺失与非法都视为证据身份不成立；非法值绝不进入输出。
+    env_id_missing = env_id_failure == "ENVIRONMENT_ID_MISSING_FOR_FORMAL_PG"
+    env_id_invalid = env_id_failure is not None and not env_id_missing
+    if env_id_failure:
+        degraded_reasons = sorted(set(degraded_reasons) | {f"environment_id: {env_id_failure}"})
 
     if degraded_reasons:
         writes = "UNVERIFIED_EVIDENCE"
@@ -694,6 +702,7 @@ def main() -> int:
             "commit_sha": _resolve_commit_sha(),
             "environment_id": environment_id,
             "environment_id_missing": env_id_missing,
+            "environment_id_invalid": env_id_invalid,
         }
     )
     coverage["coverage_fail_closed"] = bool(
@@ -704,6 +713,7 @@ def main() -> int:
         or milvus_collections.get("coverage_degraded")
         or milvus_collections.get("target_exists")
         or env_id_missing
+        or env_id_invalid
     )
 
     summary = summarize(reports, coverage)
@@ -721,7 +731,7 @@ def main() -> int:
             f"eligible={summary['eligible_kb_total']} probed={summary['probed_kb_total']} "
             f"omitted={summary['omitted_kb_total']} failed={summary['failed_kb_total']} "
             f"coverage_verdict={summary['coverage_verdict']} writes={summary['writes']} "
-            f"environment_id={summary['environment_id'] or 'MISSING'} "
+            f"environment_id={summary['environment_id'] or ('INVALID' if summary.get('environment_id_invalid') else 'MISSING')} "
             f"shared_production_gate=OPEN"
         )
         for item in summary["omitted_kbs"]:
