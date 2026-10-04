@@ -56,6 +56,12 @@ CASES: tuple[GuardCase, ...] = (
     GuardCase("rbac_catalog_parity", "check_rbac_catalog_parity.py", 120, "Python/Go RBAC 权限目录精确对账"),
     GuardCase("m5_dual_write", "check_m5_dual_write.py", 60, "M5 §16.1 S1 双写扇出与失败语义守卫"),
     GuardCase(
+        "build_graph_shadow_retry",
+        "check_build_graph_shadow_retry.py",
+        90,
+        "M5 §16.1 S1 build_graph→dual_write 影子失败→作业重试调用链守卫",
+    ),
+    GuardCase(
         "secret_scanner_selftest",
         "check_artifact_secrets_selftest.py",
         180,
