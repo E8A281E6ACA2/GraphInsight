@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,10 +13,14 @@ sys.path.insert(0, str(backend_dir))
 
 from admin.report_m5_c3_inventory import (
     C3_COUNT_KEYS,
+    _failed_entry,
+    _ok_entry,
     _resolve_targets,
+    _snapshot_degraded,
     c3_report,
     classify_collections,
     coverage_verdict,
+    resolve_environment_id,
     snapshots_match,
     summarize,
     summary_line,
@@ -179,38 +184,88 @@ def main() -> int:
     assert failed_summary["coverage_fail_closed"] is True
     assert failed_summary["failed_kbs"][0]["reason"] == "KB_PROBE_FAILED: RuntimeError"
 
-    # --- Milvus collection 只读分类 ---
+    # --- Milvus collection 只读分类（raw 与 resolved 分离，audit 修订 4）---
     classification = classify_collections(
+        "graphinsight_chunks",
         "graphinsight_chunks_v2",
         ["graphinsight_chunks_v2", "graphinsight_chunks_v3", "graphinsight_chunks", "team_shared_collection"],
     )
-    assert classification["configured"] == "graphinsight_chunks_v2"
+    assert classification["configured_raw"] == "graphinsight_chunks"
     assert classification["resolved"] == "graphinsight_chunks_v2"
+    assert classification["configured"] == "graphinsight_chunks"
     assert classification["categories"]["current"] == ["graphinsight_chunks_v2"]
     assert classification["categories"]["target"] == ["graphinsight_chunks_v3"]
     assert classification["categories"]["historical"] == ["graphinsight_chunks"]
     assert classification["categories"]["unknown"] == ["team_shared_collection"]
     assert classification["target_exists"] is True
+    assert classification["current_missing"] is False
     assert classification["read_only"] is True
     assert classification["existing_total"] == 4
-    legacy_only = classify_collections("graphinsight_chunks_v2", ["graphinsight_chunks"])
+    legacy_only = classify_collections("graphinsight_chunks", "graphinsight_chunks_v2", ["graphinsight_chunks"])
     assert legacy_only["categories"]["historical"] == ["graphinsight_chunks"]
     assert legacy_only["categories"]["current"] == []
+    assert legacy_only["current_missing"] is True
     assert legacy_only["target_exists"] is False
-    absent = classify_collections("graphinsight_chunks_v2", [])
+    absent = classify_collections("graphinsight_chunks_v2", "graphinsight_chunks_v2", [])
     assert absent["categories"] == {"current": [], "target": [], "historical": [], "unknown": []}
     assert absent["existing_total"] == 0 and absent["target_exists"] is False
+    assert absent["current_missing"] is True
+
+    # --- value/ok/reason 显式计数合同（audit 修订 1）---
+    ok_entry = _ok_entry(7)
+    assert ok_entry == {"value": 7, "ok": True, "reason": None}
+    failed_entry = _failed_entry("PG_COUNT_FAILED[chunk_revisions]: OperationalError")
+    assert failed_entry == {"value": None, "ok": False, "reason": "PG_COUNT_FAILED[chunk_revisions]: OperationalError"}
+    # 失败条目的 value 必须是 None，绝不折算成 0。
+    assert failed_entry["value"] is None
+    snap_degraded = {
+        "pg": {"chunk_revisions": _failed_entry("PG_COUNT_FAILED[chunk_revisions]: OperationalError"),
+               "knowledge_bases": _ok_entry(2)},
+        "neo4j": {"chunk_nodes": _ok_entry(5)},
+        "milvus": {"entities": _ok_entry(7)},
+        "admin_jobs": {"rows": _ok_entry(1)},
+    }
+    assert _snapshot_degraded(snap_degraded) == [
+        "pg.chunk_revisions: PG_COUNT_FAILED[chunk_revisions]: OperationalError"
+    ]
+    assert _snapshot_degraded({"pg": {"a": _ok_entry(1)}, "neo4j": {"b": _ok_entry(2)},
+                               "milvus": {"c": _ok_entry(3)}, "admin_jobs": {"d": _ok_entry(4)}}) == []
 
     # --- before/after 只读计数对账：一致放行，漂移必须逐项列出 ---
-    same = {"pg": {"chunk_revisions": 3, "knowledge_bases": 2}, "neo4j": {"chunk_nodes": 5},
-            "milvus": {"entities": 7}, "admin_jobs": {"rows": 1}, "degraded_reasons": []}
-    ok, drift = snapshots_match(same, same)
+    def _snap(chunk_revisions):
+        return {"pg": {"chunk_revisions": _ok_entry(chunk_revisions), "knowledge_bases": _ok_entry(2)},
+                "neo4j": {"chunk_nodes": _ok_entry(5)},
+                "milvus": {"entities": _ok_entry(7)},
+                "admin_jobs": {"rows": _ok_entry(1)}}
+
+    same = _snap(3)
+    ok, drift = snapshots_match(same, _snap(3))
     assert ok is True and drift == []
-    drifted = {"pg": {"chunk_revisions": 4, "knowledge_bases": 2}, "neo4j": {"chunk_nodes": 5},
-               "milvus": {"entities": 7}, "admin_jobs": {"rows": 1}, "degraded_reasons": []}
-    ok, drift = snapshots_match(same, drifted)
+    ok, drift = snapshots_match(same, _snap(4))
     assert ok is False
     assert drift == ["pg.chunk_revisions: 3 -> 4"]
+
+    # --- environment_id：显式变量优先；PG 缺失拒 FULL（audit 修订 5）---
+    saved_env = os.environ.get("GRAPHINSIGHT_ENVIRONMENT_ID")
+    try:
+        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "prod-shared-dev"
+        env_id, missing = resolve_environment_id("postgresql")
+        assert (env_id, missing) == ("prod-shared-dev", False)
+        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = ""
+        env_id, missing = resolve_environment_id("postgresql")
+        assert env_id == "" and missing is True
+        env_id, missing = resolve_environment_id("sqlite")
+        assert (env_id, missing) == ("admin_db:sqlite", False)
+        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "prod env\nuri://secret pass"
+        env_id, missing = resolve_environment_id("postgresql")
+        # `:` 在允许字符集内（admin_db:sqlite 风格），空格/换行/斜杠被清洗。
+        assert env_id == "prodenvuri:secretpass" and missing is False
+    finally:
+        if saved_env is None:
+            os.environ.pop("GRAPHINSIGHT_ENVIRONMENT_ID", None)
+        else:
+            os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = saved_env
+    # 非敏感断言：允许字符集外的空白/URI 分隔符已被清洗。
 
     print("C3_INVENTORY_CONTRACT_OK")
     return 0
