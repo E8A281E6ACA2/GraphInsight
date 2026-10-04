@@ -31,12 +31,13 @@ Gate 0 coverage evidence contract (audit/m5-gate0-completion, audit revision 2):
    coverage_verdict=FAILED, writes=UNVERIFIED_EVIDENCE (or
    UNVERIFIED_COUNTER_DRIFT when values drifted), and exit code 2.
 7. Output carries timestamp, commit_sha, and an explicit non-sensitive
-   environment_id (from GRAPHINSIGHT_ENVIRONMENT_ID, strictly validated against
-   ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$). Illegal input is rejected whole as
-   environment_id_invalid (fail-closed), never sanitized-and-emitted, so URI
-   credential fragments cannot leak through partial stripping; URIs, tokens,
-   and passwords are never emitted. A PostgreSQL run without that id refuses
-   FULL.
+   environment_id (from GRAPHINSIGHT_ENVIRONMENT_ID, matched AS-IS against
+   ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$ with NO trimming). Illegal input is
+   rejected whole as environment_id_invalid (fail-closed), never
+   sanitized-and-emitted and never stripped-then-accepted, so URI credential
+   fragments and whitespace-padded values cannot leak through; only a truly
+   empty raw value counts as missing. URIs, tokens, and passwords are never
+   emitted. A PostgreSQL run without that id refuses FULL.
 8. --kb slice probes are marked scope=SCOPE_SLICE and capped at PARTIAL.
 Isolated contract tests only prove this formatter/state machine; they do not
 constitute shared-production Gate 0 closure.
@@ -116,29 +117,28 @@ def _resolve_commit_sha() -> str:
 def resolve_environment_id(dialect_name: str) -> Tuple[str, Optional[str]]:
     """Resolve the explicit environment id under a STRICT allowlist.
 
-    Returns (environment_id, failure_reason). Illegal input is rejected, never
-    sanitized-then-emitted (audit revision 3): spaces, slashes, "@", control
-    characters, or any character outside ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$
-    invalidate the whole value, so a URI fragment such as
-    "postgres://user:pass@host" can never leak through partial stripping.
-    The failure reason carries only a category, never the raw value.
+    Returns (environment_id, failure_reason). The RAW value is matched as-is
+    (audit revision 4): no stripping, no trimming, no sanitizing. Any leading,
+    trailing, or inner illegal character (space, tab, newline, "@", slash,
+    control characters, anything outside ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$)
+    invalidates the whole value, so padded inputs -- a leading or trailing
+    space, a tab- or newline-padded token, or an all-whitespace value -- are
+    rejected as INVALID instead of being silently trimmed into acceptance.
+    Revision 3 closed partial stripping of URI fragments; revision 4 closes
+    the remaining strip bypass. Only a truly empty raw value (unset or "")
+    counts as MISSING. The failure reason carries only a category, never the
+    raw value.
     """
-    candidate = os.environ.get(ENVIRONMENT_ID_VAR, "").strip()
-    if candidate:
+    candidate = os.environ.get(ENVIRONMENT_ID_VAR)
+    if candidate:  # 原始值非空：直接严格匹配，全路径无任何 strip。
         if _ENVIRONMENT_ID_PATTERN.fullmatch(candidate):
             return candidate, None
         return "", "ENVIRONMENT_ID_INVALID: value rejected by strict allowlist"
+    # 原始值为空（未设置或显式空串）才算 MISSING；纯空白属于非法值。
     if str(dialect_name or "").strip().lower() == "postgresql":
         return "", "ENVIRONMENT_ID_MISSING_FOR_FORMAL_PG"
     # 隔离/降级运行（SQLite 等）允许派生标识，但仍须显式可读。
     return f"admin_db:{dialect_name}", None
-
-
-def _count_rows(conn: Any, table: str) -> int:
-    try:
-        return int(conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar() or 0)  # noqa: S608
-    except Exception:  # noqa: BLE001 - 缺表/权限不足时按 0 计并保留 reason
-        return 0
 
 
 def _load_kbs_with_fallback() -> Tuple[Dict[str, str], Optional[str]]:
