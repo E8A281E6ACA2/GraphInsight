@@ -459,16 +459,16 @@ def section_e(h: Harness) -> None:
 
 
 # ---------------------------------------------------------------------------
-# E2. dual_write 影子失败调用链（build_graph → shadow failure → job retry/fail）
+# E2. dual_write 影子失败调用链（reindex_chunks → shadow failure → retryable exception）
 # ---------------------------------------------------------------------------
 
 
 def section_e2(h: Harness) -> None:
-    print("[E2] dual_write 影子(v3)写失败 → 投影未收敛 → job 抛 RuntimeError 重试")
+    print("[E2] dual_write 影子(v3)写失败 → 投影未收敛 → reindex_chunks 抛可重放 RuntimeError")
     out = scenario(h, "dual_shadow_fail.db", "dual_write_shadow_failure")
     exc = exception_of(out)
     step(
-        "影子失败被判为可重放：reindex_chunks 抛 RuntimeError（非 ValidationException=不重试）",
+        "影子失败被判为可重放异常：reindex_chunks 抛 RuntimeError（非终态 ValidationException）",
         exc.get("type") == "RuntimeError",
         f"exc={exc}",
     )
@@ -484,8 +484,10 @@ def section_e2(h: Harness) -> None:
     )
     revs = rev_map(out)
     step(
-        "c-1 的 vector 投影保持未收敛（状态非 indexed 且版本 NULL），等重放",
-        revs.get("c-1", {}).get("vector_status") != "indexed" and revs.get("c-1", {}).get("vector_content_revision") is None,
+        "c-1 的 vector 投影如实记 failed（版本 NULL）：不虚报 indexed，等重放",
+        revs.get("c-1", {}).get("vector_status") == "failed"
+        and revs.get("c-1", {}).get("vector_content_revision") is None
+        and revs.get("c-1", {}).get("content_revision") == 1,
         f"revs={revs}",
     )
 

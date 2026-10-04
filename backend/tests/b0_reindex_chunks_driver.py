@@ -345,16 +345,16 @@ def scenario_graph_write_failed() -> None:
 
 
 def scenario_dual_write_shadow_failure() -> None:
-    """调用链：dual_write 影子(v3)写失败 → worker 判 write_failed → job 抛错重试。
+    """调用链：dual_write 影子(v3)写失败 → worker 判 write_failed → reindex_chunks 抛可重放异常。
 
     向量腿走真实 `chunk_projection_reindex._write_milvus_projection` + 真实
     `vector_store.upsert_chunks`（dual_write 生效、影子 client upsert 抛错），Neo4j 腿与
     embedding 用假实现隔离；不联网、不碰真实 Milvus。锁死三件事：
       1. upsert_chunks 抛的 DualWriteShadowError 被 _write_milvus_projection 的宽 except
          吸收成 write_failed（不冒泡成别的类型、也不被当成成功）；
-      2. reindex_chunks 因 failed_chunks 非空抛 RuntimeError（按 max_retries 退避重试），
-         而非 ValidationException（不重试）——即"影子脏写 = 可重放"，不是"永久失败"；
-      3. 主库(v2)确已写、影子(v3)未写；c-1 的 vector 投影保持未收敛（不虚报 indexed）。
+      2. reindex_chunks 因 failed_chunks 非空抛 RuntimeError——即"影子脏写 = 可重放异常"
+         （非终态 ValidationException）；退避重试本身由 job_service 承担，见 WS-2 调用链测试；
+      3. 主库(v2)确已写、影子(v3)未写；c-1 的 vector 投影如实记 failed（不虚报 indexed）。
     """
     from services.embedding_service import embedding_service
     from services.vector_store import vector_store
