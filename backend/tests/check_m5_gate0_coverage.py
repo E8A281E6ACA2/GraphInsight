@@ -23,6 +23,7 @@ Positive / negative matrix (task contract + audit revision 2):
 10. Neo4j 计数失败（前后值等价 0）— 同上 fail-closed
 11. Milvus stats 不可读（前后值等价 0）— 同上 fail-closed
 12. active KB 带 scope_unresolved — 仍被探测并进入 C3_REPORT
+13. environment_id 非法值 — 整体拒绝为 INVALID，绝不清洗拼接输出；FAILED + exit 2
 """
 
 from __future__ import annotations
@@ -664,6 +665,37 @@ def scenario_active_scope_unresolved_still_probed() -> None:
     assert summary["c3_totals"]["scope_unresolved"] == 1
 
 
+# ---------------------------------------------------------------------------
+# 场景 13（audit 修订 3）：environment_id 非法值 —— 整体拒绝为 INVALID 并
+# fail-closed，绝不清洗拼接后输出（URI 凭据片段不得经部分剥离泄露）。
+# ---------------------------------------------------------------------------
+
+
+def scenario_environment_id_invalid_fail_closed() -> None:
+    box, restore = _patch_sandbox([])
+    os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "postgres://user:pass@host"
+    try:
+        code, stdout = _run_cli_capture([])
+    finally:
+        _restore(restore)
+    summary = _summary_of(stdout)
+    assert code == 2, f"invalid environment id must exit 2, got {code}"
+    assert summary["coverage_verdict"] == "FAILED"
+    assert summary["writes"] == "UNVERIFIED_EVIDENCE"
+    assert summary["environment_id_invalid"] is True
+    # 原值与其凭据片段绝不出现在任何输出行。
+    for fragment in ("postgres://", "user:pass", "pass@host"):
+        assert fragment not in stdout, f"leak detected: {fragment}"
+    assert "ENVIRONMENT_ID_INVALID" in stdout
+    kv = _parse_kv_line(
+        next(l for l in stdout.splitlines() if l.startswith("GATE0_COVERAGE ")),
+        "GATE0_COVERAGE",
+    )
+    assert kv["environment_id"] == "INVALID"
+    # 探测仍执行（身份校验独立于探测），但结果必须 fail-closed。
+    assert sorted(box.probes) == ["kb-active-a", "kb-active-b"]
+
+
 SCENARIOS = (
     scenario_full_coverage_positive,
     scenario_scope_slice_and_unregistered,
@@ -677,6 +709,7 @@ SCENARIOS = (
     scenario_neo4j_count_failure,
     scenario_milvus_stats_failure,
     scenario_active_scope_unresolved_still_probed,
+    scenario_environment_id_invalid_fail_closed,
 )
 
 

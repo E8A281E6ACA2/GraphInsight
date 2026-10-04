@@ -245,27 +245,41 @@ def main() -> int:
     assert ok is False
     assert drift == ["pg.chunk_revisions: 3 -> 4"]
 
-    # --- environment_id：显式变量优先；PG 缺失拒 FULL（audit 修订 5）---
+    # --- environment_id：严格白名单（audit 修订 3）---
+    # 显式合法值放行；PG 缺失拒 FULL；非法输入整体拒绝为 INVALID，
+    # 绝不清洗拼接后输出（URI 凭据片段不得经部分剥离泄露）。
     saved_env = os.environ.get("GRAPHINSIGHT_ENVIRONMENT_ID")
     try:
         os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "prod-shared-dev"
-        env_id, missing = resolve_environment_id("postgresql")
-        assert (env_id, missing) == ("prod-shared-dev", False)
+        env_id, failure = resolve_environment_id("postgresql")
+        assert (env_id, failure) == ("prod-shared-dev", None)
         os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = ""
-        env_id, missing = resolve_environment_id("postgresql")
-        assert env_id == "" and missing is True
-        env_id, missing = resolve_environment_id("sqlite")
-        assert (env_id, missing) == ("admin_db:sqlite", False)
-        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "prod env\nuri://secret pass"
-        env_id, missing = resolve_environment_id("postgresql")
-        # `:` 在允许字符集内（admin_db:sqlite 风格），空格/换行/斜杠被清洗。
-        assert env_id == "prodenvuri:secretpass" and missing is False
+        env_id, failure = resolve_environment_id("postgresql")
+        assert env_id == "" and failure == "ENVIRONMENT_ID_MISSING_FOR_FORMAL_PG"
+        env_id, failure = resolve_environment_id("sqlite")
+        assert (env_id, failure) == ("admin_db:sqlite", None)
+        # 非法输入：URI 凭据、空格、换行、@、控制字符——整体拒绝，不输出任何片段。
+        for bad in ("postgres://user:pass@host", "prod env\nuri://secret pass", "env@host", "a b"):
+            os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = bad
+            env_id, failure = resolve_environment_id("postgresql")
+            assert env_id == "", f"invalid value must not be emitted: {bad!r}"
+            assert failure == "ENVIRONMENT_ID_INVALID: value rejected by strict allowlist"
+            assert "postgres" not in (env_id or "") and "pass" not in (env_id or "")
+        # 边界：首字符必须字母数字，长度上限 64。
+        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "-leading-dash"
+        env_id, failure = resolve_environment_id("sqlite")
+        assert env_id == "" and failure is not None
+        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "a" * 64
+        env_id, failure = resolve_environment_id("sqlite")
+        assert (env_id, failure) == ("a" * 64, None)
+        os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = "a" * 65
+        env_id, failure = resolve_environment_id("sqlite")
+        assert env_id == "" and failure is not None
     finally:
         if saved_env is None:
             os.environ.pop("GRAPHINSIGHT_ENVIRONMENT_ID", None)
         else:
             os.environ["GRAPHINSIGHT_ENVIRONMENT_ID"] = saved_env
-    # 非敏感断言：允许字符集外的空白/URI 分隔符已被清洗。
 
     print("C3_INVENTORY_CONTRACT_OK")
     return 0
