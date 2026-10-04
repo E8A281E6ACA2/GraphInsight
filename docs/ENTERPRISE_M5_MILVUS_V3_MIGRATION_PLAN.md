@@ -10,11 +10,12 @@
 
 ## 0. 一句话结论
 
-真实 v3 迁移被一个**当前代码不存在的能力**阻塞：`dual_write`。§16.1 的 S1（同一生产写
-同时落 v2+v3）在代码里没有实现路径，因此**在 `dual_write` 实现并验证之前，禁止进入 S1、
-禁止对任何真实 KB 执行 v3 迁移、禁止宣称 canary 闭环**。本方案只把"现在能做的"（隔离的
-单目标 schema 建集合验证）与"必须先补代码才能做的"（双写/切换）分开摆明，并给出各自的
-验收判据与门禁。
+真实 v3 迁移曾以 `dual_write`（§16.1 S1：同一生产写同时落 v2+v3）为代码级阻塞项。**该能力已在
+后端实现并带自动化验证（默认关闭，见文末"实现落地记录"）**，S0→S1 不再缺代码。但**实现 ≠ 迁移**：
+真实 v3 迁移仍禁止在未授权下推进——开启双写是需单独批准的迁移动作，且 §5.1 合成 schema canary
+runner 仍未实现、§7 C3 per-KB 处置清单与 §9 其余门禁尚未满足。在此之前，禁止对任何真实 KB
+执行 v3 迁移、禁止宣称 canary 闭环。本方案把"现在能做的"（隔离的单目标 schema 建集合验证）与
+"必须授权 + 补齐其余前置才能做的"（双写开启/切换）分开摆明，并给出各自的验收判据与门禁。
 
 ---
 
@@ -29,7 +30,7 @@
 | `has_content_revision_field()` | `vector_store.py:283` | 运行期探测某 collection 是否有显式 §8.5 字段（结果按名缓存，探测失败按"不支持"→拒写）。 |
 | legacy 名归一化 `graphinsight_chunks → _v2` | `vector_store.py:134-140` | 配置为空或旧名一律落到 `graphinsight_chunks_v2`，即当前默认读/写目标是 v2。 |
 | 写保护：有版本意图但缺显式字段 → 拒写 | `vector_store.py:249-257`（`VectorStoreSchemaError`，文案"…graphinsight_chunks_v3 后重建向量"） | §8.5 冻结：宁可拒写也不把 revision 降级进 dynamic metadata。 |
-| **`dual_write` / `dualwrite` / `dual-write`** | **全 `backend/` 非文档零命中** | **§16.1 S1 双写在代码中不存在。`milvus.dual_write=true` 目前只是设计要求，不是可用能力。** |
+| `dual_write` / `dualwrite` / `dual-write` | **已在后端实现（默认关闭）** | §16.1 S1 双写能力已落地：`MilvusVectorStore.resolve_dual_write` 生效判据 + `upsert_chunks`/`delete_doc`/`clear` 扇出主库与影子（`backend/services/vector_store.py`）。开关默认关，`milvus.dual_write=true` 现对应真实代码；但**开启 = 需单独授权的迁移动作**，且仍受 §5/§9 其余门禁约束。见文末"实现落地记录"。 |
 
 结论性判定：**v3 集合的"建立 + 单目标写入 + 字段判据"当前代码即可支撑；"同一写扇出到
 v2 与 v3 两个 collection"当前代码完全不支持。**
@@ -43,7 +44,7 @@ v2 与 v3 两个 collection"当前代码完全不支持。**
 
 - 若直接切配置到 v3：v3 里没有存量向量 → 检索大面积空命中（数据丢失假象）。
 - 若先逐 KB 重建 v3 再切：重建窗口内该 KB 读 v2 写 v3 = 违反读写同源不变量。
-- 若边写 v2 边补 v3：这正是 `dual_write`，而它未实现。
+- 若边写 v2 边补 v3：这正是 `dual_write`，现已实现（默认关闭，见文末落地记录）。
 
 所以 S1→S2→S3 这条主线**以 `dual_write` 为前置**。§15.4 的 A/B/C/D 已被 §16.1 状态机
 覆盖，本方案一律以 §16.1 为准。
@@ -72,7 +73,7 @@ v2 与 v3 两个 collection"当前代码完全不支持。**
 
 ```
 S0  现状：读写皆 v2（默认，安全）           —— 无需授权，已是当前态
-S1  双写：写扇出 v2+v3，读仍 v2（v3 影子）   —— GATED，阻塞项：dual_write 未实现
+S1  双写：写扇出 v2+v3，读仍 v2（v3 影子）   —— GATED；代码已实现(默认关闭)，开启需授权+补齐其余前置
 S2  切换：原子把读源 v2→v3 + 重启           —— GATED，前置 S1 稳定且校验通过
 S3  稳态：读写皆 v3，v2 只读留存备回滚       —— GATED
 ```
@@ -80,6 +81,10 @@ S3  稳态：读写皆 v3，v2 只读留存备回滚       —— GATED
 - **S0→S1 的前置不是配置开关，而是代码**。必须先实现 `dual_write`：在一次 upsert 内
   同时写 v2 与 v3，且任一失败要能定位并保持投影未收敛（与 §8.5 拒写语义一致）。在
   `dual_write` 存在且有自动化验证之前，**本步不存在，不得尝试用配置绕过**。
+  **现状更新**：该代码前置已满足——`MilvusVectorStore.resolve_dual_write` + `upsert_chunks`
+  /`delete_doc`/`clear` 扇出、影子失败抛 `DualWriteShadowError`（可定位、令投影判未收敛、按主键
+  幂等重放收敛）已由 `backend/tests/check_m5_dual_write.py` 自动化验证；开关默认关闭。开启仍需
+  §9 其余门禁 + 单独授权，不得仅因"代码有了"就设 `milvus.dual_write=true`。
 - **S2 切换**要求 v3 与 v2 的 per-KB 计数与抽样 revision 校验通过（见 §6）。
 - **S2 之后回滚 = 五步**（§16.1，覆盖 §15.4）：
   1. 写冻结（对受影响 KB 返回 `503 INDEX_UNAVAILABLE`，停止新写）；
@@ -119,8 +124,9 @@ upsert→直接读回 revision 正确、幂等重跑不翻倍。
 
 ### 5.2 双写 / 切换 canary（被阻塞，禁止宣称闭环）
 目的：证明 S1 双写一致性与 S2 切换后检索无损。
-- **依赖 `dual_write`，当前不存在。** 在实现并验证前，5.2 无法运行，也**不得**以任何形式
-  宣称"canary 已闭环/迁移可回滚"。
+- **依赖 `dual_write`——代码已实现（默认关闭），但 5.2 仍不可执行**：5.2 要真跑必须
+  ①有授权、②存在真实 v3 目标 collection 且 §5.1 schema canary 已过、③§7 C3 处置清单归零。
+  三者齐备前，5.2 **不得**以任何形式宣称"canary 已闭环/迁移可回滚"。
 - 5.1 通过也**不能**外推为 5.2 通过——两者证明的不变量不同。
 
 ---
@@ -176,23 +182,54 @@ orphan_revisions / unrecoverable / scope_unresolved / scope_mismatches / 迁移�
 
 ## 8. 明确不做（本方案与本轮的边界）
 
-- 不实现 `dual_write`、不写任何 v3/生产数据、不切配置、不跑 canary。
+- 不写任何 v3/生产数据、不切配置、不跑 canary。（`dual_write` 的**代码实现**已由后续轮次落地并默认关闭，见文末落地记录；本轮及该后续轮均不产生真实 v3 数据。）
+- 不推荐"现在就设 `milvus.dual_write=true`"——代码虽有，但真实开启仍是迁移动作，须先满足
+  §9 全部前置（§5.1 canary runner 落地、§7 C3 处置归零、真实 v3 collection、单独授权）；
+  未达前置就开启 = 把脏/未校验投影写入 v3，属危险操作。
 - 不开 M5-B1，不共享 v3 写入。
-- 不推荐"现在就设 `milvus.dual_write=true`"——该配置无对应代码，设了也是空开关，属
-  §0/§2 所述危险操作。
-- 不 push、不动 main；本文件的提交只落 `audit/m5-gate0-coverage` 分支。
+- 不 push、不动 main；本文件后续修订落在 `m5/dual-write` 分支（原审计轮 §8 表述针对
+  `audit/m5-gate0-coverage`，此处按当前分支更新）。
 
 ---
 
 ## 9. 进入执行前必须先满足的条件（阻塞清单）
 
-1. `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）。
+1. ✅ `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）——**已满足**：见文末
+   "实现落地记录"。仅解锁"代码前置"，不等于可开启真实双写；开启仍受 2/3/4 与授权约束。
 2. 授权运行 §5.1 合成 schema canary（写 Milvus，需单独批准）。
 3. C3 处置清单（§7）中所有待迁 KB 的 blocked/orphan/unrecoverable/scope_* 归零或有批准
    的例外。
 4. 双写一致性 + 切换 + 回滚五步的验收脚本就绪（§6 判据落到可执行断言）。
 
 以上任一未满足，真实 v3 迁移保持关闭，M5 gate 不宣布通过。
+
+---
+
+## 9.1 实现落地记录（2026-10-04 · dual_write 代码轮，分支 `m5/dual-write`）
+
+本节只记录**代码事实**（均可 `git`/文件复查），不改变 §4–§9 的任何门禁判定：真实 v3 迁移仍关闭。
+
+落地的能力（`MilvusVectorStore`，默认全部关闭 = S0 现网安全态）：
+
+- 配置入口：`config.py` 增 `milvus_dual_write`（env `MILVUS_DUAL_WRITE`，默认 false）、
+  `milvus_shadow_collection`（env `MILVUS_SHADOW_COLLECTION`，默认空）；
+  `services/runtime_config.py:get_vector_store_runtime_config` 输出 `dual_write` +
+  `shadow_collection`，配置中心优先压过 env/settings。
+- 生效判据：`services/vector_store.py:MilvusVectorStore.resolve_dual_write` —— active 需同时满足
+  开关开、store 已启用、shadow 非空、且 **shadow ≠ 主 collection**（同名退化为同集合重复写，拒绝）。
+- 扇出写：`upsert_chunks` → `_upsert_to`/`_build_rows`，`ensure_collection` 支持按 collection 名。
+  **主库（读源）先写**，主库失败直接抛出且影子零调用；影子（v3）写失败（主库已成）→ `logger.error`
+  + 抛 `DualWriteShadowError`（携带 primary/shadow 集合名），令投影判未收敛、调用方按主键幂等重放收敛，
+  绝不静默吸收（§4/§6/§8.5）；影子确认数≠主库同样判未收敛。影子 collection 缺显式
+  `content_revision` 字段 → 复用 §8.5 门拒写并包成影子错误。
+- 扇出删除：`delete_doc`/`clear` 同步删影子，避免 §6 "chunk_id 集合 v3 多"；影子删除失败上抛。
+- 读源不变：双写生效时 `config().collection` 仍为主库，`search` 路径不受影响。
+- `DualWriteShadowError` 为 `VectorStoreUpsertError` 子类，调用方原有 catch 仍能捕获"影子未收敛"。
+
+自动化验证：`backend/tests/check_m5_dual_write.py`（假 client，无 pytest / 不连真实 Milvus），
+16 条断言覆盖上述全部不变量；已注册进 `tests/run_unified_boundary_guards.py`（guard 名
+`m5_dual_write`）。**未做**：真实建集合、真实 v3 写入、切读源、跑 §5.1/§5.2 canary——这些仍需
+单独授权，且 §5.1 canary runner 本身仍未实现（NOT-IMPLEMENTED）。
 
 ---
 
