@@ -411,10 +411,18 @@
   缺失即 FAILED；`configured_raw` 与 `resolved` 名称分离报告；显式非敏感 environment_id
   （`GRAPHINSIGHT_ENVIRONMENT_ID`）且 PG 正式运行缺失拒 FULL；负向测试扩至"四源分别失败
   且前后值等价 0"矩阵 + scope_unresolved 仍被探测场景（12 场景全绿）。同时修正文档中
-  "所有异常均 fail-closed"与 worktree 清洁状态的过度表述。仍为隔离层，Gate 0 保持 OPEN。
+  ~~"所有异常均 fail-closed"~~与 worktree 清洁状态的过度表述。仍为隔离层，Gate 0 保持 OPEN。
 - [x] 2026-10-04（审计修订 3，"条件通过"整改）environment_id 校验改严格白名单
   （非法输入整体拒绝为 INVALID 并 fail-closed，废除清洗拼接策略，杜绝 URI 凭据片段
-  经部分剥离泄露）；复核指引修正为肯定式句型排除法（"所有异常均"命中允许存在于
+  经部分剥离泄露）；复核指引修正为肯定式句型排除法（"所有异常[均]"命中允许存在于
   废除/修正语境）；Backlog 第一版条目标注历史版本口径；场景矩阵扩至 13（新增
   environment_id 非法值 CLI 级 fail-closed 场景）。隔离验收 13/13 全绿；
+  共享生产 Gate 0 仍 OPEN，合并暂缓、dual-write 冻结不变。
+- [x] 2026-10-04（审计修订 4，P1 strip 绕过整改）`resolve_environment_id` 废除 `.strip()`
+  前置处理，改为**原始值直接严格匹配**：仅空值记 MISSING，含任何前导/尾随/内部非法
+  字符（含空白/控制字符）一律 INVALID 并 fail-closed（FAILED + exit 2 +
+  `UNVERIFIED_EVIDENCE`）；契约测试与 CLI 场景 14 钉死五个边界值（`" prod"`、
+  `"prod "`、`"\tprod"`、`"prod\n"`、`"   "`）全部拒绝且原值零泄露；删除未使用且异常
+  静默折 0 的 `_count_rows()`；复核 grep 门禁从宽泛词排除收紧为结构性规则（删除线
+  引用/自免疫提述两种合法形式，见验收记录 §5.1）。隔离验收 14/14 全绿；
   共享生产 Gate 0 仍 OPEN，合并暂缓、dual-write 冻结不变。

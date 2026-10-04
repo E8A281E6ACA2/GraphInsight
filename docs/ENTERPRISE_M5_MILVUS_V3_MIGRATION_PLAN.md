@@ -176,7 +176,7 @@ orphan_revisions / unrecoverable / scope_unresolved / scope_mismatches / 迁移�
 
 `backend/admin/report_m5_c3_inventory.py` 已从"逐 KB C3 输出"升级为带全量覆盖证据的
 gate 报告，支撑 §7 处置清单作为迁移前置门禁的可审计性。以下为**审计修订 2 后**的合同
-（第一版把计数读取错误折算为 0、并使用"所有异常均 fail-closed"的过度表述，均已按审计
+（第一版把计数读取错误折算为 0、并使用~~"所有异常均 fail-closed"~~的过度表述，均已按审计
 意见纠正）：
 
 1. **覆盖计数**：`registered_kb_total / active_kb_total / eligible_kb_total /
@@ -197,29 +197,34 @@ gate 报告，支撑 §7 处置清单作为迁移前置门禁的可审计性。�
    目标 KB 读取失败、注册表查询失败、before/after 任一快照存在 degraded reason（含
    单源读取失败、current collection 缺失、Milvus 证据降级）、计数漂移、§8.5 v3 目标
    collection 已存在、PostgreSQL 正式运行缺失显式 environment_id。除此之外的异常路径
-   不在本合同担保范围内，不使用"所有异常均 fail-closed"的表述。
+   不在本合同担保范围内，不使用~~"所有异常均 fail-closed"~~的表述。
 6. **collection 只读枚举与名称分离（审计修订）**：`configured_raw`（未归一化的原始
    配置名，可为 legacy 名）与 `resolved`（§11.1/D3 归一化后的现读写名）分别报告；
    `current` 分类只按 `resolved` 判定。`resolved` 名在实例上不存在记
    `current_missing=true` 并 fail-closed。`list_collections` 只读，绝不创建、修改或删除。
 7. **零写对账**：五类证据源在探测前后各快照一次；值漂移记 `writes=UNVERIFIED_COUNTER_
    DRIFT`；快照内任何 degraded reason 记 `writes=UNVERIFIED_EVIDENCE`——两者均 fail-closed。
-8. **环境标识（审计修订 3：严格校验）**：输出 `timestamp / commit_sha / environment_id`；
+8. **环境标识（审计修订 3：严格校验；修订 4：原始值不裁剪）**：输出
+   `timestamp / commit_sha / environment_id`；
    `environment_id` 取自 `GRAPHINSIGHT_ENVIRONMENT_ID`，按白名单
    `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$` **整体校验**——空格/斜杠/`@`/控制字符等非法输入
    直接拒绝为 `environment_id_invalid` 并 fail-closed（FAILED + exit 2 +
    `UNVERIFIED_EVIDENCE`），**不做"清洗后拼接输出"**，杜绝
    `postgres://user:pass@host` 类凭据片段经部分剥离泄露；失败原因只含类别、不含原值。
    全程不输出 URI/token/密码。PostgreSQL 正式运行缺失该变量时拒绝产出 FULL（fail-closed）。
+   审计修订 4：**原始值直接匹配、全路径无 strip**——仅原始值为空（未设置或空串）记
+   MISSING；含任何前导/尾随/内部非法字符（含空白与控制字符）一律 INVALID，
+   `" prod"`、`"prod "`、`"\tprod"`、`"prod\n"`、`"   "` 等填充输入不得被静默裁剪后放行
+   （CLI 级场景 14 逐值钉死）。
 9. **局部探测**：`--kb` 运行标 `scope=SCOPE_SLICE`，verdict 封顶 `PARTIAL`，
    永远不得表述为 `FULL`。
 
 隔离验证：`backend/tests/check_m5_c3_inventory.py`（formatter/verdict/分类/对账/
 value-ok-reason/环境标识契约）与 `backend/tests/check_m5_gate0_coverage.py`（SQLite +
-假 pymilvus/neo4j 的 CLI 正负场景 13 个：全覆盖、状态排除、缺 scope、单 KB 读取异常、
+假 pymilvus/neo4j 的 CLI 正负场景 14 个：全覆盖、状态排除、缺 scope、单 KB 读取异常、
 多 collection、计数漂移、注册表降级、**PG chunk_revisions/admin_jobs/Neo4j/Milvus
 四源分别失败且前后值等价 0 的负向矩阵**、active KB 带 scope_unresolved 仍被探测并进入
-C3 报告）。
+C3 报告、environment_id 非法值与填充空白 fail-closed）。
 
 **边界声明：以上仅为隔离测试证明的合同实现（Gate 0 contract implementation
 complete）。共享生产 Gate 0 仍未 CLOSED——共享证据采集仍须在授权后于真实

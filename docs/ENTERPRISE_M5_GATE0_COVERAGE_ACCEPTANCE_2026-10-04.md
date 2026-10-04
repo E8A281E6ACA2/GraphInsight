@@ -1,4 +1,4 @@
-# M5 Gate 0 全量覆盖证据合同验收记录（2026-10-04，含审计修订 2）
+# M5 Gate 0 全量覆盖证据合同验收记录（2026-10-04，含审计修订 2-4）
 
 任务：`audit/m5-gate0-completion`（基线 `origin/main=59332f4`）
 执行边界：只实现 + 隔离测试。**未连接、未写入共享 dev；未修改共享 v2；未创建共享 v3；
@@ -46,7 +46,7 @@
   SCOPE_SLICE 封顶、失败压制成 FAILED、collection 分类、before/after 对账断言。
 - `backend/tests/check_m5_gate0_coverage.py`（新增，+497）：SQLite 内存注册表 +
   假 `pymilvus`/`neo4j` 模块 + `build_inventory` 桩，**第一版为 7 个 CLI 级正负场景**
-  （历史口径；现行为 13 个场景，见 §3 与 §1.4 修订 3）。
+  （历史口径；现行为 14 个场景，见 §3 与修订记录）。
 
 ### 1.3 docs：`ceae362` + `acbc66c`（三份文档同步 + 本记录）
 
@@ -63,7 +63,7 @@
 | 5 | 显式 environment_id，PG 缺失拒 FULL | 新增 `GRAPHINSIGHT_ENVIRONMENT_ID`（非敏感字符集清洗）；PG 正式运行缺失 → `environment_id_missing=true` → fail-closed 拒 FULL |
 | 6 | 四源失败且前后均为 0 的负向测试 | 场景 8-11：PG chunk_revisions / admin_jobs / Neo4j / Milvus stats 分别注入失败，断言前后 value 均为 None（等价旧实现的 0/0 通过假象不再存在）且 FAILED + `UNVERIFIED_EVIDENCE` |
 | 7 | active KB 带 scope_unresolved 仍被探测 | 场景 12：探测序列包含该 KB、`counts.scope_unresolved=1`、`c3.scope_unresolved` 带 chunk 级原因、`c3_totals` 计入，verdict 不受影响 |
-| 8 | 修正过度表述 | 迁移计划 §7.1 重写为"枚举化 fail-closed"（废除"所有异常均 fail-closed"）；本记录 §6.2 修正 worktree 状态表述 |
+| 8 | 修正过度表述 | 迁移计划 §7.1 重写为"枚举化 fail-closed"（废除~~"所有异常均 fail-closed"~~）；本记录 §6.2 修正 worktree 状态表述 |
 
 整改性质：同分支追加提交，仍不连接任何真实服务。
 
@@ -74,17 +74,28 @@
 | # | 复核意见 | 整改落点 |
 |---|---|---|
 | P1 | environment_id 清洗策略可能泄露敏感片段（删除非法字符会把 URI 凭据片段拼接进输出） | `_environment_id_sanitized` 清洗策略废除，改为**严格白名单** `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$`：空格/斜杠/`@`/控制字符等非法输入整体拒绝，记 `environment_id_invalid=true` 并 fail-closed（FAILED + exit 2 + `UNVERIFIED_EVIDENCE`），绝无"清洗后输出"；失败原因只含类别（`ENVIRONMENT_ID_INVALID: value rejected by strict allowlist`），不含原值；新增 CLI 级场景 13 断言 `postgres://user:pass@host` 注入后凭据片段零泄露 |
-| P2 | 复核指引声称"所有异常均"grep 应无匹配不成立（文档在"废除/修正"语境中合法引用该历史表述）；Backlog 第一版条目仍写"7 个正负场景"易误读 | 复核指引修正为"肯定式句型排除法"（见 §5.1）：命中行必须全部处于废除/修正语境，任何肯定式使用即不通过；Backlog 第 7 条标注**[历史版本]**，本记录 §1.2 同步标注第一版 7 场景为历史口径，现行为 13 场景 |
+| P2 | 复核指引声称"所有异常[均]"grep 应无匹配不成立（文档在"废除/修正"语境中合法引用该历史表述）；Backlog 第一版条目仍写"7 个正负场景"易误读 | 复核指引修正为"肯定式句型排除法"（见 §5.1）：命中行必须全部处于废除/修正语境，任何肯定式使用即不通过；Backlog 第 7 条标注**[历史版本]**，本记录 §1.2 同步标注第一版 7 场景为历史口径（修订 3 时为 13 场景，现行为 14，见 §1.6） |
+
+### 1.6 审计修订 4（P1 strip 绕过未闭环整改）
+
+第三轮复核确认修订 3 的严格白名单与排除式 grep 已落地，但指出两点未闭环：
+
+| # | 复核意见 | 整改落点 |
+|---|---|---|
+| P1 | `resolve_environment_id` 先 `.strip()` 再校验：`" prod"`、`"prod "`、`"\tprod"`、`"prod\n"` 被静默裁剪后放行，纯空白 `"   "` 被误归为 MISSING，与"任一非法字符整体拒绝"的声明不一致 | **原始值直接严格匹配，全路径无任何 strip**：原始值为空（未设置或显式空串）才算 `MISSING`；原始值含任何前导/尾随/内部非法字符（空白、控制字符等）一律 `ENVIRONMENT_ID_INVALID` 并 fail-closed（FAILED + exit 2 + `UNVERIFIED_EVIDENCE`）。契约测试补五个边界值断言拒绝且跨方言一致；新增 CLI 级场景 14 断言五个值均 exit 2 + `UNVERIFIED_EVIDENCE` + `environment_id=INVALID`，且裁剪后 token 按词边界匹配零泄露（`shared_production_gate` 等合法词的子串不误报，`environment_id=prod` 类真实泄露仍被命中） |
+| P2 | 排除式 grep 的宽泛词（历史/事实主张/不得等）可能在未来遮蔽同行夹带的肯定式误用，非可靠长期门禁；`_count_rows()` 未使用且异常路径静默返回 0，与"错误不得折算 0"合同冲突 | grep 门禁收紧为**结构性规则**：该句型的合法字面出现仅限删除线引用与自免疫提述 `所有异常[均]` 两种形式（见 §5.1），全库 13 处历史引用已按规则改写；`_count_rows()` 已删除（无调用方，`git grep -n "_count_rows" -- backend/` 归零验证） |
+
+整改性质：同分支追加提交，仍为隔离层，不连接任何真实服务。
 
 ---
 
-## 2. 验收命令与退出码（隔离环境实跑，修订 3 整改后）
+## 2. 验收命令与退出码（隔离环境实跑，修订 4 整改后）
 
 | 命令 | exit code | 关键输出 |
 |---|---|---|
 | `python -m py_compile backend/admin/report_m5_c3_inventory.py backend/tests/check_m5_c3_inventory.py backend/tests/check_m5_gate0_coverage.py` | 0 | — |
 | `python backend/tests/check_m5_c3_inventory.py` | 0 | `C3_INVENTORY_CONTRACT_OK` |
-| `python backend/tests/check_m5_gate0_coverage.py` | 0 | `GATE0_COVERAGE_CONTRACT_OK scenarios=13` |
+| `python backend/tests/check_m5_gate0_coverage.py` | 0 | `GATE0_COVERAGE_CONTRACT_OK scenarios=14` |
 | `git diff --check`（提交前，本轮路径范围） | 0 | 无空白错误 |
 | `git status --short`（本轮路径范围 `backend docs .gitignore`） | 0 | 仅本轮改动文件 |
 
@@ -93,7 +104,7 @@ git rev-parse 打桩）。只证明格式器/状态机/CLI 合同，不代表任
 
 ---
 
-## 3. 正负场景覆盖矩阵（check_m5_gate0_coverage.py，13/13 通过）
+## 3. 正负场景覆盖矩阵（check_m5_gate0_coverage.py，14/14 通过）
 
 | # | 场景 | 期望 | 实测 |
 |---|---|---|---|
@@ -110,6 +121,7 @@ git rev-parse 打桩）。只证明格式器/状态机/CLI 合同，不代表任
 | 11 | Milvus stats 不可读（同上等价 0） | 同上 fail-closed | 通过 |
 | 12 | active KB 带 scope_unresolved | 仍被探测并进入 `C3_REPORT`（`counts.scope_unresolved=1`、chunk 级原因）、`c3_totals` 计入、verdict 不变 | 通过 |
 | 13 | environment_id 非法值（`postgres://user:pass@host`） | 整体拒绝为 INVALID、`environment_id_invalid=true`、FAILED + exit 2 + `UNVERIFIED_EVIDENCE`、凭据片段零泄露、失败原因不含原值 | 通过 |
+| 14 | environment_id 填充空白（`" prod"`/`"prod "`/`"\tprod"`/`"prod\n"`/`"   "` 五值逐个注入） | 原始值直接匹配不裁剪：一律 INVALID（纯空白不是 MISSING）、FAILED + exit 2 + `UNVERIFIED_EVIDENCE`、`environment_id=INVALID`、裁剪后 token 词边界零泄露 | 通过 |
 
 附加断言：输出不含 `postgres://`、`bolt://`、`19530`、`password`、`token`；
 `environment_id` 取自夹具显式注入（`admin_db:sqlite` 等价语义）；`commit_sha` 来自真实
@@ -122,7 +134,7 @@ git rev-parse（测试内打桩为固定值以保确定性）；场景 1 额外�
 ## 4. 证据分层声明（审计口径）
 
 1. **隔离测试**：SQLite 内存库 + fake pymilvus/neo4j + stub build_inventory，
-   13 场景 + formatter 契约全绿（exit 0）。仅证明代码合同与状态机。
+   14 场景 + formatter 契约全绿（exit 0）。仅证明代码合同与状态机。
 2. **真机取证**：**未取证**。本轮未连接任何真实 PostgreSQL/Neo4j/Milvus 运行报告；
    共享 dev 的 `report_m5_c3_inventory.py` 实跑未执行（任务明确禁止）。
 3. **生产闭环**：**未达成**。共享生产 Gate 0 保持 OPEN；`shared_production_gate=OPEN`
@@ -134,38 +146,48 @@ git rev-parse（测试内打桩为固定值以保确定性）；场景 1 额外�
 
 - `docs/ENTERPRISE_M5_MILVUS_V3_MIGRATION_PLAN.md`：§7.1 重写为审计修订版合同
   （value/ok/reason、枚举化 fail-closed、raw/resolved 分离、environment_id 门禁），
-  明确废除"所有异常均 fail-closed"的全称表述。
+  明确废除~~"所有异常均 fail-closed"~~的全称表述。
 - `docs/ENTERPRISE_ROADMAP_CHECKLIST.md`：追加审计修订 2 条目（12 场景、整改内容）。
 - `docs/ENTERPRISE_IMPLEMENTATION_BACKLOG.md`：M5-B0 验收进展追加第 8 条修订记录。
 - 本验收记录：修正过度表述并登记审核退回与整改闭环。
 
-### 5.1 独立复核指引（修订 3 修正版）
+### 5.1 独立复核指引（修订 4 收紧版）
 
-第一轮汇报中"`git grep -n "所有异常均" -- docs/` 应无匹配"的预期**不成立**：整改后的
-文档在"废除/修正/过度表述"语境中会合法引用该历史表述。正确复核方式为**肯定式句型
-排除法**——检查是否存在把"所有异常均 fail-closed"当作事实主张的用法：
+历史沿革：第一轮汇报称该句型的 grep 应无匹配，因文档在废除语境中合法引用该句型
+而不成立；修订 3 改为宽泛词排除法，但宽泛词（历史/事实主张/不得等）可能在未来
+遮蔽同行夹带的肯定式误用，不是可靠的长期门禁。修订 4 收紧为**结构性规则**：
 
-```
-git grep -nE "所有异常[均]" <rev> -- docs/ | \
-  grep -v "废除\|修正\|过度表述\|不得\|历史\|不使用\|应无匹配\|事实主张"
-```
-
-说明：pattern 用 `[均]` 字符类书写，使本指引命令行自身不命中自身（自免疫）。
-期望：**无输出**（exit 1）。排除词覆盖三类合法引用语境：废除声明、本指引自身的
-元讨论（引用旧预期以纠正之）、禁止式表述（"不使用/不得"）。若仍有命中，说明存在
-把该表述当作事实主张的肯定式使用，复核不通过。
-已在修订 3 提交（`1155198` 及后续 docs 修正）上实测：命中归零。
-
-其余复核命令不变：
+1. 该句型的**肯定式主张**在任何文档中禁止。
+2. 允许的字面出现仅限两种结构形式：
+   - **删除线引用**：`~~所有异常均 fail-closed~~`（可含引号，如 `~~"所有异常均
+     fail-closed"~~`）——历史/废除语境中引用该已废除表述；
+   - **自免疫提述**：`所有异常[均]`——仅复核指引/工具自身指称该句型时使用（字符类
+     使其不命中门禁 pattern）。
+3. 门禁命令（期望**无输出**，exit 1；`.{0,2}` 容纳删除线内可能存在的引号字符）：
 
 ```
-git log --oneline -7 <rev>
-python backend/tests/check_m5_gate0_coverage.py   # 期望 scenarios=13，exit 0
+git grep -nE "所有异常[均]" <rev> -- docs/ | grep -vE "~~.{0,2}所有异常"
+```
+
+任何未被删除线包裹的命中——无论该行是否含"历史""不得""事实主张"等词——一律
+不通过；删除线行另行人工复核其中不得夹带第二个未包裹的肯定式（行级 grep 为
+第一道闸）。本指引命令自身以 `[均]` 字符类书写，不命中门禁（自免疫）。
+已在修订 4 提交上实测：命中归零。
+
+其余复核命令不变（场景数更新）：
+
+```
+git log --oneline -10 <rev>
+python backend/tests/check_m5_gate0_coverage.py   # 期望 scenarios=14，exit 0
 git grep -n "_ENVIRONMENT_ID_PATTERN\|environment_id_invalid" <rev> -- backend/admin/report_m5_c3_inventory.py
+git grep -n "_count_rows" <rev> -- backend/       # 期望无命中（修订 4 删除静默折 0 helper）
+git show <rev>:backend/admin/report_m5_c3_inventory.py | grep -n "ENVIRONMENT_ID_VAR"
+  # 期望两行：变量定义与 os.environ.get(ENVIRONMENT_ID_VAR) 原始读取（后者无 .strip()）
 ```
 
 场景数口径提示：`343dd10..acbc66c` 为第一版 7 场景（历史），`d423f65..7b6cbcc` 为
-12 场景（修订 2），environment_id 严格校验提交后为 13 场景（修订 3）。以 HEAD 为准。
+12 场景（修订 2），environment_id 严格校验起为 13 场景（修订 3），原始值不裁剪校验起
+为 14 场景（修订 4）。以 HEAD 为准。
 
 ---
 
@@ -184,9 +206,9 @@ git grep -n "_ENVIRONMENT_ID_PATTERN\|environment_id_invalid" <rev> -- backend/a
 
 ### 6.2 状态表述修正（对应审核意见 #8）
 
-1. **"所有异常均 fail-closed"表述废除**：实际合同为**枚举式** fail-closed（§1.4 表
+1. **~~"所有异常均 fail-closed"~~表述废除**：实际合同为**枚举式** fail-closed（§1.4 表
    列出的七类触发面）。未列入枚举的异常路径（例如探测循环之外的意外崩溃）按普通错误
-   传播处理，不在本合同担保范围内。第一版文档的"所有异常均 fail-closed"为过度表述，
+   传播处理，不在本合同担保范围内。第一版文档的~~"所有异常均 fail-closed"~~为过度表述，
    已在迁移计划 §7.1 与本记录同步修正。
 2. **worktree 状态表述修正**：第一版称"主工作树已还原干净"，为过度表述。事实为：
    本轮在主工作树触碰过的 `backend/config.py` CRLF 行尾伪差异已还原；但主工作树整体
