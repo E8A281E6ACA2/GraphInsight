@@ -15,6 +15,11 @@
   7. 主/影子 rows 逐字节一致、确认数相等；
   8. delete_doc / clear 扇出影子；影子删除失败 → DualWriteShadowError；
   9. 影子失败修复后重放：主库按主键幂等再写一次并成功收敛。
+  10. 【P1#3 / Wave 1 fail-closed】store 已启用 + dual_write 请求开启 + 配置非法（shadow 空 / 与主同名）
+      → upsert_chunks / delete_doc / clear 在任何写入前抛 DualWriteConfigError，主/影子**零调用**。
+      以前的"静默退化单写"必须消灭——§6 红线：影子失败绝不静默吸收，配置错误同属必须显式失败。
+  11. store 本身未启用（enabled=false）时保持旧的零写短路（属整库关停，不是 dual_write 配置错），
+      guard 只在 enabled=true 时才生效；guard 早于 chunks 为空的短路返回。
 """
 from __future__ import annotations
 
@@ -120,7 +125,11 @@ def _chunk(rev=3):
 
 
 def main() -> int:
-    from services.vector_store import DualWriteShadowError, VectorStoreSchemaError
+    from services.vector_store import (
+        DualWriteConfigError,
+        DualWriteShadowError,
+        VectorStoreSchemaError,
+    )
 
     check = Check()
 
@@ -145,22 +154,112 @@ def main() -> int:
     check.ok("active_content_revision_present",
              rows_p[0].get("content_revision") == 3, f"rev={rows_p[0].get('content_revision')}")
 
-    # 3) shadow 与主库同名 → 拒绝双写（resolve 判 inactive，只写主库一次）。
+    # 3) shadow 与主库同名 → upsert 前 fail-closed，抛 DualWriteConfigError，主/影子零写。
+    #    （Wave 1 / P1#3 收口：以前会"退化成只写主库一次"，静默吞掉影子缺口，属 §6 红线违规。）
+    from services.vector_store import DualWriteConfigError
+
     store = _new_store(dual_write=True, shadow=PRIMARY)
     client = RecordingClient()
     _attach(store, client)
     dw = store.resolve_dual_write()
-    n = store.upsert_chunks([_chunk()], [[0.1, 0.2]])
-    check.ok("shadow_same_as_primary_refused", dw["active"] is False and set(client.upserts) == {PRIMARY} and n == 1,
-             f"active={dw['active']} reason={dw['reason']} cols={sorted(client.upserts)}")
+    raised_3 = None
+    try:
+        store.upsert_chunks([_chunk()], [[0.1, 0.2]])
+    except DualWriteConfigError as exc:
+        raised_3 = exc
+    check.ok("shadow_same_as_primary_fail_closed",
+             dw["active"] is False
+             and isinstance(raised_3, DualWriteConfigError)
+             and "同名" in str(raised_3.reason)
+             and client.upserts == {},
+             f"active={dw['active']} reason={dw['reason']} raised={type(raised_3).__name__ if raised_3 else None} cols={sorted(client.upserts)}")
 
-    # 4) shadow 为空 → 不双写并给原因。
+    # 3a) shadow 为空 + upsert → 同 fail-closed，零写。
+    store = _new_store(dual_write=True, shadow="")
+    client = RecordingClient()
+    _attach(store, client)
+    raised_3a = None
+    try:
+        store.upsert_chunks([_chunk()], [[0.1, 0.2]])
+    except DualWriteConfigError as exc:
+        raised_3a = exc
+    check.ok("upsert_empty_shadow_fail_closed",
+             isinstance(raised_3a, DualWriteConfigError)
+             and "shadow_collection" in str(raised_3a.reason)
+             and client.upserts == {},
+             f"raised={type(raised_3a).__name__ if raised_3a else None} cols={sorted(client.upserts)}")
+
+    # 3b) delete_doc 配置非法 → fail-closed，零删除。
+    store = _new_store(dual_write=True, shadow=PRIMARY)
+    client = RecordingClient()
+    _attach(store, client)
+    raised_3b = None
+    try:
+        store.delete_doc("d-1", KB)
+    except DualWriteConfigError as exc:
+        raised_3b = exc
+    check.ok("delete_doc_invalid_fail_closed",
+             isinstance(raised_3b, DualWriteConfigError) and client.deletes == {},
+             f"raised={type(raised_3b).__name__ if raised_3b else None} cols={sorted(client.deletes)}")
+
+    # 3c) clear 配置非法 → fail-closed，零删除。
+    store = _new_store(dual_write=True, shadow="")
+    client = RecordingClient()
+    _attach(store, client)
+    raised_3c = None
+    try:
+        store.clear([KB])
+    except DualWriteConfigError as exc:
+        raised_3c = exc
+    check.ok("clear_invalid_fail_closed",
+             isinstance(raised_3c, DualWriteConfigError) and client.deletes == {},
+             f"raised={type(raised_3c).__name__ if raised_3c else None} cols={sorted(client.deletes)}")
+
+    # 3d) guard 早于 chunks 为空的短路：即便本会 return 0，配置非法也必须抛。
+    store = _new_store(dual_write=True, shadow=PRIMARY)
+    client = RecordingClient()
+    _attach(store, client)
+    raised_3d = None
+    try:
+        store.upsert_chunks([], [])
+    except DualWriteConfigError as exc:
+        raised_3d = exc
+    check.ok("guard_before_empty_chunks",
+             isinstance(raised_3d, DualWriteConfigError) and client.upserts == {},
+             f"raised={type(raised_3d).__name__ if raised_3d else None}")
+
+    # 3e) store 未启用 + dual_write 请求：仍走旧的零写短路，不抛（属整库关停，不是 dual_write 配置错）。
+    store = _new_store(dual_write=True, shadow=PRIMARY, enabled=False)
+    client = RecordingClient()
+    _attach(store, client)
+    raised_3e = None
+    n_3e = None
+    try:
+        n_3e = store.upsert_chunks([_chunk()], [[0.1, 0.2]])
+    except DualWriteConfigError as exc:
+        raised_3e = exc
+    check.ok("store_disabled_zero_write_not_guarded",
+             raised_3e is None and n_3e == 0 and client.upserts == {},
+             f"raised={type(raised_3e).__name__ if raised_3e else None} n={n_3e}")
+
+    # 3f) DualWriteConfigError 是 RuntimeError（调用方原有 catch 语义不变）。
+    check.ok("config_error_is_runtime_error", issubclass(DualWriteConfigError, RuntimeError),
+             "catch RuntimeError 仍能捕获 dual_write 配置非法")
+
+    # 3g) resolve_dual_write 单次快照暴露 enabled 字段（Wave 1 收口：调用方不再自行 is_enabled() 二次读）。
+    store = _new_store(dual_write=True, shadow=SHADOW)
+    dw_3g = store.resolve_dual_write()
+    check.ok("resolve_exposes_enabled",
+             dw_3g.get("enabled") is True and dw_3g["active"] is True,
+             f"keys={sorted(dw_3g.keys())}")
+
+    # 4) shadow 为空 → resolve 判 inactive 并给原因（读取路径，不写入，不触发 guard）。
     store = _new_store(dual_write=True, shadow="")
     dw = store.resolve_dual_write()
     check.ok("empty_shadow_not_active", dw["active"] is False and "shadow_collection" in dw["reason"],
              f"reason={dw['reason']}")
 
-    # 4b) store 未启用 → 不双写。
+    # 4b) store 未启用 → resolve 判 inactive（读取路径）。
     store = _new_store(dual_write=True, shadow=SHADOW, enabled=False)
     check.ok("store_disabled_not_active", store.resolve_dual_write()["active"] is False,
              "reason=vector_store 未启用")
