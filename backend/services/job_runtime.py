@@ -146,6 +146,16 @@ def execute_build_graph(*, job_id: int, payload: Dict[str, Any]) -> Dict[str, An
     total = stats.get("total_documents", 0)
     skipped = stats.get("skipped_documents", 0)
 
+    # 向量腿（含 dual_write 影子）有任何失败都不虚报 completed：抛 RuntimeError 对齐
+    # reindex_chunks 约定，交由 job_service 按 max_retries 退避重试。重放安全：Milvus 按
+    # chunk_id 主键幂等、Neo4j 用 MERGE，重试即收敛；重试耗尽后由作业终态落 failed。
+    vector_failures = stats.get("vector_failures") or []
+    if vector_failures:
+        raise RuntimeError(
+            f"build_graph 向量投影未收敛：{len(vector_failures)} 条向量写入失败"
+            f"（样例：{str(vector_failures[0])[:200]}），转作业重试"
+        )
+
     execution_status = "completed" if processed > 0 else "empty"
     if processed > 0:
         message = "构建完成"
