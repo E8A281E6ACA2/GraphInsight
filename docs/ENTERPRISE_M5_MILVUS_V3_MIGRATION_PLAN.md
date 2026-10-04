@@ -204,9 +204,13 @@ gate 报告，支撑 §7 处置清单作为迁移前置门禁的可审计性。�
    `current_missing=true` 并 fail-closed。`list_collections` 只读，绝不创建、修改或删除。
 7. **零写对账**：五类证据源在探测前后各快照一次；值漂移记 `writes=UNVERIFIED_COUNTER_
    DRIFT`；快照内任何 degraded reason 记 `writes=UNVERIFIED_EVIDENCE`——两者均 fail-closed。
-8. **环境标识（审计修订）**：输出 `timestamp / commit_sha / environment_id`；
-   `environment_id` 取自 `GRAPHINSIGHT_ENVIRONMENT_ID`（清洗为非敏感字符集，绝不输出
-   URI/token/密码）。PostgreSQL 正式运行缺失该变量时拒绝产出 FULL（fail-closed）。
+8. **环境标识（审计修订 3：严格校验）**：输出 `timestamp / commit_sha / environment_id`；
+   `environment_id` 取自 `GRAPHINSIGHT_ENVIRONMENT_ID`，按白名单
+   `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$` **整体校验**——空格/斜杠/`@`/控制字符等非法输入
+   直接拒绝为 `environment_id_invalid` 并 fail-closed（FAILED + exit 2 +
+   `UNVERIFIED_EVIDENCE`），**不做"清洗后拼接输出"**，杜绝
+   `postgres://user:pass@host` 类凭据片段经部分剥离泄露；失败原因只含类别、不含原值。
+   全程不输出 URI/token/密码。PostgreSQL 正式运行缺失该变量时拒绝产出 FULL（fail-closed）。
 9. **局部探测**：`--kb` 运行标 `scope=SCOPE_SLICE`，verdict 封顶 `PARTIAL`，
    永远不得表述为 `FULL`。
 

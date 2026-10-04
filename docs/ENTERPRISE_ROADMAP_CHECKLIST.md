@@ -412,3 +412,9 @@
   （`GRAPHINSIGHT_ENVIRONMENT_ID`）且 PG 正式运行缺失拒 FULL；负向测试扩至"四源分别失败
   且前后值等价 0"矩阵 + scope_unresolved 仍被探测场景（12 场景全绿）。同时修正文档中
   "所有异常均 fail-closed"与 worktree 清洁状态的过度表述。仍为隔离层，Gate 0 保持 OPEN。
+- [x] 2026-10-04（审计修订 3，"条件通过"整改）environment_id 校验改严格白名单
+  （非法输入整体拒绝为 INVALID 并 fail-closed，废除清洗拼接策略，杜绝 URI 凭据片段
+  经部分剥离泄露）；复核指引修正为肯定式句型排除法（"所有异常均"命中允许存在于
+  废除/修正语境）；Backlog 第一版条目标注历史版本口径；场景矩阵扩至 13（新增
+  environment_id 非法值 CLI 级 fail-closed 场景）。隔离验收 13/13 全绿；
+  共享生产 Gate 0 仍 OPEN，合并暂缓、dual-write 冻结不变。

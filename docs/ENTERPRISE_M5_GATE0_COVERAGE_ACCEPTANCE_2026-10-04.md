@@ -45,7 +45,8 @@
 - `backend/tests/check_m5_c3_inventory.py`（+81）：追加 verdict 状态机矩阵、
   SCOPE_SLICE 封顶、失败压制成 FAILED、collection 分类、before/after 对账断言。
 - `backend/tests/check_m5_gate0_coverage.py`（新增，+497）：SQLite 内存注册表 +
-  假 `pymilvus`/`neo4j` 模块 + `build_inventory` 桩，7 个 CLI 级正负场景（见 §3）。
+  假 `pymilvus`/`neo4j` 模块 + `build_inventory` 桩，**第一版为 7 个 CLI 级正负场景**
+  （历史口径；现行为 13 个场景，见 §3 与 §1.4 修订 3）。
 
 ### 1.3 docs：`ceae362` + `acbc66c`（三份文档同步 + 本记录）
 
@@ -66,15 +67,24 @@
 
 整改性质：同分支追加提交，仍不连接任何真实服务。
 
+### 1.5 审计修订 3（"条件通过"复核意见整改）
+
+第二轮复核裁定"代码整改基本通过、隔离验收通过、文档与复核指引条件通过"，两点修正：
+
+| # | 复核意见 | 整改落点 |
+|---|---|---|
+| P1 | environment_id 清洗策略可能泄露敏感片段（删除非法字符会把 URI 凭据片段拼接进输出） | `_environment_id_sanitized` 清洗策略废除，改为**严格白名单** `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$`：空格/斜杠/`@`/控制字符等非法输入整体拒绝，记 `environment_id_invalid=true` 并 fail-closed（FAILED + exit 2 + `UNVERIFIED_EVIDENCE`），绝无"清洗后输出"；失败原因只含类别（`ENVIRONMENT_ID_INVALID: value rejected by strict allowlist`），不含原值；新增 CLI 级场景 13 断言 `postgres://user:pass@host` 注入后凭据片段零泄露 |
+| P2 | 复核指引声称"所有异常均"grep 应无匹配不成立（文档在"废除/修正"语境中合法引用该历史表述）；Backlog 第一版条目仍写"7 个正负场景"易误读 | 复核指引修正为"肯定式句型排除法"（见 §5.1）：命中行必须全部处于废除/修正语境，任何肯定式使用即不通过；Backlog 第 7 条标注**[历史版本]**，本记录 §1.2 同步标注第一版 7 场景为历史口径，现行为 13 场景 |
+
 ---
 
-## 2. 验收命令与退出码（隔离环境实跑，整改后）
+## 2. 验收命令与退出码（隔离环境实跑，修订 3 整改后）
 
 | 命令 | exit code | 关键输出 |
 |---|---|---|
 | `python -m py_compile backend/admin/report_m5_c3_inventory.py backend/tests/check_m5_c3_inventory.py backend/tests/check_m5_gate0_coverage.py` | 0 | — |
 | `python backend/tests/check_m5_c3_inventory.py` | 0 | `C3_INVENTORY_CONTRACT_OK` |
-| `python backend/tests/check_m5_gate0_coverage.py` | 0 | `GATE0_COVERAGE_CONTRACT_OK scenarios=12` |
+| `python backend/tests/check_m5_gate0_coverage.py` | 0 | `GATE0_COVERAGE_CONTRACT_OK scenarios=13` |
 | `git diff --check`（提交前，本轮路径范围） | 0 | 无空白错误 |
 | `git status --short`（本轮路径范围 `backend docs .gitignore`） | 0 | 仅本轮改动文件 |
 
@@ -83,7 +93,7 @@ git rev-parse 打桩）。只证明格式器/状态机/CLI 合同，不代表任
 
 ---
 
-## 3. 正负场景覆盖矩阵（check_m5_gate0_coverage.py，12/12 通过）
+## 3. 正负场景覆盖矩阵（check_m5_gate0_coverage.py，13/13 通过）
 
 | # | 场景 | 期望 | 实测 |
 |---|---|---|---|
@@ -99,6 +109,7 @@ git rev-parse 打桩）。只证明格式器/状态机/CLI 合同，不代表任
 | 10 | Neo4j 计数失败（同上等价 0） | 同上 fail-closed | 通过 |
 | 11 | Milvus stats 不可读（同上等价 0） | 同上 fail-closed | 通过 |
 | 12 | active KB 带 scope_unresolved | 仍被探测并进入 `C3_REPORT`（`counts.scope_unresolved=1`、chunk 级原因）、`c3_totals` 计入、verdict 不变 | 通过 |
+| 13 | environment_id 非法值（`postgres://user:pass@host`） | 整体拒绝为 INVALID、`environment_id_invalid=true`、FAILED + exit 2 + `UNVERIFIED_EVIDENCE`、凭据片段零泄露、失败原因不含原值 | 通过 |
 
 附加断言：输出不含 `postgres://`、`bolt://`、`19530`、`password`、`token`；
 `environment_id` 取自夹具显式注入（`admin_db:sqlite` 等价语义）；`commit_sha` 来自真实
@@ -111,7 +122,7 @@ git rev-parse（测试内打桩为固定值以保确定性）；场景 1 额外�
 ## 4. 证据分层声明（审计口径）
 
 1. **隔离测试**：SQLite 内存库 + fake pymilvus/neo4j + stub build_inventory，
-   12 场景 + formatter 契约全绿（exit 0）。仅证明代码合同与状态机。
+   13 场景 + formatter 契约全绿（exit 0）。仅证明代码合同与状态机。
 2. **真机取证**：**未取证**。本轮未连接任何真实 PostgreSQL/Neo4j/Milvus 运行报告；
    共享 dev 的 `report_m5_c3_inventory.py` 实跑未执行（任务明确禁止）。
 3. **生产闭环**：**未达成**。共享生产 Gate 0 保持 OPEN；`shared_production_gate=OPEN`
@@ -127,6 +138,30 @@ git rev-parse（测试内打桩为固定值以保确定性）；场景 1 额外�
 - `docs/ENTERPRISE_ROADMAP_CHECKLIST.md`：追加审计修订 2 条目（12 场景、整改内容）。
 - `docs/ENTERPRISE_IMPLEMENTATION_BACKLOG.md`：M5-B0 验收进展追加第 8 条修订记录。
 - 本验收记录：修正过度表述并登记审核退回与整改闭环。
+
+### 5.1 独立复核指引（修订 3 修正版）
+
+第一轮汇报中"`git grep -n "所有异常均" -- docs/` 应无匹配"的预期**不成立**：整改后的
+文档在"废除/修正/过度表述"语境中会合法引用该历史表述。正确复核方式为**肯定式句型
+排除法**——检查是否存在把"所有异常均 fail-closed"当作事实主张的用法：
+
+```
+git grep -n "所有异常均" <rev> -- docs/ | grep -v "废除\|修正\|过度表述\|不得\|历史"
+```
+
+期望：**无输出**（exit 1）。若仍有命中，说明存在肯定式使用，复核不通过。
+当前 HEAD `e823669` 之后按此模式复核通过。
+
+其余复核命令不变：
+
+```
+git log --oneline -7 <rev>
+python backend/tests/check_m5_gate0_coverage.py   # 期望 scenarios=13，exit 0
+git grep -n "_ENVIRONMENT_ID_PATTERN\|environment_id_invalid" <rev> -- backend/admin/report_m5_c3_inventory.py
+```
+
+场景数口径提示：`343dd10..acbc66c` 为第一版 7 场景（历史），`d423f65..7b6cbcc` 为
+12 场景（修订 2），environment_id 严格校验提交后为 13 场景（修订 3）。以 HEAD 为准。
 
 ---
 

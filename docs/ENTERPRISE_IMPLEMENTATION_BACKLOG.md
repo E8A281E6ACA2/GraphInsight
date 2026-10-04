@@ -255,7 +255,7 @@
 4. 共享生产 v3 迁移、逐 KB C3 数据治理和共享生产 `CLOSED` 尚未完成。
 5. M5-A/B0 dry-run contract v1 已统一三个入口：固定 `DRY_RUN_RESULT` JSON 标记、`writes=0` 和退出码语义；仅为隔离验收契约，不代表共享生产迁移完成。
 6. 2026-10-03 共享只读 C3 inventory 已运行：1 个 KB，`blocked/orphan/unrecoverable/scope_unresolved/scope_mismatches` 全为 0；当前读取到 `graphinsight_chunks_v2` 且无显式 `content_revision`，所以共享生产 gate 仍为 OPEN。
-7. 2026-10-04 C3 inventory 已升级为 Gate 0 全量覆盖证据报告：输出 `registered/active/eligible/probed/omitted/failed` 六项 KB 计数与 `omitted_kbs/failed_kbs` 逐项 `kb_id/status/reason`；仅 `active` 可探测，非 active 一律 omitted 且不探测，未注册 `--kb` 记 `UNREGISTERED_KB`；`coverage_verdict=FULL/PARTIAL/FAILED` 对探测失败、计数漂移、注册表降级、Milvus 证据降级、v3 目标已存在 fail-closed；Milvus collection 只读枚举分类 `current/target/historical/unknown`；before/after 只读计数对账 `writes=0`；输出 `timestamp/commit_sha/environment_id` 且不含 URI/token/密码；`--kb` 运行标 `SCOPE_SLICE` 并封顶 `PARTIAL`。隔离验收：`check_m5_c3_inventory.py` 与 `check_m5_gate0_coverage.py`（7 个正负场景）通过。仅为隔离合同实现，不代表共享生产 Gate 0 关闭。
+7. 2026-10-04 C3 inventory 已升级为 Gate 0 全量覆盖证据报告：输出 `registered/active/eligible/probed/omitted/failed` 六项 KB 计数与 `omitted_kbs/failed_kbs` 逐项 `kb_id/status/reason`；仅 `active` 可探测，非 active 一律 omitted 且不探测，未注册 `--kb` 记 `UNREGISTERED_KB`；`coverage_verdict=FULL/PARTIAL/FAILED` 对探测失败、计数漂移、注册表降级、Milvus 证据降级、v3 目标已存在 fail-closed；Milvus collection 只读枚举分类 `current/target/historical/unknown`；before/after 只读计数对账 `writes=0`；输出 `timestamp/commit_sha/environment_id` 且不含 URI/token/密码；`--kb` 运行标 `SCOPE_SLICE` 并封顶 `PARTIAL`。隔离验收：`check_m5_c3_inventory.py` 与 `check_m5_gate0_coverage.py`（7 个正负场景）通过。**[历史版本标注：本条为第一版（`343dd10`..`acbc66c`）记录，"7 个正负场景"为当时口径，现行为 13 个场景，见第 8-9 条。]** 仅为隔离合同实现，不代表共享生产 Gate 0 关闭。
 8. 2026-10-04（审计修订 2）Gate 0 证据合同按审计退回意见整改并保持隔离层：全部证据源
    （PG 三表、Neo4j 计数、Milvus stats）改为显式 `value/ok/reason`，权限/连接/SQL/缺表/
    统计不可读不再折算 0；before/after 任一 degraded reason 强制 `FAILED` + exit 2 +
@@ -264,6 +264,13 @@
    `GRAPHINSIGHT_ENVIRONMENT_ID`（非敏感字符集清洗），PG 正式运行缺失拒 FULL；负向测试
    扩为四源分别失败且前后值等价 0 的矩阵，并补 active KB 带 scope_unresolved 仍被探测
    并进入 C3 报告的场景（12 场景全绿）。文档同步修正"所有异常均 fail-closed"的过度表述。
+9. 2026-10-04（审计修订 3，"条件通过"整改）`environment_id` 校验改为严格白名单
+   （`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$`）：空格/斜杠/`@`/控制字符等非法输入整体拒绝为
+   `environment_id_invalid` 并 fail-closed（FAILED + exit 2 + `UNVERIFIED_EVIDENCE`），
+   废除"清洗后拼接输出"策略，杜绝 `postgres://user:pass@host` 类凭据片段经部分剥离泄露；
+   失败原因只含类别、不含原值。新增 CLI 级场景 13（现 13 场景全绿）。文档同步修正复核
+   指引（"所有异常均"字样的命中允许存在于"废除/修正"语境，见验收记录 §5.1）与历史
+   场景数口径（第 7 条标注为第一版历史版本）。
 
 2. `M5-B0-C3` 共享 KB 不可自动收敛清单
 状态：`todo`
