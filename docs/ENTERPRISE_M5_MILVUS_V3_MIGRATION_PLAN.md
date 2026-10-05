@@ -257,7 +257,7 @@ PostgreSQL/Neo4j/Milvus 上运行本报告，且 §5.1 canary runner、§7 处�
 
 1. ✅ `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）——**已满足**：见 §9.1（审计线
    实现）与 §9.5（两线合并裁决）。仅解锁"代码前置"，不等于可开启真实双写；开启仍受 2/3/4 与授权约束。
-2. 授权运行 §5.1 合成 schema canary（写 Milvus，需单独批准）。**开工前置审计已完成**：见
+2. ✅ 授权运行 §5.1 合成 schema canary（写 Milvus，需单独批准）——**已满足**（2026-10-05，用户书面授权后执行，见 §9.9；仅合成集合，v2 零写入）。**开工前置审计已完成**：见
    `docs/ENTERPRISE_M5_MILVUS_V3_CANARY_PREAUDIT.md`（三条写路径的显式 INT64 检查与 upsert
    返回数量/状态校验均已具备，含 4 项发现 F1–F4 与 canary 强制要求；F2/F3 已整改，见 §9.8）；
    canary 编排器已就绪（授权门控，默认零连接、只打印计划）。
@@ -586,6 +586,44 @@ F2/F3 整改后 Phase 4 **仅**跑未授权预检（零连接、零落盘、exit
 ② 本轮踩到测试夹具陷阱：`from services import embedding_service` 取到的是**模块**，
 必须取单例 `from services.embedding_service import embedding_service`，否则补丁静默无效、
 向量腿会走真实 embedding（已在驱动注释中固化该口径）。
+
+---
+
+### 9.9 §5.1 合成 schema canary 执行记录（2026-10-05 · 用户书面授权后执行）
+
+**授权原文**：仅允许连接 `127.0.0.1:19531`，仅创建并删除合成 `graphinsight_chunks_v3_canary_*` 集合，
+禁止访问 19530、禁止写入任何 v2/v3 生产集合、禁止启动迁移与 M5-B1。
+
+| 项 | 值（均取自本轮输出，未手抄） |
+|---|---|
+| 编排器 | `E:/projects/gate0-evidence/2026-10-05/phase4/run_phase4_milvus_canary.py --authorize` |
+| RUN_ID / EXEC_TIME | `RUN-20261005T222930-phase4-canary` / `2026-10-05T22:29:30` |
+| 目标 | `http://127.0.0.1:19531`（白名单钉死；19530 为显式禁连项） |
+| 合成集合 | `graphinsight_chunks_v3_canary_20261005`（建 → 用 → drop，跑完不存在） |
+| 结果 | `CHECKS_TOTAL=20`、`CHECKS_FAILED=0`、`ROUND_EXIT=0`、`OVERALL = ALL PASS` |
+
+**本轮证成的判据**：
+
+1. **显式 INT64**：合成集合 `content_revision` 字段经 `describe_collection` 复核为 INT64（非 dynamic metadata）。
+2. **写入可读回（补 F2/F4）**：`flush → load → query(consistency_level=Strong)` 读回 3 行，逐项核对
+   `text/kb_id/tenant_id/project_id/content_revision/vector` 全部一致；`content_revision` 读回为 7/11/3（与写入相同）。
+3. **upsert 确认契约（F4 实证）**：真实返回 `{'upsert_count': 3, 'cost': 0, 'ids': ['canary-a1','canary-a2','canary-a3']}`
+   —— `require_upsert_count` 的键名解析与实际库一致，数量 = 期望 3。
+4. **v2 零写入（三重）**：集合清单前后一致、`graphinsight_chunks_v2` schema 前后完全一致、
+   **v2 `count(*)` 前=0 / 后=0，且两次均为可读整数**（`counts_readable=true`、`counts_identical=true`）；mutation 调用台账
+   仅含合成集合（create_collection / create_index / upsert / flush / load_collection / drop_collection）。
+5. **失败注入 fail-closed**：维度不符、集合不存在两类注入均抛错；注入后仍为 3 行（无半截数据）。
+6. **清理与残留**：drop 后集合清单与轮前一致；跑后只读复核 `list_collections() = ['graphinsight_chunks_v2']`，无 canary 残留。
+7. **边界**：本轮未构建 PG/Neo4j 客户端、未 flip 配置、未触碰服务单例、未连 19530、未 push、未启动 M5-B1。
+
+**口径边界（不得越读）**：本节是 **§5.1 合成集合 schema/写读回 canary**，**不是**"单 KB 真实 KB 的 v3 canary"
+（无真实 KB 数据、未切读源、无 C3 per-KB 收敛对账）。路线图阶段 4 的真实单 KB canary 与阶段 5 的逐 KB
+backfill 仍未开始；共享生产 Gate 继续 OPEN，M5-B1 继续冻结。
+
+**证据文件**（同 RUN_ID/EXEC_TIME，单 JSON 文档可 `json.load` 直过）：
+`E:/projects/gate0-evidence/2026-10-05/phase4/` 下 `phase4_steps.json` / `phase4_meta.txt` /
+`PHASE4_EVIDENCE_REPORT.txt`；离线自查脚本 `check_phase4_count_semantics.py` /
+`check_phase4_doc_consistency.py` 同目录。
 
 ## 10. 与既有章节的对应
 
