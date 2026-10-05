@@ -341,37 +341,70 @@ Windows 宿主限制不变：`httpserver` 仍不能在本机编译（`admin_moni
 | P6 | Go 写侧何时放行 `reindex_chunks` | **裁定：暂不放行**。下一步**不碰共享生产库**：先补 disposable Postgres + Go HTTP 集成验证（§12.2 六项判据），全绿后再单独申请受控真实库取证 |
 | P4（沿用） | 方向 B（dual_write）与 push | 维持：dual_write 继续关闭、不进 S2、不做真实库 `--confirm`、不 push。**远端口径收紧**：本轮 `git ls-remote origin` 因 github.com:443 连接超时**未能核实**，故只能写"本轮未执行 push、分支 `m5/dual-write` 无 upstream"，**不得写成"远端已验证一致"** |
 
-### 12.1 P5 的可审计性前提（逐条回代码核实，不是承诺）
+### 12.1 P5 事实矩阵（三条路径逐格核实；上一版把三条合写成"已具备"，属过度声明，本轮按裁定拆分并登记缺口）
 
-| 前提 | 现状（实测） | 证据（现树 file:line） |
-|---|---|---|
-| 结构化结果带 `targets_hash` | **已具备** | `entry` 起始四键 `kb_id/doc_id/targets_hash/target_count`（`backend/services/reindex_queue.py:286-291`），`outcome`/`job_id` 在各分支内补齐（`outcome` 首次赋值 `:301`）；outcome 取值 `enqueued/reused/retried/reset/rejected`（`:54-58`） |
-| 结构化结果带"新建 vs 复用"判定 | **已具备，但键名是 `enqueued`，不是 `created`** | 作业日志 `action="job_created" if outcome == OUTCOME_ENQUEUED else "job_reused"`（`backend/admin/services/job_service.py:336`） |
-| 复用行指针（`child_job_id` 语义） | **已具备，但键名是 `job_id`；全仓 `child_job_id` 命中数 = 0**（`grep -rn child_job_id backend go-backend frontend/src` 实测 0） | `entry["job_id"]` 取新建行 id（`reindex_queue.py:302`）或 `_lock_existing_job` 既有行 id（`:315`）；读不到既有行时置 `None` 并走"不猜不补建"异常（`:311`、`job_service.py:312-318`） |
-| 计数与超限拒绝可追 | **已具备** | 日志 details 带 `enqueued/reused/retried/reset`（`job_service.py:344-347`）；超限拒绝写 `kb_chunk_reindex_failed` 审计行（`:367`、`:427`），HTTP 侧 `OPERATION_NOT_ALLOWED` + details（`:296-309`，`error_code` 在 `:301`） |
-| 上层能否读到这条链 | 作业日志端点在 Go 侧存在（`admin_jobs_native.go:186`），**但本轮未做活栈实测**，只证到代码存在 | 未验证项见 §11.5-3 |
+表名勘误先行：本文先前写的 `admin_job_logs` **不存在**。作业审计行落在 `admin_logs`
+（`backend/admin/models.py:72` `__tablename__ = "admin_logs"`），Go 读侧按
+`resource = 'job' AND resource_id = $1` 过滤并 SELECT 了 `details`
+（`go-backend/internal/adminstore/jobs.go:386-406`）；全仓 `admin_job_logs` 命中数 = 0。
 
-> 结论：P5 的"列表不展示 ≠ 去重不可见"成立，审计链落在 `admin_job_logs` 与 `report["jobs"]`。
-> 命名对齐（`created`/`child_job_id` ↔ 实际的 `enqueued`/`job_id`）若要统一口径，需单独一轮再裁；
-> 本轮不改键名——改会牵动既有取证脚本与门禁断言。
+| 路径 | `created` | `reused` | `child_job_id` | `targets_hash` | 证据（file:line + 本轮实跑输出） |
+|---|---|---|---|---|---|
+| **Python 内部提交**（`JobService.create_job:191` → `_create_reindex_chunks_job:248`） | **有**，键名 `action="job_created"` + `details.enqueued` | **有**，键名 `action="job_reused"` + `details.reused` | **无此键**；等价物 = 该任务自身 id，落在 `admin_logs.resource_id`（`job_service.py:612`），details 里另有 `outcome`（`:340`） | **有**：`details.targets_hash`（`:341`）+ `admin_jobs.targets_hash` 列（`reindex_queue.py:269`/`:282`） | `check_m5_wave3_handoff.py:239` 本轮输出 `✓ 复用被审计（job_reused 落 admin_logs，证明审计面可写）`；`:235-236` 输出 `✓ 任务中心 list/get 回读到同一 targets_hash` |
+| **backfill 入队**（`_enqueue_reindex_jobs:803` → `enqueue_reindex_jobs(source="backfill_m5a")`） | **仅 stdout 聚合计数**（`backfill_chunk_revisions.py:1079`），无持久留痕 | **仅 stdout 聚合计数**（同上 `jobs_reused=`） | **无**：`report["jobs"][i].job_id` 只在内存（`reindex_queue.py:302`/`:315`），调用方丢弃；只有 `rejected_detail` 会打印 `job_id`（`:1087`），仍不落库 | **部分**：库内 `admin_jobs.targets_hash` 有；backfill 自己的输出只在 rejected 行点名（`:1088`） | `_enqueue_reindex_jobs` 现已是薄委托（`backfill_chunk_revisions.py:810-818`，不再自带 INSERT），但调用点 `:1077-1090` 只 print 计数与 rejected；`check_b0_reindex_chunks.py:532` 的断言面也只有 `enqueue.get("enqueued") == 1`，`:543` 用 `__JOBS__` 验 admin_jobs 行数 —— **没有任何断言覆盖 backfill 侧逐 target 留痕** |
+| **父任务结果**（build_graph 影子失败转交，`source="build_graph_m5_wave3"`） | **有**：`result.reindex_handoff.enqueued` 计数 + `jobs[i].outcome` | **有**：`jobs[i].outcome` 取值域含 `reused`（`reindex_queue.py:54-58`） | **有**，键名 `jobs[i].job_id`（不是 `child_job_id`；全仓 `child_job_id` 命中 0） | **有**：`jobs[i].targets_hash` + 父任务 `result` JSON | `document_graph_service.py:898-902` 生成 report、`:922` 把整份 `reindex_handoff` 放进父任务结果；`job_service.py:753` `latest.result = _to_json_text(result)` 持久化到 `admin_jobs.result`。本轮 `check_m5_wave3_handoff.py` 输出 `✓ 转交报表 enqueued=1 / outcome=enqueued / 来源 build_graph_m5_wave3`、`✓ targets_hash 是 64 位十六进制且等于 payload 的 canonical 复算值`，`RESULT: PASS`（`EXIT=0`） |
 
-### 12.2 P6 的前置集成验证（**NOT-IMPLEMENTED**，本轮只登记判据）
+**P5 缺口（明确登记，不得写成完整结构化留痕）**：
+
+1. **backfill 路径无逐 target 持久留痕。** 去重判定确实发生（同一 `targets_hash` 不产生第二行，
+   `check_b0_reindex_chunks.py:543` 已证），但"新建 / 复用 / 重试"只以聚合计数出现在 stdout，
+   `report["jobs"]`（含 `job_id` + `targets_hash`）在 `backfill_chunk_revisions.py:1077` 被丢弃，
+   既不写 `admin_logs`，也不落任何表。**只有 `ON CONFLICT DO NOTHING` + 计数不能证明留痕**，
+   这正是本次要点名的风险，先于任何"已具备"结论。
+2. **键名不统一**：实际是 `enqueued/reused/retried/reset/rejected` + `job_id`，
+   不是裁定文本里的 `created/child_job_id`。本轮不改名（会牵动既有断言），列为独立议题。
+3. Go 日志读侧 `admin_logs.details` 虽在 SELECT 列内（`jobs.go:401`），但**本轮未做活栈 HTTP 实测**
+   （§11.5-3），只证到代码与 SQL 层。
+
+因此 P5 的"列表不展示 ≠ 去重不可见"这条判断**只对第 1、3 行成立**；第 2 行（backfill）
+当前是"去重生效、留痕不可见"，要真正收口需补 backfill 侧的结构化落痕（写 `admin_logs`
+或持久化 `report["jobs"]`），属新一轮改动，需单独拍板。
+
+### 12.2 P6 的前置集成验证（**设计已获批 2026-10-05，实现进行中**）
 
 落点：一次性容器 `postgres:16-alpine`（不发布端口、跑完即删），schema 由 Python 侧迁移建到临时库，
 Go 用真实 `database/sql` 连它跑 HTTP 集成用例。六项判据：
 
-1. 路由未开放时 `POST /api/v1/admin/jobs/reindex_chunks` → **404**（单测已钉，集成层再复现一次）。
-2. 内部创建路径接受 `reindex_chunks` —— **当前事实必须写准**：Go `CreateJob` 白名单**仍拒绝**该类型
-   （`adminstore/jobs.go:26-30`），今天能接受它的"内部创建路径"是 Python `JobService.create_job`
-   （`job_service.py:191`）分派到 `_create_reindex_chunks_job`（`:248`）。用例要标明验的是
-   Python 提交路径，不能写成"Go store 接受"。
-3. 同 `targets_hash` 二次提交 → **原地复用同一行**，`SELECT count(*)` 不增。
-4. `failed` / `cancelled` 再提交 → 仍复用同一行（分别走 `retried` / `reset` 分支）。
-5. `targets_hash` 缺列时 Go 读侧 → **503 `ADMIN_STORE_UNAVAILABLE`**，不得退化成"空列表 200"
-   （§11.3 只证到 SQL 层 42703，HTTP 层 503 要在集成层补证）。
-6. 旧 17 列库投影仍可读 —— 与 §11.3-C 同结论，但须在 Go 真实查询路径上复现。
+**已批形态（2026-10-05 裁定 D1/D2/D3）**：
 
-六项全绿才是 P6 的评估门槛；在此之前 Go 写侧保持关闭，真实库取证仍需单独授权。
+- **D1 只验 Python 内部路径**：Go 路由继续 404、`supportedJobTypes` 白名单继续不放行
+  （`adminstore/jobs.go:26-30` 不动）。用例里"能创建 reindex_chunks"的一方是 Python
+  `JobService.create_job:191` → `_create_reindex_chunks_job:248`，**不得写成"Go store 接受"**。
+- **D2 临时库先进"旧 17 列"形态**，再按真实迁移脚本 `admin/migrate_jobs_targets_hash.py` 加列；
+  **禁止** `create_all` 一步到位——否则"缺列 503"与"旧列可读"两条判据造不出形态，必假绿。
+  （既有可抄的样板：`check_b0_reindex_chunks.py:174-195` 的三件套 bootstrap + 真跑迁移脚本。）
+- **D3 一次性 Docker network**：Python 迁移容器与 Go 测试容器都不发布宿主端口，
+  跑完删容器 + 删 network，并 re-list 复核零残留。
+
+七项通过标准（全绿才进入"是否放行 Go 写侧"的评估）：
+
+1. 路由未放行时 `POST /api/v1/admin/jobs/reindex_chunks` → **404**（单测已钉，集成层在真实
+   Postgres 上复现一次）。
+2. Python 内部提交路径能真的建出 `reindex_chunks` 行（`admin_jobs` 有行、`status='pending'`）。
+3. 缺 `targets_hash` 列时 Go 读侧 → **结构化 503 `ADMIN_STORE_UNAVAILABLE`**，
+   不得退化成"空列表 200"（§11.3 只证到 SQL 层 42703，HTTP 层 503 在集成层补证）。
+4. 跑完迁移脚本加列之后，Go 读侧 → **200 且 `targets_hash` 字段可读**。
+5. 旧 17 列投影（历史行全 NULL）仍能被 Go 真实查询路径读出。
+6. 相同 `targets_hash` 二次提交 → **不产生第二个任务**（`SELECT count(*)` 不增），
+   **且能回读既有 child ID**（`report["jobs"][i].job_id` = 既有行 id，非新建 id）。
+7. `failed` / `cancelled` 再提交 → 仍复用同一行，分别走 `retried` / `reset` 分支
+   （`reindex_queue.py:15-19` 分支表）。
+
+第 6 项特意加了"回读 child ID"：backfill 路径当前把这份留痕丢在内存里（§12.1 P5 缺口 1），
+集成层必须把它证出来，否则"去重生效"与"去重可审计"会被混为一谈。
+
+七项全绿之前：不改 Go 写侧白名单、不跑真实库 `--confirm`、不碰共享 PG/Neo4j/Milvus、
+不进 S2、不 push、不动 stash。
 
 ```bash
 # Go —— Windows 宿主不能编译 httpserver，必须走 linux 容器
