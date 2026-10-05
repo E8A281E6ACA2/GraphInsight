@@ -294,6 +294,44 @@ Milvus/PostgreSQL/Neo4j；未在任何环境开启 `dual_write`；未 push。实
 
 ---
 
+### 9.2 实现落地记录（2026-10-05 · backfill 运行清单轮，integration worktree，本地 main）
+
+对应 v3 backfill 路线图阶段 2 的"完整 manifest"项：backfill 每轮执行（含 dry-run 与异常
+中止）落盘一份**单 JSON 文档**运行清单，使"真实数据读回 / 失败注入 / 回滚 / 幂等重跑"
+（阶段 3 disposable 验证）有可逐轮对账的权威记录。本节同样只记**代码事实**，不改变
+§4–§8 任何门禁判定。
+
+| 项 | 落点（file:line，现树实测） | 语义 |
+|---|---|---|
+| 清单常量 | `backfill_chunk_revisions.py:91-92` | `schema=m5a-backfill-manifest-v1`；目录来源 `--manifest-dir` > `BACKFILL_MANIFEST_DIR` > 未设置（不落盘） |
+| 三态目录解析 | `:97` | `_UNSET`（按环境变量）/ `None`（显式关闭）/ `Path`（显式目录）三态，避免"未设置却落盘"污染隔离测试 |
+| 骨架 | `:107` | trace_id / kb_id / mode / started_at / capabilities / inventory / gate_decision / gate_final（dry-run 为空）/ writes（含 `inserted_chunk_ids`、`state_write_failed_ids`）/ reindex_jobs / exception / exit_code / manifest_write_ok；writes 恒在且零值起步 |
+| 落盘 | `:143` | 单文件 `<trace_id>.json`，`indent=1` 供人读、`json.load()` 必须直过（证据合同）；成功打印 `RUN_MANIFEST path=`，失败打印 `RUN_MANIFEST_WRITE_FAILED`（stderr），**不改变门判定退出码** |
+| 出口包装 | `:1260`（`run`）/ `:1031`（`_run_impl`） | `run()` 负责计时 + 生成 trace_id + `finally` 落盘；异常也留痕（`exception` + `exit_code=1`）后原样上抛，禁止吞掉；各拒绝/完成分支在 `_run_impl` 落 `outcome` |
+| CLI | `:1292-1296` | `--manifest-dir`、`--no-manifest` |
+
+**隔离取证（本轮实跑，临时 SQLite + 假证据源，零真实连接）**：
+
+- `python backend/tests/check_backfill_manifest.py` → `✓ all backfill run-manifest checks passed`，EXIT=0。
+  覆盖：T1 执行清单单 JSON + schema/身份齐备 / T2 写入腿与 DB 实际一致 / T3 决策门与最终门 +
+  outcome / T4 dry-run 清单 writes 全零且无最终门 / T5 幂等重跑两轮各一份清单（trace_id 互异、
+  次轮零新增 + `rows_skipped_existing=1`）/ T6 失败注入：写入腿抛异常仍留清单
+  （`exception` + `exit_code=1`）/ T7 未启用时零副作用（不建目录、无 RUN_MANIFEST）/ T8
+  `RUN_MANIFEST path=` 指向的文件名 = `trace_id.json`。
+- 注册统一门禁后全量：`run_unified_boundary_guards.py` → `SUMMARY total=18 failed=0`，EXIT=0。
+- 既有回归：`check_m5a_revision_backfill.py` → `✓ all M5-A acceptance checks passed`，EXIT=0
+  （`run()` 签名向后兼容，驱动 `bf.run(kb, dry_run)` 两参调用未受影响）。
+
+**判据与陷阱（供编排器引用）**：
+
+1. 清单是**审计产物**不是门判定器：写失败只响铃，退出码仍由数据库状态与 `evaluate_gate` 决定；
+   编排器须对"清单缺失 / `manifest_write_ok=false`"fail-closed，不得把 RUN_MANIFEST 缺失读成通过。
+2. 同轮复跑产生新 `trace_id` 新文件，历史清单**不覆盖不追加**；跨轮对账只能按 `started_at`
+   （文件名含随机后缀，字典序 ≠ 执行顺序——本轮 T5 首版即因此判反，已改判据）。
+3. 未设置目录时**完全不落盘**，故共享环境 dry-run（阶段 1 编排器）行为零变化。
+
+---
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
