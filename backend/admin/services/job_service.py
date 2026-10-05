@@ -107,6 +107,7 @@ def _to_item(job: AdminJob) -> JobItem:
         max_retries=job.max_retries or 0,
         requested_by=job.requested_by,
         trace_id=job.trace_id,
+        targets_hash=job.targets_hash,
         started_at=job.started_at,
         finished_at=job.finished_at,
         created_at=job.created_at,
