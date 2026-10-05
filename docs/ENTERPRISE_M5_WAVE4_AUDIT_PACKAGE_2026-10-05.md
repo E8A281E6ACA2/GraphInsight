@@ -365,12 +365,15 @@ Windows 宿主限制不变：`httpserver` 仍不能在本机编译（`admin_moni
    不是裁定文本里的 `created/child_job_id`。本轮不改名（会牵动既有断言），列为独立议题。
 3. Go 日志读侧 `admin_logs.details` 虽在 SELECT 列内（`jobs.go:401`），但**本轮未做活栈 HTTP 实测**
    （§11.5-3），只证到代码与 SQL 层。
+   → **Wave 6 已闭环这一条**：一次性 Postgres 上 Go 真实查询路径读回了 Python 写入的
+   `admin_logs.details`（含 `outcome`），见 §14.3 表末行。缺口 1（backfill 按 target 留痕被丢弃）
+   与缺口 2（键名口径）**本轮未动**，仍是待裁定议题。
 
 因此 P5 的"列表不展示 ≠ 去重不可见"这条判断**只对第 1、3 行成立**；第 2 行（backfill）
 当前是"去重生效、留痕不可见"，要真正收口需补 backfill 侧的结构化落痕（写 `admin_logs`
 或持久化 `report["jobs"]`），属新一轮改动，需单独拍板。
 
-### 12.2 P6 的前置集成验证（**设计已获批 2026-10-05，实现进行中**）
+### 12.2 P6 的前置集成验证（**设计已获批 2026-10-05；七项判据已于 Wave 6 一次性容器全绿，结果与口径修正见 §14**）
 
 落点：一次性容器 `postgres:16-alpine`（不发布端口、跑完即删），schema 由 Python 侧迁移建到临时库，
 Go 用真实 `database/sql` 连它跑 HTTP 集成用例。六项判据：
@@ -460,4 +463,118 @@ dual_write 继续默认关闭 · 不做真实库 --confirm · 不进 S2 · 不 p
 下一轮候选动作 = §12.2 的 disposable Postgres + Go HTTP 集成套件，
 其设计先过一轮人工确认再实现。
 ```
+
+## 14. Wave 6 记录（P6 disposable Postgres 集成套件，2026-10-05）
+
+**结论先行**：§12.2 的七项通过标准在一次性容器拓扑上**全部实跑通过**（`criteria=7 failed_criteria=0
+failed_steps=0` / `RESULT: PASS`）。因此 P6 的门槛条件已满足；但**"是否放行 Go 写侧"仍是用户的单独
+裁定**（§13 回执原文："P6 disposable 套件全绿后，再单独裁定是否放行 Go 写侧"），本文不代答。
+所有绿色**只有 §11.4 的隔离证据口径**：一次性网络、不发布端口、跑完即删、未接触共享 PG/Neo4j/Milvus，
+也不等于真实生产库取证。
+
+### 14.1 交付物与角色
+
+| 文件 | 角色 | 关键锚点 |
+|---|---|---|
+| `backend/tests/check_m5_p6_disposable_pg.py` | 宿主编排器：起网络/容器 → 真实迁移脚本 rollback/migrate → 两个 Go 阶段 → 收尾复查残留 → 七项判据台账 | `preflight:122`、`bring_up:156`、未发布端口断言 `:184-186`、`pg_isready:208`、`py_stage:213`、`migrate:225`、`go_phase:235`、`main:259`、判据登记 `:299/301/328/331/335/351/353/356`、`teardown:380`、零残留复查 `:387-391`、共享栈基线比对 `:393-397`、`finish:400`、汇总行 `:410` |
+| `backend/tests/p6_disposable_pg_driver.py` | 容器内 schema 状态机 + Python 内部提交路径（判据 2/6/7） | 钉连接 `pin_env:62`、`assert_disposable:72`（方言打印 `:76`、非 postgresql 即 fatal `:77-78`、DSN 主机核对 `:80-83`、`current_database()` 与"集群内不得出现共享开发库名" `:85-99`）、`job_shape:102`、`stage_bootstrap:142`、旧行 INSERT `stage_assert_old_shape:156-179`、`stage_assert_migrated:182`、`_latest_log:199`、`stage_submit:252`、判据 2 断言 `:294-301`、判据 6 `:303-309`、判据 7 `:311-328`、`__SUBMIT__` 标记 `:330-340`、`stage_dump:343` |
+| `go-backend/internal/httpserver/p6_disposable_pg_integration_test.go` | Go 真实 HTTP 读侧 + 路由派发（判据 1/3/4/5/6 读侧/7 读侧，并闭环 §12.1 缺口 3） | env 门控 `t.Skip:59`（CI 永不连库）、真 `adminstore.New` + 仅计数 `CreateJob` 的 `p6ProbeStore:99-145`、`do():147`（先 `rec.Body.String()` 再解码，注释说明原因）、判据 1 `:212-231`、判据 3 `:235-270`、判据 4+6 `:274-310`、判据 5 `:315-340`、Python 留痕回读 `:362+` |
+| `backend/Dockerfile.p6test` | 一次性 Python 运行镜像（`python:3.11-slim` + 全量 `requirements.txt`；`job_service` 会经 `services.job_runtime` 牵进 pymilvus/neo4j/openai，缺包即 import 失败） | 构建产物 `gi-p6-py:tmp`，`docker build` 退出码 0 |
+
+编排器**有意不进 20 项统一门禁**（`check_m5_p6_disposable_pg.py:19`）：门禁必须能在无 Docker 的 CI 里跑。
+容器内驱动按 Wave 4-3 静态守卫的既有约定被豁免（`check_migration_cleanup_guards.py:585` `DRIVER_SUFFIX`、
+`:600` `_db_isolation_findings`）；本轮直接对四个新文件调用该函数复核：`FINDINGS []`（驱动在扫描面内、
+因 `_driver.py` 后缀豁免；编排器不在扫描面内，因其不含 `create_all(`/`create_engine(` 字样）。
+
+### 14.2 D1 / D2 / D3 落点对照（含一处**必须裁定的口径修正**）
+
+| 裁定 | 落点 | 实况 |
+|---|---|---|
+| **D1** 只验 Python 内部路径，Go 路由继续 404、白名单继续不放行 | Python 侧：`JobService.create_job:191` → `_create_reindex_chunks_job:248`（驱动 `stage_submit:252` 起真实 service）；Go 侧：`p6ProbeStore.CreateJob:99` 只计数、断言 `createCalls == 0`（测试 `:228-230`）；`adminstore/jobs.go:26-30` 白名单**一字未动** | ✅ 未把任何结果写成"Go store 接受" |
+| **D2** 临时库先进旧形态再按真实迁移脚本加列，禁止 `create_all` 一步到位 | 实际序列：`bootstrap`（模型新形态 21 列）→ **真实** `admin/migrate_jobs_targets_hash.py --action rollback`（→ 20 列、无 `targets_hash`、无部分唯一索引）→ 种一条旧行 → Go `pre_migrate` → **真实** `--action migrate`（→ 21 列 + 索引定义逐字符对上）→ Go `post_migrate` | ⚠️ **比 D2 更严**（D2 只要求"先进旧形态"，本轮用真回滚脚本造形态而非手写复刻），且旧形态列数与 D2 措辞不符，见下 |
+| **D3** 一次性 network、两端都不发布宿主端口、跑完删并复核零残留 | `gi-p6-net` + `gi-p6-pg`（`postgres:16-alpine`，`POSTGRES_HOST_AUTH_METHOD=trust` ⇒ DSN 无凭据）+ `gi-p6-py`；全程无任何 `-p`；`docker port` 两次为空；`docker rm -f` ×2 + `docker network rm`；`--filter name=gi-p6` 复查容器与网络均空 | ✅ 见 §14.4 的一处如实残余 |
+
+**口径修正（待裁定，本轮不擅改 §11.3 的历史实测数字）**：D2 文本与 §11.3、§12.2 判据 5 都写"旧 **17** 列形态"。
+17 列来自 Wave 5 当时**手写的 17 列最小复刻表**（`gi-wave5-pg`，只验投影列清单耦合，§11.3 第 284 行已自我限定），
+**不是生产模型回滚后的真实形态**。本轮用真实模型 + 真实回滚脚本量出来的是：**迁移前 20 列 → 迁移后 21 列**
+（`__BOOTSTRAP__ column_count: 21` → `__LEGACY__ column_count: 20` → `__MIGRATED__ column_count: 21`，
+原始输出见 `/tmp/p6_run5.txt` 第 26 / 52 / 96 行）。所以：
+
+- §11.3 的 A/C 两行（17 列复刻表）作为**当时那张表的实测记录**保留，数字不改；
+- 但"旧 17 列"作为**生产 admin_jobs 的形态描述是错的**，往后的行文应读作"迁移前形态（20 列，无 `targets_hash`）"。
+  本轮新代码的注释与阶段标题已按实测措辞（编排器阶段 3 标签、判据 5 标题）。
+  要不要回头修 §12.2 D2 / 判据 5 的"17 列"字样，请裁定。
+
+### 14.3 七项通过标准（本轮真实数字，全绿）
+
+| # | 判据 | 判据来源 | 本轮证据（`/tmp/p6_run5.txt`） |
+|---|---|---|---|
+| 1 | 路由未放行 → **404** | Go `:212-231` | `--- PASS` ×2 阶段；两种拼写（`reindex_chunks` / `reindex-chunks`）都是 404 + `NOT_FOUND`，非 409；`createCalls=0` |
+| 2 | Python 内部路径建出 `reindex_chunks` | 驱动 `:294-301` | 落库 `job_type=reindex_chunks`、`status=pending`、`targets_hash` = canonical 复算值、作用域 `t1/p1/kb-p6`、留痕 `outcome=enqueued` |
+| 3 | 缺列时 Go 读侧 → **结构化 503** | Go `:235-270` | 列表/详情/日志三条路径全 503 + `ADMIN_STORE_UNAVAILABLE`；显式断言**不得**是 200；日志必须同时含 `targets_hash` 与 `does not exist`（归因到 42703 缺列） |
+| 4 | 加列后读侧 200 且带 hash | Go `:274-310` | 列表 `total=1`、Go 读回的 `targets_hash` **等于 Python 写入值**；详情同值 |
+| 5 | 迁移前旧行仍可读、不参与唯一性 | Go `:315-340` | 旧行 id=1 仍在列表，`job_type=build_graph`、`TargetsHash == nil`，并按对象作用域断言该行 JSON **不含** `targets_hash` 键（`omitempty` 语义） |
+| 6 | 同 hash 不新增且回读既有 child ID | 驱动 `:303-309` | `__SUBMIT__`：`reindex_chunks_count=1`、二次提交 `job_id` 就是既有行 id、留痕 `action=job_reused` + `outcome=reused`、`for_update_sql_count=1`（**Postgres 行锁分支首次被真实跑到**——SQLite 套件到不了） |
+| 7 | failed/cancelled 原地 retry/reset | 驱动 `:311-328` | `outcomes=['enqueued','reused','retried','reset']`；failed→pending 且 `retry_count` 1→2；cancelled→pending 且归零；两次都仍 `count=1`（不新建行） |
+| （附） | §12.1 **P5 缺口 3** 闭环 | Go `:362+` | Go 真实查询路径读回 Python 写的 `admin_logs.details`（含 outcome 序列）；编排器把它单列一条 ✓（`check_m5_p6_disposable_pg.py:359`，本轮日志第 136 行 `✓ Go 读侧回读到 Python 留痕（P5 缺口 3 闭环）`） |
+
+本轮 `targets_hash` = `42d6adf0785f8c86e027badadc7997b02f9063bccf0a5c9842e53f029ca61023`，
+`job_id=2`（旧行 `id=1` 是 `build_graph`、hash 为 NULL）。迁移后的部分唯一索引定义与 §11.3 逐字符一致：
+`CREATE UNIQUE INDEX uq_admin_jobs_targets_hash ON public.admin_jobs USING btree (job_type, kb_id, targets_hash) WHERE (targets_hash IS NOT NULL)`。
+
+### 14.4 隔离取证（D3 的"可观察证据"，不是口头声明）
+
+- **不发布端口**：`docker port gi-p6-pg` / `docker port gi-p6-py` 输出为空（`check_...:184-186`）。
+- **钉连接 + 断言方言**：每个阶段先 `DIALECT postgresql`（驱动 `:76`），非 postgresql 直接 fatal；
+  `__PIN__ {"current_database": "p6_admin", "server_addr": "192.168.16.2/32", "shared_dev_databases_in_cluster": 0}`
+  —— 集群内**不存在**共享开发库名，这一条是"没连错库"的正面证据。
+- **DSN 无凭据**：trust 认证 ⇒ DSN 里没有密码/token，符合"密钥不落文档/代码"红线。
+- **零残留**：`gi-p6-py` / `gi-p6-pg` / `gi-p6-net` 已删；`docker ps -a --filter name=gi-p6` 与
+  `docker network ls --filter name=gi-p6` 均为空。
+- **共享栈未受影响**：`graphinsight_default`、`gi-phase3-pg` 的存在性与 preflight 记录的基线一致（`:393-397`）。
+- **未破的边界**：Go 写侧白名单未改、真实库 `--confirm` 未跑、共享 PG/Neo4j/Milvus 未碰、未进 S2、
+  未 push、未动 stash。
+- **如实残余（一项）**：一次性镜像 `gi-p6-py:tmp` 仍在本地（可再生，不影响隔离）。要清就跑
+  `docker rmi gi-p6-py:tmp`。本轮没删，是为了留一个能直接复跑 Go 阶段的现成镜像。
+
+### 14.5 反假绿记录：套件先红后绿的四次自纠
+
+（真实缺陷驱动的 red→green 链；如果一次就绿，判据本身才是可疑对象。）
+
+1. `docker version --format {{.ServerVersion}}` 在该 CLI 上报 `can't evaluate field` ⇒ 预检**假红**。
+   改成 plain `docker version`，并把子进程输出细节 surfaced（`check_...:122`）。
+2. Go 阶段命令漏写 `go`，实际跑了 shell 内建 `test`（`test: extra argument "-run"`，rc=2）⇒
+   判据 1/3/4/5 **未评分**。改为显式 `go test`。
+3. `json.NewDecoder(rec.Body)` 先把 `httptest.ResponseRecorder` 抽干，随后的 `rec.Body.String()` 为空 ⇒
+   判据 5 报"解码失败 raw=（空）"。改为**先取 raw 再解码**（Go 测试 `:147` 附注释）。
+4. 判据 5 最初用 `strings.Contains(raw, "\"targets_hash\"")` 扫整个列表体 ⇒ **假红**：同时存在的
+   `reindex_chunks` 行本就该带 hash。改为按对象作用域（`env.legacyID` 那一行）做键存在性判断。
+   这一条正是"门禁对自己的输出安静"家族的复发苗头，记此以防再犯。
+
+### 14.6 未做 / 未验证（不得据此轮宣称的部分）
+
+- **真实共享库仍零取证**：没跑 `migrate_jobs_targets_hash.py --confirm`，没碰 `gi-phase3-pg` 里的生产形态数据。
+- **Go 写侧未放行**：`supportedJobTypes` 不含 `reindex_chunks`；是否放行是 §13 约定的**用户单独裁定**，
+  七项全绿只是把门槛凑齐，不构成自动放行。
+- **P5 缺口 1 / 2 未动**：`backfill_chunk_revisions.py:1077` 仍丢弃 `report["jobs"]`（按 target 的结构化留痕不落表）；
+  键名 `enqueued/reused/retried/reset/rejected` vs 裁定文本 `created/child_job_id` 仍未统一（改名牵动既有断言）。
+- **前端/真实浏览器**：本轮无前端改动，故无 UI 实测口径可声明。
+- **密钥扫描**：本轮只对 4 个新文件跑扫描器（`paths=4 files=4 bytes=50074 … findings=0 result=pass`），
+  加上本文档；`frontend/src`、`go-backend`、`docs` 整体仍在 CI 扫描面外，
+  admin.ts 那 11 条仍是**扫描范围外的待复核项**，绝不表述为"全仓库扫描通过"。
+- **远端**：本轮未执行 push，分支 `m5/dual-write` 无 upstream。`git ls-remote` 上一轮超时未取到值
+  （§12 末注），所以远端口径到此为止，不写"远端已验证"。
+
+### 14.7 复核命令
+
+```bash
+cd backend
+PYTHONUTF8=1 python tests/check_m5_p6_disposable_pg.py     # 期望 P6_DISPOSABLE_SUMMARY criteria=7 failed_criteria=0 / RESULT: PASS
+PYTHONUTF8=1 python tests/run_unified_boundary_guards.py   # 期望 SUMMARY total=20 failed=0（本轮实跑 GATE_EXIT=0）
+docker ps -a --filter name=gi-p6 --format '{{.Names}}'     # 期望空（零残留）
+docker network ls --filter name=gi-p6 --format '{{.Name}}' # 期望空
+```
+
+Windows 宿主不能编译 `httpserver`（`syscall.Statfs`），所以 Go 判据**只能**在 linux 容器里取证；
+Go 用例在无 `GI_P6_PG_DSN` 时整体 `t.Skip`，`go test ./...`（CI）永远不会连库。
 
