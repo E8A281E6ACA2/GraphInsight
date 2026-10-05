@@ -10,10 +10,12 @@
 
 ## 0. 一句话结论
 
-真实 v3 迁移被一个**当前代码不存在的能力**阻塞：`dual_write`。§16.1 的 S1（同一生产写
-同时落 v2+v3）在代码里没有实现路径，因此**在 `dual_write` 实现并验证之前，禁止进入 S1、
-禁止对任何真实 KB 执行 v3 迁移、禁止宣称 canary 闭环**。本方案只把"现在能做的"（隔离的
-单目标 schema 建集合验证）与"必须先补代码才能做的"（双写/切换）分开摆明，并给出各自的
+真实 v3 迁移曾以**当前代码不存在的能力** `dual_write` 为代码级阻塞项；该能力已于
+2026-10-05 在本地 main 落地（默认关闭，见 §9.1 落地记录）。§16.1 的 S1（同一生产写
+同时落 v2+v3）在代码里已有实现路径，但**真实 v3 迁移仍然关闭**：§9 阻塞清单其余各项
+（授权、C3 处置、验收脚本）未满足前，禁止在共享环境开启 `dual_write`、禁止对任何真实
+KB 执行 v3 迁移、禁止宣称 canary 闭环。本方案只把"现在能做的"（隔离的
+单目标 schema 建集合验证）与"必须授权后才能做的"（双写/切换）分开摆明，并给出各自的
 验收判据与门禁。
 
 ---
@@ -29,10 +31,10 @@
 | `has_content_revision_field()` | `vector_store.py:283` | 运行期探测某 collection 是否有显式 §8.5 字段（结果按名缓存，探测失败按"不支持"→拒写）。 |
 | legacy 名归一化 `graphinsight_chunks → _v2` | `vector_store.py:134-140` | 配置为空或旧名一律落到 `graphinsight_chunks_v2`，即当前默认读/写目标是 v2。 |
 | 写保护：有版本意图但缺显式字段 → 拒写 | `vector_store.py:249-257`（`VectorStoreSchemaError`，文案"…graphinsight_chunks_v3 后重建向量"） | §8.5 冻结：宁可拒写也不把 revision 降级进 dynamic metadata。 |
-| **`dual_write` / `dualwrite` / `dual-write`** | **全 `backend/` 非文档零命中** | **§16.1 S1 双写在代码中不存在。`milvus.dual_write=true` 目前只是设计要求，不是可用能力。** |
+| `dual_write`（2026-10-05 更新） | `config.py:139`、`runtime_config.py:165`、`vector_store.py:145-159/268-336` | §16.1 S1 双写已在代码中实现（默认关闭；shadow 目标锁定 v3，仅 primary=v2 时生效）。自动化验证：`tests/check_vector_dual_write.py`（23 断言，统一门禁 `vector_dual_write` 项）。真实启用仍属 §9 授权范围。 |
 
-结论性判定：**v3 集合的"建立 + 单目标写入 + 字段判据"当前代码即可支撑；"同一写扇出到
-v2 与 v3 两个 collection"当前代码完全不支持。**
+结论性判定（2026-10-05 更新）：**v3 集合的"建立 + 单目标写入 + 字段判据"当前代码即可支撑；
+"同一写扇出到 v2 与 v3 两个 collection"已由 S1 双写实现（默认关闭），真实启用见 §9 门禁。**
 
 ---
 
@@ -235,23 +237,60 @@ PostgreSQL/Neo4j/Milvus 上运行本报告，且 §5.1 canary runner、§7 处�
 
 ## 8. 明确不做（本方案与本轮的边界）
 
-- 不实现 `dual_write`、不写任何 v3/生产数据、不切配置、不跑 canary。
+- 不写任何 v3/生产数据、不切配置、不跑 canary。（`dual_write` 的**代码实现**已于
+  2026-10-05 落地并默认关闭，见 §9.1 落地记录；本轮不产生真实 v3 数据。）
 - 不开 M5-B1，不共享 v3 写入。
-- 不推荐"现在就设 `milvus.dual_write=true`"——该配置无对应代码，设了也是空开关，属
-  §0/§2 所述危险操作。
-- 不 push、不动 main；本文件的提交只落 `audit/m5-gate0-coverage` 分支。
+- 不推荐"现在就设 `milvus.dual_write=true`"——真实启用属 §9 授权范围；在共享环境显式
+  开启即进入 S1，需配套写冻结与回滚预案（§16.1）。
+- 历史轮边界存档：2026-10-04 审计轮"不 push、不动 main、提交只落
+  `audit/m5-gate0-coverage`"仅描述该轮边界；当前集成轮按用户指示在本地 main 提交，
+  仍然不 push。
 
 ---
 
 ## 9. 进入执行前必须先满足的条件（阻塞清单）
 
-1. `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）。
+1. ✅ `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）——**已满足**（2026-10-05）：
+   代码见 §9.1；验证 `backend/tests/check_vector_dual_write.py` 23/23 PASS，已注册统一门禁
+   `vector_dual_write`（套件 `SUMMARY total=17 failed=0`，EXIT=0）。
 2. 授权运行 §5.1 合成 schema canary（写 Milvus，需单独批准）。
 3. C3 处置清单（§7）中所有待迁 KB 的 blocked/orphan/unrecoverable/scope_* 归零或有批准
    的例外。
 4. 双写一致性 + 切换 + 回滚五步的验收脚本就绪（§6 判据落到可执行断言）。
 
 以上任一未满足，真实 v3 迁移保持关闭，M5 gate 不宣布通过。
+
+---
+
+### 9.1 实现落地记录（2026-10-05 · S1 双写最小移植轮，integration worktree，本地 main）
+
+本节只记录**代码事实**（均可 `git`/文件复查），不改变 §4–§8 的任何门禁判定：真实 v3 迁移
+仍关闭、`MILVUS_DUAL_WRITE` 默认 false、共享环境未做任何配置变更或连接。
+
+| 项 | 落点（file:line，均为现树实测） | 语义 |
+|---|---|---|
+| 配置开关 | `backend/config.py:139` | `MILVUS_DUAL_WRITE`（默认 false）布尔解析；后台展示经 runtime_config vector_store 类目透出（AGENTS.md 后端规范 9） |
+| 运行时透传 | `backend/services/runtime_config.py:165` | `dual_write` 键进入 vector_store 运行时配置（配置中心优先，settings 兜底） |
+| 切换点显式化 | `backend/services/vector_store.py:145-159` | dual_write 仅在 primary=`graphinsight_chunks_v2` 时产生 shadow=`graphinsight_chunks_v3`；primary 非 v2 时 warning 且不生效（S2 形态）——"只写 v3 + 只读 v2"结构性不可能（§16.1 不变量） |
+| S1 写扇出 | `vector_store.py:268-336` | primary（v2）先写；带版本 chunk 且 v2 缺显式字段时**剥版本写 v2、版本由 v3 承载**（:303-310，§8.5 禁 dynamic metadata，不写 ≠ 降级）；v3 先 `ensure_collection`（新建必含显式 `content_revision` INT64）再守卫（已存在但缺字段仍拒写，:319-325）；v3 upsert 失败 fail-closed 上抛 `VectorStoreUpsertError`（:326-335），由运维按 §16.1 写冻结降级回 S0，禁止丢弃新写 |
+| 删除/清空同步 | `vector_store.py:360`（delete_doc）、`:389`（clear）内的 dual_target 分支 | S1 期 v3 影子侧同步删除，避免 S2 切换后已删文档残留 |
+| 健康透出 | `vector_store.py:181-182` | `health()` 返回 `dual_write` / `dual_target_collection`（布尔非敏感） |
+
+**隔离取证（本轮实跑，零真实连接）**：
+
+- `python backend/tests/check_vector_dual_write.py` → `RESULT: 23 passed, 0 failed`，EXIT=0。
+  覆盖：T1 默认关闭 / T2 S1 激活 / T3 S2 不生效 / T4 双落且版本由 v3 承载 / T5 v3 缺显式字段
+  拒写 / T6 v3 upsert 失败上抛 / T7 无双写单写与 §8.5 拒写 / T8 delete/clear 同步 / T9 health 透出。
+- 注册统一门禁后全量：`python backend/tests/run_unified_boundary_guards.py` →
+  `SUMMARY total=17 failed=0`，EXIT=0（含 `vector_dual_write` 项 `RESULT: 23 passed, 0 failed`）。
+- 语法检查：`py_compile config.py services/runtime_config.py services/vector_store.py
+  tests/check_vector_dual_write.py` → EXIT=0。
+
+**边界与已知分支线**：以上全部为进程内 FakeClient 隔离证据，未连接真实
+Milvus/PostgreSQL/Neo4j；未在任何环境开启 `dual_write`；未 push。实现规格以 M5AB 计划 §4
+为准（`milvus.dual_write` + `milvus.collection` 切换，shadow 隐含 v3）；`m5/dual-write`
+分支后续演进的 `shadow_collection` 配置化 / `DualWriteConfigError` / `resolve_dual_write`
+形态是**另一条已知分支线**，两线合并时需显式裁决收敛，不得默认某一口径。
 
 ---
 
