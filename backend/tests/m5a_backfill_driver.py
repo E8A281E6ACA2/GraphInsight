@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Dict
@@ -415,6 +416,89 @@ def s_unrecoverable_neo_only():
     return code
 
 
+# ---------------------------------------------------------------------------
+# 运行清单（run manifest）场景 —— v3 backfill 路线图阶段 2
+# 清单目录由环境变量 MANIFEST_TMP 传入（check 脚本每个场景一个临时目录）；
+# 未设置时走 bf.run 的默认三态（不落盘），用于验证"未启用=零副作用"。
+# ---------------------------------------------------------------------------
+
+
+def _manifest_dir() -> Path:
+    raw = (os.environ.get("MANIFEST_TMP") or "").strip()
+    return Path(raw) if raw else None
+
+
+def _dump_manifest() -> None:
+    """清单内容以单行紧凑 JSON 回显（多行缩进会被 marker 行解析截断）。
+
+    盘上文件仍保留 indent=1 供人工阅读；marker 行必须单行才能被 check 逐行解析。
+    """
+    mdir = _manifest_dir()
+    files = sorted(mdir.glob("*.json")) if (mdir and mdir.exists()) else []
+    print("__MANIFEST_COUNT__" + str(len(files)))
+    for path in files:
+        print("__MANIFEST__" + json.dumps(json.loads(path.read_text(encoding="utf-8")), ensure_ascii=False))
+
+
+def _manifest_sources():
+    parsed = {"kb-a": {"m1": {"doc_id": "d1", "text": "内容一", "parser_version": "p1", "source_version": "h1"}}}
+    neo = {"kb-a": {"m1": {"doc_id": "d1", "text": "内容一", "tenant_id": "t1", "project_id": "p1", "content_revision": 1}}}
+    _patch_sources(neo=neo, parsed=parsed, graph=True, vector=False)
+
+
+def s_manifest_execute():
+    """执行模式清单：写入腿计数 / 门判定 / inserted_chunk_ids 全部落盘。"""
+    _manifest_sources()
+    code = bf.run("kb-a", dry_run=False, manifest_dir=_manifest_dir())
+    _dump_manifest()
+    return code
+
+
+def s_manifest_dryrun():
+    """dry-run 清单：writes 全零、mode=dry-run、outcome=dry_run_completed。"""
+    _manifest_sources()
+    code = bf.run("kb-a", dry_run=True, manifest_dir=_manifest_dir())
+    _dump_manifest()
+    return code
+
+
+def s_manifest_rerun():
+    """幂等重跑：两轮各一份清单，第二轮 rows_new=0、rows_skipped_existing=1。"""
+    _manifest_sources()
+    codes = [
+        bf.run("kb-a", dry_run=False, manifest_dir=_manifest_dir()),
+        bf.run("kb-a", dry_run=False, manifest_dir=_manifest_dir()),
+    ]
+    _dump_manifest()
+    return 0 if codes == [0, 0] else 1
+
+
+def s_manifest_exception():
+    """失败注入：写入腿抛异常也必须留下清单（exception + exit_code=1），供 disposable 对账。"""
+    _manifest_sources()
+    bf._insert_revision_rows = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("injected failure"))
+    caught = ""
+    try:
+        bf.run("kb-a", dry_run=False, manifest_dir=_manifest_dir())
+    except Exception as exc:  # noqa: BLE001 - 场景需要捕获后仍落清单
+        caught = type(exc).__name__
+    print("__EXCEPTION__" + caught)
+    _dump_manifest()
+    return 0 if caught == "RuntimeError" else 1
+
+
+def s_manifest_disabled():
+    """未启用清单（三态 UNSET 且无环境变量）→ 不落盘、不建目录、零副作用。"""
+    _manifest_sources()
+    mdir = _manifest_dir()
+    before = mdir.exists() if mdir else False
+    code = bf.run("kb-a", dry_run=False)
+    _dump_manifest()
+    if before:
+        print("__PREEXISTING_DIR__1")
+    return code
+
+
 def s_scope_conflict_new():
     """审计修复 #4：new_chunk 的 tenant 与 knowledge_bases 登记冲突 → 零写入 fail-closed。"""
     _ensure_kb_table("kb-a", "t1", "p1")
@@ -513,6 +597,11 @@ SCENARIOS = {
     "unrecoverable_neo_only": s_unrecoverable_neo_only,
     "scope_conflict_new": s_scope_conflict_new,
     "scope_conflict_row": s_scope_conflict_row,
+    "manifest_execute": s_manifest_execute,
+    "manifest_dryrun": s_manifest_dryrun,
+    "manifest_rerun": s_manifest_rerun,
+    "manifest_exception": s_manifest_exception,
+    "manifest_disabled": s_manifest_disabled,
     "direct_document_aggregation": s_direct_document_aggregation,
     "direct_cas_failure": s_direct_cas_failure,
     "backfill_document_aggregation_failure": s_backfill_document_aggregation_failure,
