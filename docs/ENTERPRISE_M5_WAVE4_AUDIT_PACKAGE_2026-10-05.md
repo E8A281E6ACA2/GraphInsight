@@ -711,4 +711,213 @@ PYTHONPATH= python tests/check_m5_p6_disposable_pg.py      # 期望 criteria=7 f
 PYTHONPATH= python tests/run_unified_boundary_guards.py    # 期望 SUMMARY total=20 failed=0
 ```
 
+## 16. Wave 8：Go 写侧完整提交链 + disposable PG 真实写入验收
+
+**本轮指令口径**：继续实施 Go 写侧完整提交链，并在 disposable PG 中完成真实 Go HTTP 写入验收；
+**不得仅增加白名单后宣告放行**；必须证明 §16.3 去重、并发唯一性、原地重试、child ID 回读、
+作用域校验与审计留痕；完成后提交最终树与可回读证据再交审。本轮不执行共享库 `--confirm`、不 push、不进 S2。
+
+### 16.1 写侧链路落点（route → store → DB → audit）
+
+| 环节 | 位置 | 作用 |
+|---|---|---|
+| 路由分派与入口防线 | `httpserver/admin_jobs_native.go`（`submitReindexChunksJob`） | 未列类型走 **路由 404**；`supportedJobTypes`（`adminstore/jobs.go:26-30`）的存储层 400 只是第二道线，本轮未把 `reindex_chunks` 加进去 |
+| targets 解析 | `admin_jobs_native.go:368-404` | 逐条要求对象形状 + `chunk_id` 非空 + `target_revision` 是整数语义（`:414` `targetRevisionFromJSON`，小数/字符串/布尔在入口拒，避免两端算出不同 hash） |
+| 作用域冻结 | `requireJobKnowledgeBase` → `freezeJobPayloadScope` | tenant/project/kb 取服务端 KB 行，不采信客户端字符串 |
+| 去重入队 | `adminstore/reindex_queue.go:101` `EnqueueReindexChunks` | 单事务内分组 → `insertReindexJob`（`:204` `ON CONFLICT (job_type, kb_id, targets_hash) WHERE targets_hash IS NOT NULL DO NOTHING`）→ 零行则 `resolveReindexConflict`（`:258`，`:266` `FOR UPDATE`） |
+| §16.3 冲突分支 | `reindex_queue.go:276-295` | pending/running/succeeded→reused；failed 且额度未用尽→原地 retry；failed 且 `retry_count>=max_retries`→**rejected（不复活）**；cancelled→复位归零 |
+| 异常哨兵 | `reindex_queue.go:36` `ErrReindexEnqueueAnomaly` | 命中唯一索引却 `FOR UPDATE` 读不到行了 |
+| 审计留痕 | `reindex_queue.go:352` `writeReindexAudit` → `adminstore/jobs.go:641-671` `insertJobAuditLogEntry` | `resource='job'`、`resource_id=<jobID>`、`user_id`/`operator_id` 同值；拒绝留痕 `status='failed'` + `error_message` |
+| 错误映射 | `admin_jobs_native.go:426-448` | 400 REINDEX_SCOPE_REQUIRED / 400 INVALID_BODY / 503（两条分句，见 §16.4 缺陷 2）；**Go 侧无 409**，§16.3 的 `409 JOB_409` 仍是 NOT-IMPLEMENTED |
+
+### 16.2 判据 8–14 逐条与取证
+
+编排器把判据台账从 7 项改为 `BASE_CRITERIA_COUNT(7) + len(W8_GO_WRITE_CRITERIA)(7) = 14`
+（`check_m5_p6_disposable_pg.py:76/80/463-464/505`），写侧每项钉一个 Go 用例名，缺一即红。
+
+| # | 判据 | 用例 | 关键断言（全在真实 Go HTTP + 真实 PG 上） |
+|---|---|---|---|
+| 8 | child ID 回读 + 跨语言 hash 对等 | `TestP6GoWriteReusesPythonSubmittedJob` | Go 用 Python 那批 targets **原文**（`p6TargetsFromArrayJSON`，`p6_…_test.go:238`，只剥外层方括号、绝不重序列化）重提交 → 200 且 `id == Python 行 id(2)`、`targets_hash` 与 Python 写入值逐字相同（`42d6adf0…61023`）、该 hash 仍 1 行、`createCalls==0`（不走裸 INSERT 的 CreateJob） |
+| 9 | §16.3 去重（Go 路径） | `TestP6GoWriteCreatesRowAndDedupesResubmits` | 首批 201 新建；原样重提交与**换序重提交**都 200 复用同一 id；同 hash 恒 1 行；作用域三元组冻结自服务端 KB 行；`requested_by == 夹具操作员`（`:816`） |
+| 10 | 原地 retry/reset | `TestP6GoWriteRetriesAndResetsInPlace` | failed(1)→retry_count=2 且行仍 pending/同一 id；cancelled(2)→retry_count 归零；全程该 hash 1 行 |
+| 11 | 额度耗尽拒绝 + 失败留痕 | `TestP6GoWriteRejectsExhaustedRetriesAndAudits` | 400 `JOB_MAX_RETRIES_REACHED` + `child_job_id`/`targets_hash`/`retry_count`/`reason=retry_exhausted`；行**不动**（failed/3/原 error_message）；库侧 1 条 `job_rejected` 且 `status='failed'`、`user_id`/`operator_id` 均为操作员（`:971`） |
+| 12 | 并发唯一性 | `TestP6GoWriteConcurrentSameHashKeepsSingleRow` | 两 goroutine 同 hash 并发：都成功、回读同一 id、hash 相同、最多一个 201、库里 1 行（ON CONFLICT 第一道 + `FOR UPDATE` 第二道） |
+| 13 | 审计形状跨语言一致 | `TestP6GoWriteAuditMatchesPythonFrozenKeys` | `details` 键集合 = Python 冻结 13 键（不多不少、无旧键 `job_id`）；聚合计数 created=1 其余 0；**同一库侧检索式**（`resource='job' AND resource_id='<id>'`）命中 1 条且带操作员身份（`:1063-1071`） |
+| 14 | 作用域校验在入队前 | `TestP6GoWriteBlocksCrossScopeAndUnknownKBBeforeEnqueue` | 跨租户 400 `KB_CROSS_SCOPE`（按契约 §2.9 不映射 403）、未知 kb_id 404 `KB_NOT_FOUND`；`enqueueCalls==0 && createCalls==0`；该 KB 行数零增长 |
+
+编排器另加写侧夹具前置闸门（`:460-462`）：`doc_id` / `payload_targets` 任一为空即判红，
+不允许"夹具没铺上→用例空转→绿灯"的链路。
+
+### 16.3 操作员身份与外键事实（本轮实测，非推断）
+
+一次性库里 `\d admin_jobs` 实读：`admin_jobs.requested_by → admin_users(id)`
+（约束名 `admin_jobs_requested_by_fkey`）；`admin_logs.user_id`/`operator_id` 同样指向 `admin_users(id)`。
+两侧写入口径不同：Python 内部入队 `requested_by=None`（不需要操作员行），Go 写侧把认证 UserID 写进
+`requested_by` 并同值写入审计两列 —— 所以夹具**必须**种下 `admin_users` 行。落法：
+
+- 驱动 `seed_operator`（`p6_disposable_pg_driver.py:144`，`OPERATOR_ID = 1`，`:39`）幂等插行并 `setval` 序列，
+  BOOTSTRAP 标记回带 `operator_id`（`:187`）；
+- 编排器把该值注入 `GI_P6_OPERATOR_ID`（`check_m5_p6_disposable_pg.py:441`），**不在 Go 侧重复写魔数**；
+- Go 侧 fail-closed：`requirePostMigrate` 缺该 env 即 Fatalf（`p6_…_test.go:117`），
+  `p6OpenFixtureDB` 在写任何一行前探测 `admin_users` 命中数（`:286`），缺口当场红且说出真名。
+
+写侧闸门一律用 `t.Fatalf` 不用 `t.Skip`：判据 8–14 必须"跑到"，跑到数由编排器
+`GO_EVIDENCE` 的 `expected/ran/passed/failed/skipped` 五元组钉死。
+
+### 16.4 本轮抓出并修掉的两处真实缺陷
+
+1. **提交体形状错（判据 8 首跑 400）**：`submitReindex` 的第 4 参数是 targets **数组内部**形状，
+   而 Python 标记里的 `payload_targets` 是数组原文，直接塞进去拼成 `targets:[[…]]` →
+   `payload.targets 必须是对象列表`。修 = 新增 `p6TargetsFromArrayJSON`，只做"剥外层方括号 +
+   逐元素原始字节拼接"，任何重序列化都可能让两语言 hash 不同形，判据就退化成"各自算各自的对"。
+2. **路由 catch-all 文案误导排障（判据 9–13 首跑 503）**：`writeReindexEnqueueError` 的 `default:`
+   把**任何** store 错误都说成"命中去重索引但读不到既有任务行"。首跑真实原因是夹具缺 `admin_users`
+   行使 `requested_by` 外键违例（同一条 SQL 把 `requested_by` 改 NULL 即可插入 —— psql 原始复现），
+   却被这句话把排障方向整个带偏。修 = 拆成 `errors.Is(err, ErrReindexEnqueueAnomaly)` 专句
+   （`:436-440`）+ 通用"存储层不可用"（`:441-447`），并在 `admin_jobs_native_test.go` 补双向断言：
+   去重异常必须点名去重索引，外键违例**不得**复用该文案（含"同文案但非哨兵错误"的精确匹配证伪）。
+
+### 16.5 Wave 8 总回归（本轮真实数字，全绿；均为**隔离证据**）
+
+| 门禁 / 套件 | 结果（取自本轮日志原文） |
+|---|---|
+| P6 disposable PG + Go 七项写侧判据 | `P6_DISPOSABLE_SUMMARY criteria=14 failed_criteria=0 failed_steps=0 go_phases=2 skipped=0`，`RESULT: PASS`，全文 `✗` 计数 0；`GO_EVIDENCE pre_migrate expected=2 ran=2 passed=2 failed=0 skipped=0`、`post_migrate expected=11 ran=11 passed=11 failed=0 skipped=0`。**提交前在同一棵树上复跑一次**（`output/w8/p6_run_w8c.log`，`P6_REAL_EXIT=0`），关键行与首跑 `p6_run_w8b.log` 逐字一致，含收尾 dump `admin_jobs 最终 7 行；job 留痕 16 条` 与 `job#13 ... status=failed retry=3` |
+| 收尾 dump（人工可复查） | `admin_jobs` 7 行 / job 留痕 16 条；`job#13 reindex_chunks status=failed retry=3 targets_hash=有`（拒绝分支未复活行的直接证据） |
+| 统一边界门禁 | `SUMMARY total=20 failed=0`，`EXIT_run_unified_boundary_guards=0`（**提交前在同一棵树上复跑**，`output/w8/w8c_gates.log`；本轮早先一次为 `output/w8/w8_gates.log`，同数） |
+| 迁移清理守卫 | `MIGRATION_CLEANUP_GUARDS_OK`，EXIT=0（`output/w8/w8_gates.log`；本轮其后未再触及迁移/守卫文件） |
+| M5-A backfill 全量 | `✓ all M5-A acceptance checks passed`，`EXIT_check_m5a_revision_backfill=0`（提交前复跑，`w8c_gates.log`） |
+| B0 reindex_chunks 闭环 | `✓ all M5-B0 reindex_chunks checks passed`，`EXIT_check_b0_reindex_chunks=0`（提交前复跑，`w8c_gates.log`） |
+| Wave 3 转交连续场景 | `RESULT: PASS — Wave 3 连续场景（影子失败转交 / 复用 / 终态父子回写 / §8.5 拒写）全部证成`，`EXIT_check_m5_wave3_handoff=0`（提交前复跑，`w8c_gates.log`；`✓` 行 71，与 Wave 7 同数） |
+| M5 dual_write / build_graph_revision | `M5_DUAL_WRITE_SUMMARY passed=23 failed=0` / `M5_BUILD_GRAPH_REVISION_SUMMARY passed=22 failed=0`（`w8_gates.log`；其后未改这两项覆盖的源码） |
+| KB 作用域隔离 / build_graph 影子重试 | `passed=55 failed=0` / `✓` 行 24，EXIT=0（`w8_gates.log`；其后未改这两项覆盖的源码） |
+| Go（`golang:1.27` 容器，`GOPROXY=off`） | `gofmt -l`（本轮 9 个 Go 文件，清单见 §16.8）输出空；`BUILD_EXIT=0`、`VET_EXIT=0`、`go test ./... -count=1` → 8 包 `ok`、0 FAIL（`output/w8/go_suite_w8c.log`）。**注意口径**：裸套件里 `p6_disposable_pg_integration_test.go` 受 env 门控会 skip（所以这轮 httpserver 只 1.5s），它证明的是"编译+读侧/单测不回归"；判据 8–14 **真跑到**的证据只认 P6 编排器日志里的 `GO_EVIDENCE expected/ran/passed/failed/skipped` 五元组 |
+| 前端（`admin.ts` 注释口径修正） | 提交前复跑：`TSC_REAL_EXIT=0`、`ESLINT_REAL_EXIT=0`（`output/w8/w8c_tsc.log`；退出码由 `echo $?` 直接取，不经过管道） |
+| 密钥扫描（HEAD 对照法） | 8 个已跟踪改动文件：工作树命中 34 条，`git show HEAD:` 同扫也是**同样 34 条**；提交前把两份输出解析成 `(文件, kind, match_sha256, 掩码值)` 四元组集合排序比对 → `head 34 worktree 34 IDENTICAL`，本轮零新增。6 个新增文件单独扫 `findings=0 result=pass`（`SECRET_SCAN_SUMMARY paths=6 files=6 ... findings=0 result=pass`）。34 条是 `go-backend`/`frontend/src` 这类 **CI 扫描范围外的待复核项**（CI 只扫 `artifacts`、`playwright-report`、`test-results`、`logs/dev/*.log`），**不等于全仓库扫描通过** |
+| 一次性资源零残留 | `docker ps -a` / `docker network ls` 过滤 `gi-p6*` 均空（P6 编排器自查 + 提交前复跑后再查一次）；共享栈 4 个容器（`graphinsight-go-gateway` / `-postgres` / `-neo4j` / `-milvus`）状态仍是 `Up 6 hours`，本轮没有重启或改写它们 |
+
+### 16.6 本轮维持的边界
+
+不跑共享库 `--confirm`（`check_m5a_live_execution.py --confirm` 未运行）、不碰共享 PG/Neo4j/Milvus、
+不进 S2、**不 push**、不动 stash（`GI-11` 的 `stash@{0}/stash@{1}` 原样保留）。
+本地态：分支 `m5/dual-write`，HEAD `97645ac`（Wave 7），本轮改动只 stage 指定文件做**本地提交**。
+远端口径：`git rev-parse --abbrev-ref @{u}` → `fatal: no upstream configured for branch 'm5/dual-write'`；
+`git ls-remote origin refs/heads/m5/dual-write` 空输出（远端无该分支引用）。
+
+`reindex_chunks` 是否进 `supportedJobTypes` 通用建任务白名单仍是用户单独裁定项；本轮接通的是
+**专用提交端点**，没有自行放行通用路径。
+
+**stage 清单口径**：`git status` 会把 `adminstore/{client,configs,logs,monitor,monitor_test,rbac_bindings,rbac_seed,users}.go`
+这 8 个文件也列为 modified，但逐个 `git hash-object` 与 `git rev-parse HEAD:<path>` 比对结果**全部 SAME**
+（stat 缓存造成的假 dirty，`core.autocrlf=false` + `.gitattributes` 钉 `eol=lf`），本轮没有 stage 它们，
+也不是把它们的改动漏在提交外。本次 stage 的 15 个文件：
+
+```
+backend/tests/_w8_gen_vectors.py                 （新增，hash 向量生成器，见 §16.7-1）
+backend/tests/check_m5_p6_disposable_pg.py
+backend/tests/p6_disposable_pg_driver.py
+docs/ENTERPRISE_M5_WAVE4_AUDIT_PACKAGE_2026-10-05.md
+frontend/src/types/admin.ts
+go-backend/internal/adminstore/jobs.go
+go-backend/internal/adminstore/reindex_queue.go       （新增）
+go-backend/internal/adminstore/reindex_queue_test.go  （新增）
+go-backend/internal/adminstore/targets_hash.go        （新增）
+go-backend/internal/adminstore/targets_hash_test.go   （新增）
+go-backend/internal/adminstore/testdata/targets_hash_vectors.json （新增）
+go-backend/internal/httpserver/admin_jobs_native.go
+go-backend/internal/httpserver/admin_jobs_native_test.go
+go-backend/internal/httpserver/admin_control_plane_routes_test.go
+go-backend/internal/httpserver/p6_disposable_pg_integration_test.go
+```
+
+### 16.7 待拍板 / 未闭环
+
+1. `backend/tests/_w8_gen_vectors.py` 被 `adminstore/targets_hash_test.go:21` 作为跨语言向量的生成来源
+   引用。**本轮裁定：随本轮提交入库**（纯 hash 复算，不建引擎、不触库），否则 checkout 后引用悬空、
+   没人能重算那 11 条向量。若审核认为该生成器不该进主干，删除该文件不会影响 Go 用例
+   —— 用例只读 `testdata/targets_hash_vectors.json`，生成器只是可复算的证明。
+2. disposable PG 只证明 §16.3 的**写侧语义**，共享库上的真实 backfill/迁移仍要 `--confirm` 授权后另跑。
+3. `admin_logs` 里 Python 留痕 `user_id/operator_id` 为 NULL（内部入队无操作员），Go 留痕带 id ——
+   检索式已按"只认非 NULL 的必须等于操作员"落，若后续要求 Python 侧也带人，需要另一轮改动。
+
+### 16.8 复核命令（Wave 8 口径）
+
+```bash
+cd backend
+PYTHONPATH= python tests/check_m5_p6_disposable_pg.py    # 期望 criteria=14 failed_criteria=0 failed_steps=0 go_phases=2 skipped=0 / RESULT: PASS
+PYTHONPATH= python tests/run_unified_boundary_guards.py  # 期望 SUMMARY total=20 failed=0
+PYTHONPATH= python tests/check_m5a_revision_backfill.py  # 期望 ✓ all M5-A acceptance checks passed
+PYTHONPATH= python tests/check_b0_reindex_chunks.py      # 期望 ✓ all M5-B0 reindex_chunks checks passed
+PYTHONPATH= python tests/check_m5_wave3_handoff.py       # 期望 RESULT: PASS
+
+# Go：Windows 宿主不能编译 httpserver，必须 linux 容器（GOPROXY=off 证明零新依赖）。
+# gofmt 的文件清单 = 本轮改动的 9 个 Go 文件，逐字列出，期望输出为空。
+MSYS_NO_PATHCONV=1 docker run --rm -v "E:/projects/GraphInsight:/src" -v "C:/Users/yh/go:/go" \
+  -w /src/go-backend -e GOPROXY=off -e GOFLAGS=-mod=mod golang:1.27 \
+  sh -c "gofmt -l internal/adminstore/reindex_queue.go internal/adminstore/reindex_queue_test.go \
+         internal/adminstore/targets_hash.go internal/adminstore/targets_hash_test.go internal/adminstore/jobs.go \
+         internal/httpserver/admin_jobs_native.go internal/httpserver/admin_jobs_native_test.go \
+         internal/httpserver/admin_control_plane_routes_test.go internal/httpserver/p6_disposable_pg_integration_test.go; \
+         go build ./... ; echo BUILD_EXIT=\$? ; \
+         go vet ./...  ; echo VET_EXIT=\$?  ; \
+         go test ./... -count=1 ; echo TEST_EXIT=\$?"
+# 期望：gofmt 输出空 + BUILD_EXIT=0 + VET_EXIT=0 + TEST_EXIT=0（8 包 ok、0 FAIL，httpserver ≈10s）
+
+# 跨语言 hash 向量重算（纯复算，不建引擎；期望 11 条向量，重算后 testdata/targets_hash_vectors.json 零 diff）
+PYTHONPATH= python tests/_w8_gen_vectors.py
+```
+
+### 16.9 逐字证据片段（提交进仓库的那一份，不依赖本地日志）
+
+`output/` 被 `.gitignore:43 *.log` 排除，日志本身不入库，所以把提交前同一棵树上的实跑关键行
+逐字抄在这里供对账；审核者可用 §16.8 的命令重跑并比对。
+
+P6 disposable PG（`output/w8/p6_run_w8c.log`，`P6_REAL_EXIT=0`）：
+
+```
+    GO_EVIDENCE phase=pre_migrate expected=2 ran=2 passed=2 failed=0 skipped=0
+    GO_EVIDENCE phase=post_migrate expected=11 ran=11 passed=11 failed=0 skipped=0
+    admin_jobs 最终 7 行；job 留痕 16 条
+    · job#13 reindex_chunks status=failed retry=3 targets_hash=有
+P6_DISPOSABLE_SUMMARY criteria=14 failed_criteria=0 failed_steps=0 go_phases=2 skipped=0
+RESULT: PASS
+```
+
+Go 套件（`output/w8/go_suite_w8c.log`，容器内 `echo` 真实退出码，非管道后的 `$?`）：
+
+```
+GOFMT_DONE          ← 上一行 gofmt -l 的 9 个文件清单输出为空
+BUILD_EXIT=0
+VET_EXIT=0
+ok  graphinsight/go-backend/internal/adminstore  0.116s
+ok  graphinsight/go-backend/internal/httpserver  1.546s
+TEST_EXIT=0         ← 8 包 ok、0 FAIL
+```
+
+Python 门禁（`output/w8/w8c_gates.log`，每个脚本单独 `echo EXIT_*=$?` 取真实退出码）：
+
+```
+SUMMARY total=20 failed=0
+EXIT_run_unified_boundary_guards=0
+✓ all M5-A acceptance checks passed
+EXIT_check_m5a_revision_backfill=0
+✓ all M5-B0 reindex_chunks checks passed
+EXIT_check_b0_reindex_chunks=0
+RESULT: PASS — Wave 3 连续场景（影子失败转交 / 复用 / 终态父子回写 / §8.5 拒写）全部证成
+EXIT_check_m5_wave3_handoff=0
+```
+
+向量重算与 LF 归一（本轮最后一处改动，故单独取证）：
+
+```
+wrote 11 vectors -> E:\projects\GraphInsight\go-backend\internal\adminstore\testdata\targets_hash_vectors.json
+CRLF 0 LF 153 bytes 4207
+--- PASS: TestCanonicalTargetsHashMatchesPythonVectors (0.00s)
+ok  graphinsight/go-backend/internal/adminstore  0.008s   TEST_EXIT=0
+```
+
+生成器原先用 Windows 默认换行写出（153 行 CRLF），而 `.gitattributes` 是 `*.json text eol=lf`，
+两者不一致会让"重算后零 diff"这条判据在任何 Windows 检出上假红。本轮把生成器钉成
+`newline="\n"` 并重算，工作树字节与入库 blob 同为 LF；改完在容器内复跑对等用例（上面 4 条 PASS）
+确认换行归一没有动到向量内容——JSON 里的换行是 `"l\nm"` 这类转义，不受文件 EOL 影响。
+
 

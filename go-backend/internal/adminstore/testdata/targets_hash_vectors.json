@@ -1,0 +1,153 @@
+{
+  "vectors": [
+    {
+      "name": "basic_2",
+      "input": [
+        {
+          "chunk_id": "c1",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c2",
+          "target_revision": 2
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"c1\",\"target_revision\":1},{\"chunk_id\":\"c2\",\"target_revision\":2}]",
+      "hash": "f14c8c06d7558f774602ee0280e78c3fbfbed5314b9d601f8b5709533d17736c"
+    },
+    {
+      "name": "order_swapped",
+      "input": [
+        {
+          "chunk_id": "c2",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c1",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"c1\",\"target_revision\":1},{\"chunk_id\":\"c2\",\"target_revision\":2}]",
+      "hash": "f14c8c06d7558f774602ee0280e78c3fbfbed5314b9d601f8b5709533d17736c"
+    },
+    {
+      "name": "same_chunk_multi_rev",
+      "input": [
+        {
+          "chunk_id": "c1",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c1",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"c1\",\"target_revision\":1},{\"chunk_id\":\"c1\",\"target_revision\":2}]",
+      "hash": "e8b4a1a6a4381c326d2bbc928d7169c8e9b955633ef563920e92f25ffb7995bc"
+    },
+    {
+      "name": "single",
+      "input": [
+        {
+          "chunk_id": "x",
+          "target_revision": 7
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"x\",\"target_revision\":7}]",
+      "hash": "3a8b0834ad2a55670165341294822798fff96eb692112035f3f70476b7109a4a"
+    },
+    {
+      "name": "unicode_id",
+      "input": [
+        {
+          "chunk_id": "区块A",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "chunk",
+          "target_revision": 9
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"chunk\",\"target_revision\":9},{\"chunk_id\":\"\\u533a\\u5757A\",\"target_revision\":3}]",
+      "hash": "6af2d169d44a34eb4442558a2af0fb2c9864e8cdb4ed8b530fe66aadef8fda44"
+    },
+    {
+      "name": "html_chars",
+      "input": [
+        {
+          "chunk_id": "a<b>c&d",
+          "target_revision": 5
+        },
+        {
+          "chunk_id": "e/f",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"a<b>c&d\",\"target_revision\":5},{\"chunk_id\":\"e/f\",\"target_revision\":1}]",
+      "hash": "069dfd3b57a6e065a961f174a9bb35edbcedcd0294c9c82a460ab0fc30492a54"
+    },
+    {
+      "name": "quote_backslash",
+      "input": [
+        {
+          "chunk_id": "q\"z",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "bs\\",
+          "target_revision": 3
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"bs\\\\\",\"target_revision\":3},{\"chunk_id\":\"q\\\"z\",\"target_revision\":2}]",
+      "hash": "12be8ad34b349879c37fdf31df645af18e2a72c5a79a0983895581b29a043b22"
+    },
+    {
+      "name": "control_nl",
+      "input": [
+        {
+          "chunk_id": "l\nm",
+          "target_revision": 4
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"l\\nm\",\"target_revision\":4}]",
+      "hash": "ef47bb5178aeb1c809b77c88d05ba184643d00f5376bd1a716404cd1831fc68c"
+    },
+    {
+      "name": "big_rev",
+      "input": [
+        {
+          "chunk_id": "z",
+          "target_revision": 123456789
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"z\",\"target_revision\":123456789}]",
+      "hash": "73f028b97652cc0770c6c616541d29f2d02c1a5d71d3863648f9f9fc9f660408"
+    },
+    {
+      "name": "dup_exact",
+      "input": [
+        {
+          "chunk_id": "d1",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "d1",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"d1\",\"target_revision\":1},{\"chunk_id\":\"d1\",\"target_revision\":1}]",
+      "hash": "fb10d4b3cf8f3e1aa4fca7b36206ab42d5aadeaa1397b41bfc99ec1faddf0018"
+    },
+    {
+      "name": "emptyish_min",
+      "input": [
+        {
+          "chunk_id": "0",
+          "target_revision": 0
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"0\",\"target_revision\":0}]",
+      "hash": "e065c34f28a2d4d7d38fc30a72abd4d928b8a7183e6de9350bfba297378250dc"
+    }
+  ]
+}

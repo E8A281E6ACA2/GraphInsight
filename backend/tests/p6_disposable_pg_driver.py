@@ -35,6 +35,8 @@ DOC = "doc-p6"
 CHUNKS = ("c-p6-1", "c-p6-2")
 TARGET_REVISION = 1
 TRACE = "p6-disposable-trace"
+# Go 写侧认证结果里的操作员 id（与 httpserver 假授权保持一致，由编排器注入回 Go 阶段核对）。
+OPERATOR_ID = 1
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -139,6 +141,32 @@ def seed_kb(engine) -> None:
         )
 
 
+def seed_operator(engine) -> int:
+    """种 Go 写侧需要的操作员行：admin_jobs.requested_by 与 admin_logs.operator_id 两条外键
+    都指向 admin_users(id)。Python 内部提交路径传 requested_by=None，所以 P6 前几轮不种也绿；
+    Wave 8 的 Go 提交链会把认证结果里的 UserID 真写进这两列，缺行就是外键违例（实跑抓到过）。
+    id 必须与 Go 测试假授权（newSoftKBGuardForTest 的 authz.UserID）一致，由编排器注入给
+    Go 阶段核对，不靠两边各写一个魔数。
+    """
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO admin_users (id, username, password_hash, email, is_active) "
+                "VALUES (:id, :username, 'p6-not-a-real-hash', :email, TRUE) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {"id": OPERATOR_ID, "username": f"p6-operator-{OPERATOR_ID}", "email": f"p6-operator-{OPERATOR_ID}@p6.local"},
+        )
+        conn.execute(text("SELECT setval('admin_users_id_seq', GREATEST(:id, 1), TRUE)"), {"id": OPERATOR_ID})
+        present = conn.execute(
+            text("SELECT count(*) FROM admin_users WHERE id = :id"), {"id": OPERATOR_ID}
+        ).scalar()
+    check(f"操作员行已就位（id={OPERATOR_ID}，供 Go 写侧两条外键引用）", int(present or 0) == 1, f"count={present}")
+    return OPERATOR_ID
+
+
 def stage_bootstrap(engine) -> None:
     from admin.database import Base
     from admin.models import AdminJob, AdminLog, AdminUser, KnowledgeBase
@@ -148,9 +176,16 @@ def stage_bootstrap(engine) -> None:
         tables=[AdminUser.__table__, AdminJob.__table__, AdminLog.__table__, KnowledgeBase.__table__],
     )
     seed_kb(engine)
+    operator_id = seed_operator(engine)
     shape = job_shape(engine)
     check("建表后 admin_jobs 含 targets_hash（随后由真实迁移脚本回滚成旧形态）", shape["has_targets_hash"], str(shape))
-    marker("BOOTSTRAP", {"shape": shape, "kb_id": KB, "tenant_id": TENANT, "project_id": PROJECT})
+    marker("BOOTSTRAP", {
+        "shape": shape,
+        "kb_id": KB,
+        "tenant_id": TENANT,
+        "project_id": PROJECT,
+        "operator_id": operator_id,
+    })
 
 
 def stage_assert_old_shape(engine) -> None:
@@ -333,6 +368,11 @@ def stage_submit(engine) -> None:
         {
             "child_job_id": row1.get("id"),
             "targets_hash": expected_hash,
+            "doc_id": DOC,
+            # Wave 8：Go 写侧用例要用**完全相同**的一批 targets 重提交，才能把
+            # "Go 端算出的 targets_hash 与 Python 逐字相同"从推断变成观测。原文只在这里
+            # 出口一次，编排器原样注入给 golang 容器，不重新拼字符串（重拼就可能不同形）。
+            "payload_targets": payload_targets,
             "reindex_chunks_count": fourth["count"],
             "outcomes": [first["log"].get("details", {}).get("outcome"), second["log"].get("details", {}).get("outcome"), third["log"].get("details", {}).get("outcome"), fourth["log"].get("details", {}).get("outcome")],
             "detail_child_job_ids": [

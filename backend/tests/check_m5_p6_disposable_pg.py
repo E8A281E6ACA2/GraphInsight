@@ -57,6 +57,36 @@ GO_TEST_RE = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.MULTILINE)
 # 每阶段**点名**要跑到的 Go 用例：`-run TestP6` 是前缀匹配，改名或新增用例都会悄悄改变
 # 匹配面（甚至匹配到 0 个也照样 `ok`）。这里把清单写死并把 `-run` 收紧成精确 alternation，
 # 于是"该有的用例没跑到"和"跑到了但不 PASS"都会显式变红，而不是靠 SKIP 蒙混。
+# Wave 8 的 Go 写侧用例：只在 post_migrate 阶段跑（写侧 requirePostMigrate 是 Fatalf，
+# 不是 Skip —— 阶段不对就红，不给"没跑到"留成"跳过所以绿"的口子）。
+# 顺序必须与测试文件里的声明顺序一致：TestP6JobLogsExposePythonAuditDetails 断言每个
+# outcome 恰好 1 条留痕，而写侧复用会给同一行追加第二条 reused。
+W8_GO_WRITE_TESTS = [
+    "TestP6GoWriteReusesPythonSubmittedJob",
+    "TestP6GoWriteCreatesRowAndDedupesResubmits",
+    "TestP6GoWriteRetriesAndResetsInPlace",
+    "TestP6GoWriteRejectsExhaustedRetriesAndAudits",
+    "TestP6GoWriteConcurrentSameHashKeepsSingleRow",
+    "TestP6GoWriteAuditMatchesPythonFrozenKeys",
+    "TestP6GoWriteBlocksCrossScopeAndUnknownKBBeforeEnqueue",
+]
+
+# 判据 1~7 是 P6 原有的读侧/内部路径口径；Wave 8 把总数推到 14（+ 写侧 8~14）。
+# 汇总里的 criteria 由这两段长度相加得出，不再写死，避免"新增判据但总数仍报 7"的假绿。
+BASE_CRITERIA_COUNT = 7
+
+# 判据 8~14 与上面七个写侧用例一一对应（顺序即序号），每条都必须由真实 Go HTTP 写入
+# 在一次性 PG 上跑到 PASS 才成立 —— "加白名单"从来不算放行。
+W8_GO_WRITE_CRITERIA: List[Tuple[str, str]] = [
+    ("Go 写侧复用 Python 已提交行并回读同一 child_job_id", "TestP6GoWriteReusesPythonSubmittedJob"),
+    ("Go 写侧新建行且同 targets_hash 重复提交被 §16.3 去重", "TestP6GoWriteCreatesRowAndDedupesResubmits"),
+    ("Go 写侧 failed/cancelled 原地 retry/reset 不新增行", "TestP6GoWriteRetriesAndResetsInPlace"),
+    ("Go 写侧重试额度耗尽拒绝并保持原行不动 + 失败留痕", "TestP6GoWriteRejectsExhaustedRetriesAndAudits"),
+    ("Go 写侧并发同 targets_hash 只留一行（FOR UPDATE）", "TestP6GoWriteConcurrentSameHashKeepsSingleRow"),
+    ("Go 写侧审计 details 键集合与 Python 冻结 13 键完全一致", "TestP6GoWriteAuditMatchesPythonFrozenKeys"),
+    ("Go 写侧跨作用域/未知 kb_id 在入队前拦下且不落库", "TestP6GoWriteBlocksCrossScopeAndUnknownKBBeforeEnqueue"),
+]
+
 GO_EXPECTED_TESTS: Dict[str, List[str]] = {
     "pre_migrate": [
         "TestP6UnlistedJobTypeIsRejectedAtRouteDispatch",
@@ -67,6 +97,7 @@ GO_EXPECTED_TESTS: Dict[str, List[str]] = {
         "TestP6ReadPathSucceedsWithTargetsHashAfterMigration",
         "TestP6LegacyRowStaysReadableAfterMigration",
         "TestP6JobLogsExposePythonAuditDetails",
+        *W8_GO_WRITE_TESTS,
     ],
 }
 
@@ -317,8 +348,14 @@ def main() -> int:
         m1 = markers(out)
         dump_out(out, rc, 12)
         boot = m1.get("BOOTSTRAP", {}).get("shape", {}) if "BOOTSTRAP" in m1 else {}
+        operator_id = m1.get("BOOTSTRAP", {}).get("operator_id")
         check("bootstrap 退出码 0", rc == 0, f"rc={rc}")
         check("bootstrap 新形态含 targets_hash（随后由真实脚本回滚）", bool(boot.get("has_targets_hash")), str(boot))
+        # Go 写侧提交链会把认证结果里的操作员 id 真写进 admin_jobs.requested_by 与
+        # admin_logs.operator_id 两条外键；夹具不种这个 id，Wave 8 实跑就被外键撞死过一次。
+        # 所以操作员 id 由驱动报回来、由编排器注入给 Go 阶段核对，两边不各写魔数。
+        check("bootstrap 种下 Go 写侧操作员行（外键目标存在）", isinstance(operator_id, int) and operator_id > 0,
+              f"operator_id={operator_id}")
 
         say("── 阶段 2：真实迁移脚本 --action rollback（D2：不手写 DDL）──")
         rc, out = migrate("rollback")
@@ -385,13 +422,23 @@ def main() -> int:
                   rc == 0 and "retried" in outcomes and "reset" in outcomes,
                   f"outcomes={outcomes}")
 
-        say("── 阶段 8：Go 读侧 post_migrate（判据 1/4/5 + 留痕读侧）──")
+        say("── 阶段 8：Go 读侧 + 写侧 post_migrate（判据 1/4/5 + 留痕读侧 + 判据 8~14 Go 写侧）──")
         rc, out, v2 = go_phase(
             "post_migrate",
             {
                 "GI_P6_LEGACY_JOB_ID": str(legacy_id or 0),
                 "GI_P6_JOB_ID": str(job_id or 0),
                 "GI_P6_TARGETS_HASH": str(targets_hash or ""),
+                # 写侧夹具与 Python 提交同源：doc_id 和整批 targets 直接取驱动 SUBMIT 标记的原文，
+                # 由这里一次性注入 golang 容器。任何"重拼 targets"都可能让两语言算出的
+                # targets_hash 不同形，那样判据 8/9/12 就成了假绿。
+                "GI_P6_DOC_ID": str(sub.get("doc_id") or ""),
+                "GI_P6_TARGETS_JSON": json.dumps(
+                    sub.get("payload_targets") or [], separators=(",", ":"), sort_keys=True
+                ),
+                # 夹具种下的操作员 id（外键目标）。Go 写侧用例既要在跑之前确认它存在于
+                # admin_users，也要确认落库的 requested_by / operator_id 就是它。
+                "GI_P6_OPERATOR_ID": str(operator_id or 0),
             },
         )
         show_tail(out, limit=30)
@@ -408,6 +455,14 @@ def main() -> int:
         check("Go 读侧回读到 Python 留痕（P5 缺口 3 闭环）",
               v2.get("TestP6JobLogsExposePythonAuditDetails") == "PASS",
               f"post_migrate verdict={v2.get('TestP6JobLogsExposePythonAuditDetails')}")
+
+        # 注入前置自查：夹具字段为空时 Go 侧只会"用空 targets 跑通"，那是零信息量的绿。
+        w8_inputs_ok = bool(sub.get("doc_id")) and bool(sub.get("payload_targets"))
+        check("阶段 8 写侧夹具注入前置条件成立（doc_id / payload_targets 非空）",
+              w8_inputs_ok, f"doc_id={sub.get('doc_id')} targets={sub.get('payload_targets')}")
+        for offset, (title, name) in enumerate(W8_GO_WRITE_CRITERIA):
+            criterion(8 + offset, title, w8_inputs_ok and v2.get(name) == "PASS",
+                      f"post_migrate verdict={v2.get(name)}")
 
         say("── 阶段 9：收尾状态 dump（供人工复查）──")
         rc, out = py_stage("dump")
@@ -447,13 +502,14 @@ def teardown() -> None:
 
 
 def finish() -> int:
+    total = BASE_CRITERIA_COUNT + len(W8_GO_WRITE_CRITERIA)
     say("")
-    say("── 七项通过标准逐条对账 ──")
-    for idx in range(1, 8):
+    say(f"── {total} 项通过标准逐条对账 ──")
+    for idx in range(1, total + 1):
         key = f"C{idx}"
         ok, evidence = CRITERIA.get(key, (False, "未执行到该判据"))
         say(f"  {'✓' if ok else '✗'} 判据{idx} {evidence}")
-    failed_criteria = sum(1 for i in range(1, 8) if not CRITERIA.get(f"C{i}", (False, ""))[0])
+    failed_criteria = sum(1 for i in range(1, total + 1) if not CRITERIA.get(f"C{i}", (False, ""))[0])
     failed_steps = len(FAILURES)
     ok = failed_criteria == 0 and failed_steps == 0
     # Go 证据账：两个阶段都跑完才给 skipped 计数；未跑完写 NA，不能让"没跑"读成"零跳过"。
@@ -461,7 +517,10 @@ def finish() -> int:
         go_summary = f"go_phases=2 skipped={sum(int(ev.get('skipped') or 0) for ev in GO_EVIDENCE.values())}"
     else:
         go_summary = f"go_phases={len(GO_EVIDENCE)} skipped=NA"
-    say(f"P6_DISPOSABLE_SUMMARY criteria=7 failed_criteria={failed_criteria} failed_steps={failed_steps} {go_summary}")
+    say(
+        f"P6_DISPOSABLE_SUMMARY criteria={total} failed_criteria={failed_criteria} "
+        f"failed_steps={failed_steps} {go_summary}"
+    )
     say("RESULT: PASS" if ok else "RESULT: FAIL")
     return 0 if ok else 1
 

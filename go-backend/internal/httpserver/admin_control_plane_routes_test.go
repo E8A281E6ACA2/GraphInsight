@@ -1225,12 +1225,16 @@ type fakeAdminJobStore struct {
 	createReq    adminstore.JobCreateRequest
 	createResult adminstore.JobItem
 	createErr    error
-	retryReq     adminstore.JobRetryRequest
-	retryResult  adminstore.JobItem
-	retryErr     error
-	cancelReq    adminstore.JobCancelRequest
-	cancelResult adminstore.JobItem
-	cancelErr    error
+	// enqueueReq/enqueueResult 只服务 reindex_chunks：它的提交链刻意不走 CreateJob。
+	enqueueReq    adminstore.ReindexEnqueueRequest
+	enqueueResult adminstore.ReindexEnqueueReport
+	enqueueErr    error
+	retryReq      adminstore.JobRetryRequest
+	retryResult   adminstore.JobItem
+	retryErr      error
+	cancelReq     adminstore.JobCancelRequest
+	cancelResult  adminstore.JobItem
+	cancelErr     error
 	// kbRow 覆盖 GetKnowledgeBase 的返回；为空时默认返回 tenant-a/project-a 下的 active KB。
 	kbRow adminstore.KnowledgeBaseItem
 }
@@ -1293,6 +1297,11 @@ func (s *fakeAdminJobStore) ListJobLogs(_ context.Context, jobID int, page int, 
 func (s *fakeAdminJobStore) CreateJob(_ context.Context, req adminstore.JobCreateRequest) (adminstore.JobItem, error) {
 	s.createReq = req
 	return s.createResult, s.createErr
+}
+
+func (s *fakeAdminJobStore) EnqueueReindexChunks(_ context.Context, req adminstore.ReindexEnqueueRequest) (adminstore.ReindexEnqueueReport, error) {
+	s.enqueueReq = req
+	return s.enqueueResult, s.enqueueErr
 }
 
 func (s *fakeAdminJobStore) RetryJob(_ context.Context, req adminstore.JobRetryRequest) (adminstore.JobItem, error) {

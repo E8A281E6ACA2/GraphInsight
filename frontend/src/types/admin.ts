@@ -729,8 +729,10 @@ export interface AdminUserBatchResetPasswordResult {
 // 任务中心相关类型
 // ============================================================
 
-// reindex_chunks 是只读类型：Go 的路由分派与建任务白名单都不放行新建，
-// 该任务只由后端影子失败转交产生，任务中心可查看/重试，不能在页面内创建。
+// reindex_chunks 在本页面仍是只读类型：任务中心可查看/重试，不提供页面内创建，
+// 通用建任务白名单（Go `adminstore/jobs.go:supportedJobTypes`）也不放行它。
+// Wave 8 起 Go 另有专用提交端点 POST /api/v1/admin/jobs/reindex-chunks（§16.3 去重入队），
+// 该端点不在任务中心调用范围内，所以这里的能力口径不变。
 export type JobType = 'build_graph' | 'clear_kb' | 'reindex' | 'reindex_chunks';
 export type JobStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
