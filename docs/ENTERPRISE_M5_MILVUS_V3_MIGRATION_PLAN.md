@@ -668,6 +668,43 @@ backfill 仍未开始；共享生产 Gate 继续 OPEN，M5-B1 继续冻结。
 **边界**：本轮未写入任何生产或共享 v2/v3 集合（phase5 只读、彩排仅一次性容器）；未修改 v2；未启动全量迁移与 M5-B1；
 未 push。共享生产 Gate 仍 **OPEN**；真实单 KB canary 需新的书面授权（清单见档案 §6）。
 
+---
+
+### 9.11 真实单 KB v3 canary：执行前只读预检判定 BLOCKED（2026-10-05）
+
+用户于 2026-10-05 授权对 KB `34905f75-38ca-4cfa-bf22-c89c96107fa8` 执行真实 single-KB v3 canary
+（允许：开 S1 dual-write / 建或用 `graphinsight_chunks_v3` / 该 KB backfill / 三引擎读回 / §16.1 回滚与幂等重跑；
+禁止：写 v2 / 碰其他 KB / 全量迁移 / M5-B1 / push；失败即停并按 CLOSED_DEGRADED 或 FAILED 汇报）。
+
+**执行前只读可行性预检**（`E:/projects/gate0-evidence/2026-10-05/phase7-precheck/`，
+`RUN-20261005T234646-phase7-precheck`，`CHECKS_TOTAL=9`/`CHECKS_FAILED=5`/`ROUND_EXIT=2`；
+两次探针均 `writes=0` / `counter_drift=[]`）判定 **BLOCKED（exit 2）**，
+故**未执行任何写入**（遵循"失败即停止"）。五条阻塞（事实均取自本轮输出）：
+
+| blocker id | 事实 | 影响 |
+|---|---|---|
+| `EMPTY_KB` | 目标 KB 在全部来源均无数据：Neo4j `chunk_nodes=0`、Milvus `entities=0`、PG `chunk_revisions=0`（仅 `knowledge_bases=1`） | canary 无迁移对象；任何"通过"都是**空态假绿**，不得作为真实迁移证据（Gate 0 合同明令） |
+| `VECTOR_CAPABILITY_OFF` | 该 KB `vector_enabled=false`、`milvus_collection=""` | 即便有数据，Milvus 腿也会记 skipped/degraded，不会写 v3 |
+| `V3_ABSENT` | `graphinsight_chunks_v3` 当前不存在（`target_exists=false`） | 创建它会在共享环境**永久新增**一个集合；空 KB 下无法被数据验证 |
+| `AUTHORIZATION_CONFLICT` | 授权项 1（S1 dual-write）按 §16.1 必然写扇出 v2+v3，与禁止项 1（不得写 v2）互斥 | "真 S1 但不写 v2"在现有代码下不可达 |
+| `BACKFILL_BYPASSES_FANOUT` | `admin/backfill_chunk_revisions.py:506` 直接 `client.upsert(collection_name=primary)`，**未走** `services/vector_store.upsert_chunks` 的 dual-write 扇出 | 即使开 dual-write，backfill 只写 primary(v2)；**v3 不会因此获得该 KB 的数据**——"S1 下用 backfill 补齐 v3"这条路径当前不存在 |
+
+**结论口径**：本轮 canary **FAILED（执行前阻塞）**，不是 CLOSED、也不是 CLOSED_DEGRADED；共享生产 Gate 仍 **OPEN**；
+未写 v2、未建 v3、未跑 backfill、未启动迁移与 M5-B1、未 push。
+
+**因此需要先解决的项（按依赖排序）**：
+
+1. **修 backfill 扇出缺口（代码，可先在隔离层做，无需共享写）**：让 `_backfill_milvus` 走
+   `upsert_chunks`（获得 S1 扇出 + 影子失败 fail-closed），并补回归网；否则真实迁移的"补齐 v3"无路径。
+2. **裁定空态 KB 的 canary 语义**：环境当前是空态（0 chunk）。若要"真实数据读回"，须先有**非空 KB**
+   （真实入库/解析产物/索引），这本身需要数据写入授权；若只验机制，须明确标注"不证明真实向量迁移"。
+3. **开关 vector 能力**：`vector_enabled=false` 意味着 embedding/store 未配置；真实 v3 写入需要该能力
+   （配置 + 重启），亦需授权。
+4. **消解授权互斥**：明确是否允许 S1 期间对**目标 KB** 的 v2 行做幂等 upsert（否则真 S1 不可达）。
+
+就绪档案已同步更新（P0 非空前置、P1b 能力、B-A/B-B 两条结构性阻塞，含 blocker id 映射），并由
+`check_phase6_readiness_consistency.py` 守住档案↔证据一致性（全绿）。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
