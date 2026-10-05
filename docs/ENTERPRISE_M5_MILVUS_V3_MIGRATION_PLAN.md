@@ -332,6 +332,42 @@ Milvus/PostgreSQL/Neo4j；未在任何环境开启 `dual_write`；未 push。实
 
 ---
 
+### 9.3 disposable 环境验证记录（2026-10-05 · 路线图阶段 3，一次性 docker 容器）
+
+v3 backfill 路线图阶段 3 要求"真实数据读回 / 失败注入 / 回滚 / 幂等重跑"四项在 disposable
+环境完成。本轮在**一次性 docker 容器**上完成（仅绑定 127.0.0.1、跑完即删并验证销毁）：
+
+| 引擎 | 容器 | 用途 |
+|---|---|---|
+| PostgreSQL 16（`postgres:16-alpine`） | `gi-phase3-pg` @ 127.0.0.1:55432 | 真实 PG：建表 / 写入 / 读回 / 结构级回滚 |
+| Neo4j 5.26.26 | `gi-phase3-neo4j` @ 127.0.0.1:29531（`NEO4J_AUTH=none`） | 真实图库：Chunk 播种、回写读回、失败注入 |
+| Milvus | **本轮不拉起** | 见下方"未取证"声明 |
+
+四项结果（编排器 `E:/projects/gate0-evidence/2026-10-05/phase3/run_phase3_disposable.py`，
+证据同目录 `phase3_steps.json` / `phase3_meta.txt` / `PHASE3_EVIDENCE_REPORT.txt` / `manifests/`）：
+
+| 项 | 判据 | 结果 |
+|---|---|---|
+| 真实数据读回 | PG `chunk_revisions` 读回 3 行 current（revision=1、graph indexed/1、vector skipped）；Neo4j `c.content_revision` 读回 =1 | PASS（双引擎真实读回，非 mock） |
+| 失败注入 | Neo4j 指向不可达端口 → 非零退出 + 清单留 `exception`/`exit_code=1` + **零新增写入**（无半截数据） | PASS（fail-closed） |
+| 回滚 | `chunk_revisions` 整表回滚消失 + `admin_jobs.targets_hash` 列回滚消失（口径：后者只删索引+列，表仍在）→ 再迁移 → 再跑通 `rows_new=3` | PASS（真实 PG 结构级） |
+| 幂等重跑 | 恢复后 `rows_new=0`、总行数不翻倍；三轮共 3 份清单（历史不覆盖） | PASS |
+
+本轮实测：**CHECKS_TOTAL=33、CHECKS_FAILED=0、ROUND_EXIT=0**
+（`RUN_ID=RUN-20261005T185413-phase3-disposable`）；清理阶段删除 Neo4j 播种节点与临时
+解析产物，并销毁全部一次性容器后复核 `docker ps -a` 无残留。
+
+**未取证声明（必须随本节一起读）**：Milvus 腿本轮**关闭**（`VECTOR_STORE_ENABLED=false`，
+`_load_milvus_chunks` 在 store 关闭时早返回 `{}`，既不连也不写）。一次性 Milvus standalone
+在本机无法启动（`panic: failed to create etcd client: context deadline exceeded`，内嵌 etcd
+超时；项目 compose 栈因带 `graphinsight_milvus_data` 卷可正常启动，但那属于 local-live
+而非 disposable）。真实 Milvus 的 schema / 读回属 **§5.1 合成 schema canary（§9 阻塞项 2，
+需单独批准）**，且路线图排在阶段 4 书面授权之后——**本轮未取证，不得据此宣称真实向量迁移
+或生产收敛**。阶段 4 获授权后须补：真实 v3 集合建集合、显式 INT64 `content_revision`
+写入与读回、切读源验证。
+
+---
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
