@@ -1060,7 +1060,7 @@ a201e723325b7c29d6269cbc6b8aa4f0e6c25340	refs/pull/1/head
 
 据此确定的三件事（本地缓存态一律让位于此）：
 
-1. 远端 `main` = `59332f4`，且它正是本地 `m5/dual-write` 的 merge-base；`m5/dual-write` 相对远端 `main` 领先 **33 个提交**，即审查分支的 PR 范围就是这 33 个提交。
+1. 远端 `main` = `59332f4`，且它正是本地 `m5/dual-write` 的 merge-base；该次探测时点（Wave 9 两个提交之前）分支相对远端 `main` 领先 **33 个提交**，Wave 9 计入 `86399e5` + `4ccaf30` 后，推送与草稿 PR 的范围是 **35 个提交**（`gh pr view` 复核值即 35）。
 2. **远端不存在 `refs/heads/m5/dual-write`**——审查分支此前从未推送过。
 3. 本地 `main`（`13303dc`，含 26 个不在本分支上的 enterprise 文档提交）与远端 `main` 已经不同线；本轮不碰它，也不把它的内容算进 PR 范围。此前 `git branch -vv` 显示 `origin/main: ahead 26` 是本地 tracking ref 的过期缓存态，不作为判据。
 
@@ -1145,3 +1145,11 @@ Wave 9 实际改动的 7 个文件（提交只 stage 这些）：
 7. `docs/ENTERPRISE_M5_WAVE4_AUDIT_PACKAGE_2026-10-05.md`（§16.8 锚点措辞 + 本节）
 
 Windows stat-cache 假脏复跑（`git hash-object` 对 `git rev-parse HEAD:<path>`）：`git status` 报 M 的 13 个文件里，8 个 `go-backend/internal/adminstore/*.go`（`client.go`、`configs.go`、`logs.go`、`monitor.go`、`monitor_test.go`、`rbac_bindings.go`、`rbac_seed.go`、`users.go`）与工作树字节完全一致，判 SAME，未 stage；剩下 5 个 DIFF 文件（本节的 1/3/5/6/7）加 2 个新增文件（本节的 2/4）才是真实改动，7 个一起 stage。
+
+### 17.9 推送与草稿 PR 的实际结果（授权范围内）
+
+- 推送通道：`ssh://git@ssh.github.com:443/E8A281E6ACA2/GraphInsight.git`（HTTPS 被 DNS 黑洞挡死，见 §17.3），`PUSH_EXIT=0`，`* [new branch] m5/dual-write -> m5/dual-write`。
+- 权威复核：`git ls-remote … refs/heads/m5/dual-write` 返回值与本地分支一致（`VERIFY_EXIT=0`），未使用本地 tracking ref 作判据。
+- 草稿 PR：**#2** `https://github.com/E8A281E6ACA2/GraphInsight/pull/2`，`gh pr view` 复核 `isDraft=True`、`state=OPEN`、`base=main`、`head=m5/dual-write`、创建时 `commits=35`、`diff +11410/-280`。
+- 未做：合并、部署、共享库 `--confirm` 迁移、S2、通用白名单放行（`supportedJobTypes` 仍不含 `reindex_chunks`）。
+- 复核当前远端 SHA：`git ls-remote ssh://git@ssh.github.com:443/E8A281E6ACA2/GraphInsight.git refs/heads/m5/dual-write`
