@@ -729,7 +729,9 @@ export interface AdminUserBatchResetPasswordResult {
 // 任务中心相关类型
 // ============================================================
 
-export type JobType = 'build_graph' | 'clear_kb' | 'reindex';
+// reindex_chunks 是只读类型：Go 的路由分派与建任务白名单都不放行新建，
+// 该任务只由后端影子失败转交产生，任务中心可查看/重试，不能在页面内创建。
+export type JobType = 'build_graph' | 'clear_kb' | 'reindex' | 'reindex_chunks';
 export type JobStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 export interface JobCreateRequest {
@@ -759,6 +761,8 @@ export interface JobItem {
   finished_at?: string;
   created_at: string;
   updated_at?: string;
+  // §16.3 去重键；历史行为 null（列由 admin/migrate_jobs_targets_hash.py 建）。
+  targets_hash?: string | null;
 }
 
 export interface JobQueryParams {

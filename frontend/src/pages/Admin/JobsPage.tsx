@@ -50,6 +50,8 @@ const jobTypeOptions: Array<{ label: string; value: JobTypeFilter }> = [
   { label: '建图任务', value: 'build_graph' },
   { label: '清库任务', value: 'clear_kb' },
   { label: '重建索引', value: 'reindex' },
+  // 只读筛选项：影子失败转交产生的 chunk 重建任务（页面不提供新建入口）。
+  { label: '分片重建', value: 'reindex_chunks' },
 ];
 
 const jobStatusOptions: Array<{ label: string; value: JobStatusFilter }> = [
