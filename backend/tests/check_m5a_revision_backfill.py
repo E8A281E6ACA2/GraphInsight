@@ -136,11 +136,27 @@ def row_of(rows: list, kb: str, chunk: str) -> dict:
 
 
 def bootstrap_admin_jobs(h: Harness) -> tuple:
+    """建出**迁移前**形状的 admin_jobs（没有 targets_hash）。
+
+    ORM 现在声明了 targets_hash（列结构与已迁移库对齐），`create_all` 于是会把列一并建出来，
+    本节要验的却是"老库升级"这条路径——列已存在时 migrate 只会打印 already exists，
+    "added column" 断言与 rollback（先删索引再删列）都失去取证对象。所以建表后把列剥掉，
+    顺带删掉可能挂在列上的索引：SQLite 的 DROP COLUMN 在列仍被索引引用时会直接报错。
+    """
     return h.run_python_code(
-        "from admin.database import Base, engine;"
-        "from admin.models import AdminJob;"
-        "Base.metadata.create_all(bind=engine, tables=[AdminJob.__table__]);"
-        "engine.dispose(); print('bootstrap ok')"
+        "from admin.database import Base, engine\n"
+        "from admin.models import AdminJob\n"
+        "from sqlalchemy import text\n"
+        "Base.metadata.create_all(bind=engine, tables=[AdminJob.__table__])\n"
+        "with engine.begin() as conn:\n"
+        "    conn.execute(text('DROP INDEX IF EXISTS ix_admin_jobs_targets_hash'))\n"
+        "    conn.execute(text('DROP INDEX IF EXISTS uq_admin_jobs_targets_hash'))\n"
+        "    cols = [r[1] for r in conn.execute(text('PRAGMA table_info(admin_jobs)'))]\n"
+        "    if 'targets_hash' in cols:\n"
+        "        conn.execute(text('ALTER TABLE admin_jobs DROP COLUMN targets_hash'))\n"
+        "    left = [r[1] for r in conn.execute(text('PRAGMA table_info(admin_jobs)'))]\n"
+        "engine.dispose()\n"
+        "print('bootstrap ok legacy_no_column=' + str('targets_hash' not in left))\n"
     )
 
 
@@ -154,7 +170,7 @@ def prep_db(h: Harness, name: str) -> None:
     code, out = h.run(str(Path("admin") / "migrate_chunk_revisions.py"), ["--action", "migrate"])
     step(f"{name}：迁移 chunk_revisions", code == 0, f"exit={code} " + out[-300:])
     code, out = bootstrap_admin_jobs(h)
-    step(f"{name}：引导 admin_jobs", code == 0 and "bootstrap ok" in out, f"exit={code} " + out[-300:])
+    step(f"{name}：引导 admin_jobs", code == 0 and "bootstrap ok legacy_no_column=True" in out, f"exit={code} " + out[-300:])
     code, out = h.run(str(Path("admin") / "migrate_jobs_targets_hash.py"), ["--action", "migrate"])
     step(f"{name}：迁移 targets_hash", code == 0, f"exit={code} " + out[-300:])
 
@@ -247,7 +263,7 @@ def section_b(h: Harness) -> None:
     print("[B] migrate_jobs_targets_hash（幂等/部分唯一/回滚）")
     h.use_db("mig_b.db")
     code, out = bootstrap_admin_jobs(h)
-    step("admin_jobs 引导", code == 0 and "bootstrap ok" in out, out[-300:])
+    step("admin_jobs 引导", code == 0 and "bootstrap ok legacy_no_column=True" in out, out[-300:])
     script = str(Path("admin") / "migrate_jobs_targets_hash.py")
 
     code, out = h.run(script, ["--dry-run"])
