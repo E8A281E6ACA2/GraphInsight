@@ -633,6 +633,41 @@ backfill 仍未开始；共享生产 Gate 继续 OPEN，M5-B1 继续冻结。
 `check_phase4_evidence_contract.py` 全绿）；③ 一致性检查加防复发断言（生成器与证据都必须带精确口径）。
 另：`upsert_raw_result` 自本轮起同时记录**结构化对象**与原文 `repr`（便于机器核对键名/数量）。
 
+---
+
+### 9.10 共享 KB 只读 C3 清单 + 真实单 KB canary 准备（2026-10-05 · 下一阶段第一/二步）
+
+**第一步：共享 KB 只读 C3 清单（零写入）**。编排器 `E:/projects/gate0-evidence/2026-10-05/phase5/run_phase5_shared_c3_inventory.py`
+（受控描述符 `E:/projects/.gate0-controlled/local-live.env`，环境 id `local-dev-gate0-ro`）：
+
+| 项 | 值（取自本轮输出） |
+|---|---|
+| RUN_ID | `RUN-20261005T231214-phase5-c3-inventory` |
+| 覆盖 | `coverage_verdict=FULL`、`active/probed/omitted/failed = 1/1/0/0` |
+| 零写入证明 | `writes=0`、`counter_drift=[]` |
+| Gate | `SHARED_PRODUCTION_GATE=OPEN`（保持） |
+| 运行树 | `commit_sha=29f1bd0` |
+| 处置结果 | 1 个 KB `34905f75-38ca-4cfa-bf22-c89c96107fa8`（`active`，§9 五类全 0，`gate.closed=true`，`needs_reindex=0`）→ **ready canary 候选** |
+
+证据：`phase5_inventory.json`（含 `raw_lines`，无文本头）、`phase5_disposal_table.json`（逐 KB 处置 + 候选 + `candidates_ready`）、
+`phase5_meta.txt`、`PHASE5_EVIDENCE_REPORT.txt`；12 项检查 + 10 项合同校验全绿。
+
+**第二步：真实单 KB canary 四项验证的准备**（可执行部分已在 disposable 彩排，真实 Milvus/KB 步骤未执行）：
+
+| 项 | 状态 |
+|---|---|
+| R1 运行清单（manifest） | ✅ 彩排（`RUN-20261005T231306-phase6-rehearsal`：字段齐备、`RUN_MANIFEST` 路径一致） |
+| R2 worker/backfill 读回 | ✅ PG/Neo4j 腿部彩排；Milvus 读回机制已由 §5.1 canary 证（phase4），**真实 KB 的 Milvus 读回待授权** |
+| R3 回滚 | ✅ 迁移级（表/列消失 + 再迁移 + 再跑通）；**§16.1 五步（写冻结/v3→v2 回放/权威清单对账/切读源/解冻）未执行**，依赖 Milvus 与授权 |
+| R4 幂等重跑 | ✅ 彩排（`rows_new=0`、总行数不增、两轮两份清单 `trace_id` 互异） |
+
+就绪档案：`E:/projects/gate0-evidence/2026-10-05/phase6-prep/PHASE6_CANARY_READINESS.md`（前置条件 P1–P6、
+四项执行规程、§16.1 五步映射、停止条件、证据合同、待授权事项清单）。档案与机器证据的一致性由
+`check_phase6_readiness_consistency.py` 守住（RUN_ID/候选 KB/统计数字/未执行声明/口径，逐条对齐，全绿）。
+
+**边界**：本轮未写入任何生产或共享 v2/v3 集合（phase5 只读、彩排仅一次性容器）；未修改 v2；未启动全量迁移与 M5-B1；
+未 push。共享生产 Gate 仍 **OPEN**；真实单 KB canary 需新的书面授权（清单见档案 §6）。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
