@@ -799,9 +799,13 @@ PYTHONPATH= python tests/run_unified_boundary_guards.py    # 期望 SUMMARY tota
 
 不跑共享库 `--confirm`（`check_m5a_live_execution.py --confirm` 未运行）、不碰共享 PG/Neo4j/Milvus、
 不进 S2、**不 push**、不动 stash（`GI-11` 的 `stash@{0}/stash@{1}` 原样保留）。
-本地态：分支 `m5/dual-write`，HEAD `97645ac`（Wave 7），本轮改动只 stage 指定文件做**本地提交**。
+本地态：分支 `m5/dual-write`，Wave 8 之前的 HEAD `97645ac`（Wave 7）；本轮最终树已作为其后继
+**本地提交** `1141700`（`feat(m5): Wave 8 Go 写侧提交链 + disposable PG 七项写侧判据（8–14）`，
+15 files changed, 2517 insertions(+), 37 deletions(-)）。提交前在同一棵树上复跑过 P6 / Go 套件 /
+4 项 Python 门禁 / tsc+eslint / 密钥对照扫描，数字见 §16.5 与 §16.9。
 远端口径：`git rev-parse --abbrev-ref @{u}` → `fatal: no upstream configured for branch 'm5/dual-write'`；
 `git ls-remote origin refs/heads/m5/dual-write` 空输出（远端无该分支引用）。
+补记上述 hash 的这笔后续提交只改本文档，不含任何代码或夹具改动，提交后用 `git status` 复核过。
 
 `reindex_chunks` 是否进 `supportedJobTypes` 通用建任务白名单仍是用户单独裁定项；本轮接通的是
 **专用提交端点**，没有自行放行通用路径。
