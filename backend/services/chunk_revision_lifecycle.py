@@ -21,8 +21,10 @@ CAS 语义（单事务）：
 必然有一个失败（第二条 current 违反 uq_chunk_revisions_current），SQLAlchemy rollback 后
 调用方重试即可；不需要应用层锁。
 
-不覆盖：Wave 3 才做影子失败持久转交、父子投影状态回写、targets_hash 冲突回读；
-本模块只负责建立 revision 真相源，不负责 relay 与收敛。
+边界（Wave 3 已落地，仍不在本模块）：本模块只负责建立 revision 真相源；影子失败持久转交与
+targets_hash 去重入队在 `services/reindex_queue.py`，作业（父）终态→投影（子）状态回写在
+`services/chunk_projection_state.py:write_back_job_failure`（由 `admin/services/job_service.py`
+在不再自动重试时调用）。
 """
 from __future__ import annotations
 

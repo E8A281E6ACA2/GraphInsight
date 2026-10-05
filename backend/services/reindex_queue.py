@@ -168,6 +168,178 @@ def _group_targets(targets: Iterable[Mapping[str, Any]]) -> Dict[tuple, List[Dic
     return groups
 
 
+def _empty_report() -> Dict[str, Any]:
+    return {
+        "enqueued": 0,
+        "reused": 0,
+        "retried": 0,
+        "reset": 0,
+        "rejected": 0,
+        "targets": 0,
+        "jobs": [],
+        "rejected_detail": [],
+    }
+
+
+def targets_from_payload(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """job payload → reindex targets（提交路径与终态回写共用同一份解析口径）。
+
+    payload 形状按 §8.2 冻结：`{kb_id, tenant_id, project_id, doc_id?, targets:[{chunk_id,
+    target_revision}]}`。targets 为空视为 §15.7 `REINDEX_SCOPE_REQUIRED`（调用方转成
+    ValidationException），不返回空列表——空 targets 的 job 一旦入队，worker 会"成功"
+    消费掉一个什么都不重建的任务。
+
+    结构校验直接复用 `_group_targets`（入队时的同一判据），否则缺 chunk_id / 非法
+    target_revision 的提交会带着裸 ValueError 冒到 API 层变成 500。
+    """
+    raw_targets = payload.get("targets") if isinstance(payload, Mapping) else None
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise ValueError("reindex_chunks payload.targets 不能为空")
+    kb_id = str(payload.get("kb_id") or "").strip()
+    doc_id = str(payload.get("doc_id") or "").strip()
+    tenant_id = str(payload.get("tenant_id") or "").strip()
+    project_id = str(payload.get("project_id") or "").strip()
+    targets: List[Dict[str, Any]] = []
+    for raw in raw_targets:
+        if not isinstance(raw, Mapping):
+            raise ValueError("reindex_chunks payload.targets 必须是对象列表")
+        targets.append(
+            {
+                "kb_id": kb_id,
+                "doc_id": doc_id,
+                "tenant_id": tenant_id,
+                "project_id": project_id,
+                "chunk_id": raw.get("chunk_id"),
+                "target_revision": raw.get("target_revision"),
+            }
+        )
+    _group_targets(targets)
+    return targets
+
+
+def enqueue_on_connection(
+    conn,
+    targets: Iterable[Mapping[str, Any]],
+    *,
+    source: str,
+    trace_id: str = "",
+    max_retries: int = 3,
+) -> Dict[str, Any]:
+    """在调用方已开启的事务连接上执行 §16.3 入队（任务中心提交路径用）。
+
+    和 `enqueue_reindex_jobs` 同一份分支表，只是不自带 `engine.begin()`：提交路径必须让
+    "去重判定 + 建行 + 审计"落在 API session 的同一事务里，否则 `db.rollback()` 只能回滚
+    一半，重复提交就会留下孤零零的 pending job。
+    """
+    if not _admin_jobs_table_exists(conn):
+        raise RuntimeError("admin_jobs 表不存在，请先执行任务中心迁移")
+    groups = _group_targets(targets)
+    if not groups:
+        return _empty_report()
+    report = _empty_report()
+
+    for (kb_id, doc_id), group in sorted(groups.items()):
+        payload_targets = [
+            {"chunk_id": item["chunk_id"], "target_revision": item["target_revision"]} for item in group
+        ]
+        payload_targets.sort(key=lambda t: (t["chunk_id"], t["target_revision"]))
+        targets_hash = canonical_targets_hash(payload_targets)
+        tenant_id = next((item["tenant_id"] for item in group if item["tenant_id"]), "")
+        project_id = next((item["project_id"] for item in group if item["project_id"]), "")
+        payload = {
+            "kb_id": kb_id,
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "doc_id": doc_id or None,
+            "source": source,
+            "targets": payload_targets,
+        }
+        result = conn.execute(
+            text(
+                "INSERT INTO admin_jobs (job_type, status, tenant_id, project_id, kb_id, payload, "
+                "retry_count, max_retries, trace_id, targets_hash) "
+                "VALUES (:job_type, 'pending', :tenant_id, :project_id, :kb_id, :payload, "
+                "0, :max_retries, :trace_id, :targets_hash) "
+                "ON CONFLICT (job_type, kb_id, targets_hash) WHERE targets_hash IS NOT NULL DO NOTHING"
+            ),
+            {
+                "job_type": JOB_TYPE,
+                "tenant_id": tenant_id or None,
+                "project_id": project_id or None,
+                "kb_id": kb_id,
+                "payload": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                "max_retries": max_retries,
+                "trace_id": trace_id,
+                "targets_hash": targets_hash,
+            },
+        )
+        report["targets"] += len(payload_targets)
+        entry: Dict[str, Any] = {
+            "kb_id": kb_id,
+            "doc_id": doc_id,
+            "targets_hash": targets_hash,
+            "target_count": len(payload_targets),
+        }
+        if result.rowcount:
+            new_id = conn.execute(
+                text(
+                    "SELECT id FROM admin_jobs WHERE job_type = :job_type AND kb_id = :kb_id "
+                    "AND targets_hash = :targets_hash ORDER BY id DESC LIMIT 1"
+                ),
+                {"job_type": JOB_TYPE, "kb_id": kb_id, "targets_hash": targets_hash},
+            ).fetchone()
+            report["enqueued"] += 1
+            entry["outcome"] = OUTCOME_ENQUEUED
+            entry["job_id"] = int(new_id[0]) if new_id else None
+            report["jobs"].append(entry)
+            continue
+
+        existing = _lock_existing_job(conn, kb_id=kb_id, targets_hash=targets_hash)
+        if existing is None:
+            # 唯一索引拦了新增却读不到行：历史 NULL hash 行不参与唯一性，正常不该发生。
+            report["reused"] += 1
+            entry["outcome"] = OUTCOME_REUSED
+            entry["job_id"] = None
+            report["jobs"].append(entry)
+            continue
+
+        entry["job_id"] = existing["job_id"]
+        status = existing["status"]
+        if status in (STATUS_PENDING, STATUS_RUNNING, STATUS_SUCCEEDED):
+            report["reused"] += 1
+            entry["outcome"] = OUTCOME_REUSED
+        elif status == STATUS_FAILED:
+            if existing["retry_count"] < existing["max_retries"]:
+                _reset_failed_job(conn, job_id=existing["job_id"], trace_id=trace_id)
+                report["retried"] += 1
+                entry["outcome"] = OUTCOME_RETRIED
+            else:
+                report["rejected"] += 1
+                entry["outcome"] = OUTCOME_REJECTED
+                report["rejected_detail"].append(
+                    {
+                        "job_id": existing["job_id"],
+                        "kb_id": kb_id,
+                        "doc_id": doc_id,
+                        "targets_hash": targets_hash,
+                        "reason": REJECT_REASON_RETRY_EXHAUSTED,
+                        "retry_count": existing["retry_count"],
+                        "max_retries": existing["max_retries"],
+                        "chunk_ids": [t["chunk_id"] for t in payload_targets],
+                    }
+                )
+        elif status == STATUS_CANCELLED:
+            _reset_cancelled_job(conn, job_id=existing["job_id"], trace_id=trace_id)
+            report["reset"] += 1
+            entry["outcome"] = OUTCOME_RESET
+        else:
+            # 未知状态一律按复用处理，不冒险重置别人正在管的行。
+            report["reused"] += 1
+            entry["outcome"] = OUTCOME_REUSED
+        report["jobs"].append(entry)
+    return report
+
+
 def enqueue_reindex_jobs(
     targets: Iterable[Mapping[str, Any]],
     *,
@@ -185,120 +357,13 @@ def enqueue_reindex_jobs(
     """
     conn_engine = engine or _engine_default()
     groups = _group_targets(targets)
-    report: Dict[str, Any] = {
-        "enqueued": 0,
-        "reused": 0,
-        "retried": 0,
-        "reset": 0,
-        "rejected": 0,
-        "targets": 0,
-        "jobs": [],
-        "rejected_detail": [],
-    }
     if not groups:
-        return report
-
+        return _empty_report()
     with conn_engine.begin() as conn:
-        if not _admin_jobs_table_exists(conn):
-            raise RuntimeError("admin_jobs 表不存在，请先执行任务中心迁移")
-        for (kb_id, doc_id), group in sorted(groups.items()):
-            payload_targets = [
-                {"chunk_id": item["chunk_id"], "target_revision": item["target_revision"]}
-                for item in group
-            ]
-            payload_targets.sort(key=lambda t: (t["chunk_id"], t["target_revision"]))
-            targets_hash = canonical_targets_hash(payload_targets)
-            tenant_id = next((item["tenant_id"] for item in group if item["tenant_id"]), "")
-            project_id = next((item["project_id"] for item in group if item["project_id"]), "")
-            payload = {
-                "kb_id": kb_id,
-                "tenant_id": tenant_id,
-                "project_id": project_id,
-                "doc_id": doc_id or None,
-                "source": source,
-                "targets": payload_targets,
-            }
-            result = conn.execute(
-                text(
-                    "INSERT INTO admin_jobs (job_type, status, tenant_id, project_id, kb_id, payload, "
-                    "retry_count, max_retries, trace_id, targets_hash) "
-                    "VALUES (:job_type, 'pending', :tenant_id, :project_id, :kb_id, :payload, "
-                    "0, :max_retries, :trace_id, :targets_hash) "
-                    "ON CONFLICT (job_type, kb_id, targets_hash) WHERE targets_hash IS NOT NULL DO NOTHING"
-                ),
-                {
-                    "job_type": JOB_TYPE,
-                    "tenant_id": tenant_id or None,
-                    "project_id": project_id or None,
-                    "kb_id": kb_id,
-                    "payload": json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    "max_retries": max_retries,
-                    "trace_id": trace_id,
-                    "targets_hash": targets_hash,
-                },
-            )
-            report["targets"] += len(payload_targets)
-            entry: Dict[str, Any] = {
-                "kb_id": kb_id,
-                "doc_id": doc_id,
-                "targets_hash": targets_hash,
-                "target_count": len(payload_targets),
-            }
-            if result.rowcount:
-                new_id = conn.execute(
-                    text(
-                        "SELECT id FROM admin_jobs WHERE job_type = :job_type AND kb_id = :kb_id "
-                        "AND targets_hash = :targets_hash ORDER BY id DESC LIMIT 1"
-                    ),
-                    {"job_type": JOB_TYPE, "kb_id": kb_id, "targets_hash": targets_hash},
-                ).fetchone()
-                report["enqueued"] += 1
-                entry["outcome"] = OUTCOME_ENQUEUED
-                entry["job_id"] = int(new_id[0]) if new_id else None
-                report["jobs"].append(entry)
-                continue
-
-            existing = _lock_existing_job(conn, kb_id=kb_id, targets_hash=targets_hash)
-            if existing is None:
-                # 唯一索引拦了新增却读不到行：历史 NULL hash 行不参与唯一性，正常不该发生。
-                report["reused"] += 1
-                entry["outcome"] = OUTCOME_REUSED
-                entry["job_id"] = None
-                report["jobs"].append(entry)
-                continue
-
-            entry["job_id"] = existing["job_id"]
-            status = existing["status"]
-            if status in (STATUS_PENDING, STATUS_RUNNING, STATUS_SUCCEEDED):
-                report["reused"] += 1
-                entry["outcome"] = OUTCOME_REUSED
-            elif status == STATUS_FAILED:
-                if existing["retry_count"] < existing["max_retries"]:
-                    _reset_failed_job(conn, job_id=existing["job_id"], trace_id=trace_id)
-                    report["retried"] += 1
-                    entry["outcome"] = OUTCOME_RETRIED
-                else:
-                    report["rejected"] += 1
-                    entry["outcome"] = OUTCOME_REJECTED
-                    report["rejected_detail"].append(
-                        {
-                            "job_id": existing["job_id"],
-                            "kb_id": kb_id,
-                            "doc_id": doc_id,
-                            "targets_hash": targets_hash,
-                            "reason": REJECT_REASON_RETRY_EXHAUSTED,
-                            "retry_count": existing["retry_count"],
-                            "max_retries": existing["max_retries"],
-                            "chunk_ids": [t["chunk_id"] for t in payload_targets],
-                        }
-                    )
-            elif status == STATUS_CANCELLED:
-                _reset_cancelled_job(conn, job_id=existing["job_id"], trace_id=trace_id)
-                report["reset"] += 1
-                entry["outcome"] = OUTCOME_RESET
-            else:
-                # 未知状态一律按复用处理，不冒险重置别人正在管的行。
-                report["reused"] += 1
-                entry["outcome"] = OUTCOME_REUSED
-            report["jobs"].append(entry)
-    return report
+        return enqueue_on_connection(
+            conn,
+            targets,
+            source=source,
+            trace_id=trace_id,
+            max_retries=max_retries,
+        )

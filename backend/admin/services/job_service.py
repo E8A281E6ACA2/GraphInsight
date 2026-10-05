@@ -15,7 +15,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from services.chunk_projection_state import aggregate_document_states, write_back_job_failure
 from services.job_runtime import execute_job
+from services.reindex_queue import (
+    JOB_TYPE as REINDEX_CHUNKS_JOB_TYPE,
+    OUTCOME_ENQUEUED,
+    OUTCOME_REJECTED,
+    REJECT_REASON_RETRY_EXHAUSTED,
+    enqueue_on_connection,
+    targets_from_payload,
+)
 from services.scope_contract import normalize_scope_id
 from ..crud import log_crud
 from ..database import SessionLocal
@@ -188,9 +197,16 @@ class JobService:
         requested_by: Optional[int],
         trace_id: Optional[str] = None,
     ) -> JobItem:
+        if job_type not in SUPPORTED_JOB_TYPES:
+            raise ValidationException(f"不支持的任务类型: {job_type}")
+        # reindex_chunks 走 §16.3 共享去重入队，且必须留在兜底 except 之外——
+        # 落进 `except Exception: raise BusinessException("创建任务失败")` 会把
+        # 超限拒绝的结构化 details（job_id/targets_hash/reason）压成一句空话。
+        if job_type == REINDEX_CHUNKS_JOB_TYPE:
+            return self._create_reindex_chunks_job(
+                db, request=request, requested_by=requested_by, trace_id=trace_id
+            )
         try:
-            if job_type not in SUPPORTED_JOB_TYPES:
-                raise ValidationException(f"不支持的任务类型: {job_type}")
             scope, payload = self._resolve_job_scope(db, job_type=job_type, request=request)
             job = AdminJob(
                 job_type=job_type,
@@ -228,6 +244,195 @@ class JobService:
             db.rollback()
             logger.error(f"创建任务失败: {exc}", exc_info=True)
             raise BusinessException("创建任务失败")
+
+    def _create_reindex_chunks_job(
+        self,
+        db: Session,
+        *,
+        request: JobCreateRequest,
+        requested_by: Optional[int],
+        trace_id: Optional[str],
+    ) -> JobItem:
+        """§16.3 提交路径：reindex_chunks 走共享去重入队，不走裸 INSERT。
+
+        裸 INSERT 会让同 hash 的重复提交各建一行 pending，worker 于是把同一批 targets
+        重建多次；去重/复用/原地 retry/超限拒绝只在 services.reindex_queue 实现一次。
+        入队必须落在 API session 的同一事务里（`db.connection()`），否则提交失败时
+        `db.rollback()` 只能回滚一半，留下孤零零的 pending job。
+
+        超限拒绝用 3xxx `OPERATION_NOT_ALLOWED` + 结构化 details 表达。§16.3 文里写的
+        HTTP 409 映射在 Go 控制面（`go-backend/internal/adminstore/jobs.go:27-29` 的
+        allowedJobTypes 尚无 reindex_chunks，§7 reindex-chunks 端点整体未落地），
+        Python 侧不新增错误码。
+        """
+        scope, payload = self._resolve_job_scope(db, job_type=REINDEX_CHUNKS_JOB_TYPE, request=request)
+        try:
+            targets = targets_from_payload(payload)
+        except ValueError as exc:
+            db.rollback()
+            raise ValidationException(
+                str(exc),
+                error_code=ErrorCode.REINDEX_SCOPE_REQUIRED,
+                details={"job_type": REINDEX_CHUNKS_JOB_TYPE, "kb_id": scope["kb_id"]},
+            ) from exc
+
+        report = enqueue_on_connection(
+            db.connection(),
+            targets,
+            source="admin_api",
+            trace_id=trace_id or "",
+            max_retries=request.max_retries,
+        )
+        entry = (report.get("jobs") or [{}])[0]
+        job_id = entry.get("job_id")
+        outcome = entry.get("outcome")
+        detail = (report.get("rejected_detail") or [{}])[0]
+
+        if outcome == OUTCOME_REJECTED:
+            db.rollback()
+            self._audit_reindex_rejected(db, job_id=job_id, requested_by=requested_by, detail=detail)
+            raise BusinessException(
+                "reindex_chunks 重试额度已用尽，需人工介入后再提交",
+                error_code=ErrorCode.OPERATION_NOT_ALLOWED,
+                details={
+                    "job_id": job_id,
+                    "kb_id": scope["kb_id"],
+                    "targets_hash": detail.get("targets_hash"),
+                    "reason": REJECT_REASON_RETRY_EXHAUSTED,
+                    "retry_count": detail.get("retry_count"),
+                    "max_retries": detail.get("max_retries"),
+                },
+            )
+        if job_id is None:
+            # 唯一索引拦住新增却读不到既有行（§16.3 分支表外的异常）：不猜、不补建。
+            db.rollback()
+            raise BusinessException(
+                "reindex_chunks 入队异常：命中去重索引但读不到既有任务行",
+                error_code=ErrorCode.OPERATION_FAILED,
+                details={"kb_id": scope["kb_id"], "targets_hash": entry.get("targets_hash")},
+            )
+
+        db.commit()
+        job = db.query(AdminJob).filter(AdminJob.id == job_id).first()
+        if job is None:
+            raise BusinessException(
+                "reindex_chunks 入队后任务行读取失败",
+                error_code=ErrorCode.OPERATION_FAILED,
+                details={"job_id": job_id, "kb_id": scope["kb_id"]},
+            )
+        if requested_by is not None and job.requested_by is None:
+            # 共享入队的裸 INSERT 不含 requested_by，这里补登记（审计要能追到人）。
+            job.requested_by = requested_by
+            db.commit()
+            db.refresh(job)
+        self._write_job_log(
+            db,
+            job=job,
+            action="job_created" if outcome == OUTCOME_ENQUEUED else "job_reused",
+            details={
+                "job_type": job.job_type,
+                "status": job.status,
+                "outcome": outcome,
+                "targets_hash": entry.get("targets_hash"),
+                "target_count": entry.get("target_count"),
+                "kb_id": job.kb_id,
+                "enqueued": report.get("enqueued"),
+                "reused": report.get("reused"),
+                "retried": report.get("retried"),
+                "reset": report.get("reset"),
+            },
+        )
+        return _to_item(job)
+
+    def _audit_reindex_rejected(
+        self, db: Session, *, job_id: Optional[int], requested_by: Optional[int], detail: Dict[str, Any]
+    ) -> None:
+        """超限拒绝写审计 `kb_chunk_reindex_failed`（§16.3），取既有行做上下文。"""
+        job = db.query(AdminJob).filter(AdminJob.id == job_id).first() if job_id else None
+        if job is None:
+            logger.warning("reindex 超限拒绝审计跳过：任务行不存在", context={"job_id": job_id})
+            return
+        if requested_by is not None and job.requested_by is None:
+            job.requested_by = requested_by
+            db.commit()
+            db.refresh(job)
+        self._write_job_log(
+            db,
+            job=job,
+            action="kb_chunk_reindex_failed",
+            status_value="failed",
+            details={
+                "job_type": job.job_type,
+                "kb_id": job.kb_id,
+                "reason": REJECT_REASON_RETRY_EXHAUSTED,
+                "targets_hash": detail.get("targets_hash"),
+                "retry_count": detail.get("retry_count"),
+                "max_retries": detail.get("max_retries"),
+                "chunk_ids": detail.get("chunk_ids"),
+                "submit_source": "admin_api",
+            },
+            error_message="reindex_chunks 重试额度已用尽，拒绝再次入队（§16.3）",
+        )
+
+    def _write_back_terminal_failure(
+        self, db: Session, *, job: AdminJob, error_code: Optional[str]
+    ) -> None:
+        """作业（父）终态 failed 且不再自动重试 → 投影（子）落 failed + 文档级聚合（§15.5）。
+
+        只对 reindex_chunks 生效：worker 正常收敛路径自己已逐 chunk 落过 failed 并聚合过
+        文档态，这里补的是 worker 没机会写完的场景（超时、崩溃、重试额度用尽的终态失败）。
+        build_graph 的失败转交在 GI-9c 已落成 per-chunk failed + 自动入队，不在这里重复降级。
+
+        §8.5：`INDEX_UNAVAILABLE`（collection 缺显式 content_revision 字段）属"没能力写"
+        而不是"写失败"，vector 侧保持 pending 等 v3 迁移，因此整列不动。
+        """
+        if job.job_type != REINDEX_CHUNKS_JOB_TYPE:
+            return
+        payload = _parse_json_text(job.payload) or {}
+        kb_id = str(payload.get("kb_id") or job.kb_id or "").strip()
+        if not kb_id:
+            logger.warning("作业终态父子回写缺少 kb_id，跳过", context={"job_id": job.id})
+            return
+        try:
+            targets = targets_from_payload(payload)
+        except ValueError as exc:
+            logger.warning(
+                "作业终态父子回写 payload 非法，跳过",
+                context={"job_id": job.id, "error": str(exc)},
+            )
+            return
+        keep_vector_untouched = error_code == ErrorCode.INDEX_UNAVAILABLE
+        try:
+            report = write_back_job_failure(
+                kb_id, targets, keep_vector_untouched=keep_vector_untouched
+            )
+            document_states = (
+                aggregate_document_states(kb_id, report["doc_ids"]) if report["doc_ids"] else []
+            )
+        except Exception as wb_exc:  # noqa: BLE001
+            logger.error(
+                "作业终态父子回写失败",
+                context={"job_id": job.id, "kb_id": kb_id, "error": str(wb_exc)},
+                exc_info=True,
+            )
+            return
+        self._write_job_log(
+            db,
+            job=job,
+            action="kb_chunk_reindex_failed",
+            status_value="failed",
+            details={
+                "job_type": job.job_type,
+                "kb_id": kb_id,
+                "targets_hash": job.targets_hash,
+                "targets": report["targets"],
+                "updated": report["updated"],
+                "current_moved": report["current_moved"],
+                "keep_vector_untouched": keep_vector_untouched,
+                "document_states": document_states[:20],
+            },
+            error_message=str(job.error_message or "")[:1000],
+        )
 
     def should_auto_run(self, item: JobItem) -> bool:
         return item.job_type in RUNNABLE_JOB_TYPES and item.status == JOB_STATUS_PENDING
@@ -604,6 +809,7 @@ class JobService:
                         error_message=error_message[:1000],
                     )
 
+                    retry_scheduled = False
                     if (
                         JOB_AUTO_RETRY_ENABLED
                         and failed.job_type in RUNNABLE_JOB_TYPES
@@ -631,6 +837,11 @@ class JobService:
                             },
                         )
                         self._schedule_retry(job_id, retry_attempt, delay_seconds)
+                        retry_scheduled = True
+                    if not retry_scheduled:
+                        self._write_back_terminal_failure(
+                            db, job=failed, error_code=getattr(exc, "error_code", None)
+                        )
             except Exception as update_exc:  # noqa: BLE001
                 db.rollback()
                 logger.error(
