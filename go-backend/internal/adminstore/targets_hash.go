@@ -95,7 +95,7 @@ func encodePythonJSONString(value string) string {
 func writePythonUnicodeEscape(builder *strings.Builder, runeValue rune) {
 	if runeValue > 0xFFFF {
 		value := runeValue - 0x10000
-		writeHex4(builder, 0xD7C0+(value>>10))
+		writeHex4(builder, 0xD800+(value>>10))
 		writeHex4(builder, 0xDC00+(value&0x3FF))
 		return
 	}

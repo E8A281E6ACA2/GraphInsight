@@ -74,6 +74,12 @@ CASES: tuple[GuardCase, ...] = (
         "M5 Wave 3 §16.3 连续场景（影子失败持久转交 / targets_hash 复用 / 终态父子回写 / §8.5 拒写）守卫",
     ),
     GuardCase(
+        "m5_targets_hash_vectors",
+        "check_m5_targets_hash_vectors.py",
+        60,
+        "M5 §16.3 跨语言 targets_hash 向量复算与边界变体覆盖守卫",
+    ),
+    GuardCase(
         "secret_scanner_selftest",
         "check_artifact_secrets_selftest.py",
         180,
