@@ -133,6 +133,12 @@ class Settings:
         self.milvus_metric_type = os.getenv("MILVUS_METRIC_TYPE", "COSINE").strip().upper()
         self.milvus_index_type = os.getenv("MILVUS_INDEX_TYPE", "IVF_FLAT").strip().upper()
         self.milvus_search_nprobe = int(os.getenv("MILVUS_SEARCH_NPROBE", "16"))
+        # §16.1 S1 双写开关：仅当 milvus.collection 为 v2 时生效（shadow 写 v3）。
+        # S2（读写都在 v3）阶段应显式关闭；布尔值非敏感无需脱敏，后台展示经
+        # runtime_config vector_store 类目透出（AGENTS.md 后端规范 9）。
+        self.milvus_dual_write = os.getenv("MILVUS_DUAL_WRITE", "false").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
 
         # HTTP client 配置
         self.http_client_trust_env = os.getenv("HTTP_CLIENT_TRUST_ENV", "false").lower() == "true"

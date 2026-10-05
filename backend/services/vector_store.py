@@ -142,6 +142,21 @@ class MilvusVectorStore:
         cfg["metric_type"] = str(cfg.get("metric_type") or "COSINE").strip().upper()
         cfg["index_type"] = str(cfg.get("index_type") or "IVF_FLAT").strip().upper()
         cfg["search_nprobe"] = max(1, int(cfg.get("search_nprobe") or 16))
+        # §16.1 S0→S3 唯一切换点的显式化：dual_write 只在 S1（primary=v2）产生
+        # shadow 目标 v3（写 v2+v3、读 v2）；S2（primary=v3）读写都在 v3，双写不生效；
+        # "只写 v3 + 只读 v2" 的禁止组合在此结构性不可能出现。
+        dual_write = bool(cfg.get("dual_write"))
+        dual_target = ""
+        if dual_write:
+            if collection == "graphinsight_chunks_v2":
+                dual_target = "graphinsight_chunks_v3"
+            else:
+                logger.warning(
+                    "milvus.dual_write 已开启但 primary collection 不是 v2，S1 双写不生效",
+                    context={"collection": collection},
+                )
+        cfg["dual_write"] = dual_write
+        cfg["dual_target_collection"] = dual_target
         return cfg
 
     def is_enabled(self) -> bool:
@@ -153,7 +168,8 @@ class MilvusVectorStore:
             return {"ok": False, "enabled": False, "provider": "milvus"}
         try:
             client = self._get_client()
-            collection = self.config()["collection"]
+            cfg = self.config()
+            collection = cfg["collection"]
             collection_exists = bool(client.has_collection(collection))
             return {
                 "ok": True,
@@ -161,17 +177,20 @@ class MilvusVectorStore:
                 "provider": "milvus",
                 "collection": collection,
                 "collection_exists": collection_exists,
+                # §16.1：双写状态对后台可见（布尔非敏感，规范 9）
+                "dual_write": bool(cfg.get("dual_write")),
+                "dual_target_collection": cfg.get("dual_target_collection") or "",
             }
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "enabled": True, "provider": "milvus", "error": str(exc)}
 
-    def ensure_collection(self, dimension: Optional[int] = None) -> None:
+    def ensure_collection(self, dimension: Optional[int] = None, collection: Optional[str] = None) -> None:
         if not self.is_enabled():
             return
         client = self._get_client()
         cfg = self.config()
         embedding_cfg = get_embedding_runtime_config()
-        collection = cfg["collection"]
+        collection = str(collection or cfg["collection"]).strip()
         vector_dimension = int(dimension or embedding_cfg.get("dimension") or 1536)
 
         if client.has_collection(collection):
@@ -246,15 +265,18 @@ class MilvusVectorStore:
 
         import json
 
-        if any(chunk.content_revision is not None for chunk in chunks):
-            if not self.has_content_revision_field(collection):
-                # §8.5 冻结：没有显式字段就禁止写版本（写进去只会进 dynamic metadata，
-                # 类型与查询都不可靠）。拒写而不是降级写入，投影由调用方保持未收敛状态。
-                raise VectorStoreSchemaError(
-                    f"Milvus collection {collection} 缺少显式 content_revision 字段，"
-                    "禁止把投影版本号写入 dynamic metadata；请按 §8.5/§15.4 迁移到 "
-                    "graphinsight_chunks_v3 后重建向量"
-                )
+        dual_target = self.config().get("dual_target_collection")
+        versioned = any(chunk.content_revision is not None for chunk in chunks)
+        primary_supports_version = self.has_content_revision_field(collection)
+        if versioned and not primary_supports_version and not dual_target:
+            # §8.5 冻结：没有显式字段就禁止写版本（写进去只会进 dynamic metadata，
+            # 类型与查询都不可靠）。无 v3 影子腿时版本将完全丢失，拒写而不是降级，
+            # 投影由调用方保持未收敛状态。
+            raise VectorStoreSchemaError(
+                f"Milvus collection {collection} 缺少显式 content_revision 字段，"
+                "禁止把投影版本号写入 dynamic metadata；请按 §8.5/§15.4 迁移到 "
+                "graphinsight_chunks_v3 后重建向量"
+            )
 
         rows = []
         for chunk, vector in zip(chunks, vectors):
@@ -277,8 +299,41 @@ class MilvusVectorStore:
             if chunk.content_revision is not None:
                 row["content_revision"] = int(chunk.content_revision)
             rows.append(row)
-        result = client.upsert(collection_name=collection, data=rows)
-        return require_upsert_count(result, len(rows))
+        primary_rows = rows
+        if versioned and not primary_supports_version and dual_target:
+            # §16.1 S1：primary（v2）缺显式字段时剥掉版本号再写（§8.5 禁止 dynamic
+            # metadata；不写 ≠ 降级写入）。版本号由 v3 影子腿完整承载，并非静默
+            # 丢失——C1 收敛证据（§15.3 indexed 判定）取自 v3 的显式字段。
+            primary_rows = [
+                {k: v for k, v in row.items() if k != "content_revision"}
+                for row in rows
+            ]
+        result = client.upsert(collection_name=collection, data=primary_rows)
+        primary_count = require_upsert_count(result, len(primary_rows))
+
+        # §16.1 S1 双写：primary（v2）确认后 shadow 写 v3（全量行，含显式版本号）。
+        # v3 腿失败必须显式抛错（由运维按 §16.1 写冻结降级回 S0），
+        # 禁止"v2 只读 + 新写丢弃"。
+        if dual_target:
+            # 先 ensure（新建 v3 必带显式字段），后守卫（已存在但缺字段的 v3 仍 fail-closed）
+            self.ensure_collection(dimension=vector_dimension, collection=dual_target)
+            if versioned and not self.has_content_revision_field(dual_target):
+                raise VectorStoreSchemaError(
+                    f"Milvus 双写目标 collection {dual_target} 缺少显式 content_revision 字段，"
+                    "禁止把版本号降级写入 dynamic metadata；请先完成 v3 collection 迁移"
+                    "或回退 S0（回退后新写只进 v2）"
+                )
+            try:
+                dual_result = client.upsert(collection_name=dual_target, data=rows)
+                require_upsert_count(dual_result, len(rows))
+            except VectorStoreUpsertError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 双写失败 fail-closed 上抛
+                raise VectorStoreUpsertError(
+                    f"Milvus S1 双写 v3 upsert 失败（primary {collection} 已写入，"
+                    f"§16.1 要求降级回 S0 而不是丢弃新写）：{exc}"
+                ) from exc
+        return primary_count
 
     def has_content_revision_field(self, collection: Optional[str] = None) -> bool:
         """collection 是否有显式 `content_revision` 字段（§8.5 v3 判据）。
@@ -323,6 +378,13 @@ class MilvusVectorStore:
             collection_name=collection,
             filter=filter_expr,
         )
+        # §16.1 S1 双写：删除同步应用到 v3 影子侧，避免 S2 切换后出现已删文档残留。
+        dual_target = self.config().get("dual_target_collection")
+        if dual_target and client.has_collection(dual_target):
+            client.delete(
+                collection_name=dual_target,
+                filter=filter_expr,
+            )
 
     def clear(self, kb_ids: List[str]) -> None:
         """按 kb 作用域删除向量；禁止 drop collection / 全库清空（手册 §11.4）。"""
@@ -336,6 +398,13 @@ class MilvusVectorStore:
                 collection_name=collection,
                 filter=filter_expr,
             )
+            # §16.1 S1 双写：kb 级清空同步应用到 v3 影子侧。
+            dual_target = self.config().get("dual_target_collection")
+            if dual_target and client.has_collection(dual_target):
+                client.delete(
+                    collection_name=dual_target,
+                    filter=filter_expr,
+                )
 
     def search(self, vector: List[float], limit: int, filter_expr: str = "") -> List[VectorSearchHit]:
         if not self.is_enabled() or not vector:
