@@ -1285,7 +1285,7 @@ PYTHONPATH= python tests/_w9_secret_baseline.py 97645ac10658867b268216a042290b73
 | 修复后绿 | run `37338598712`（event `pull_request`，`headSha=72bbe6b…`）`completed / success`；job `Go backend tests` 与 `Backend unified boundary guards` 均 `conclusion=success` |
 | CI 日志逐字 | `M5_BUILD_GRAPH_REVISION_SUMMARY passed=23 failed=0`、`SUMMARY total=21 failed=0`、`RBAC_CATALOG_PARITY_SUMMARY permissions=19/19 roles=4/4 passed=16 failed=0`（`gh run view 37338598712 --log` → `output/w10/ci_green_72bbe6b.log`） |
 
-PR #2 元数据（权威复核）：`gh pr view 2 --json commits --jq '.commits|length'` → **37**，`headRefOid=72bbe6b…`、`base=main`、`head=m5/dual-write`、`isDraft=true`（两次调用 `GH_EXIT=0`）。远端 `main` 仍为 `59332f4`。
+PR #2 元数据（权威复核）：`gh pr view 2 --json commits --jq '.commits|length'` → **37**，`headRefOid=72bbe6b…`、`base=main`、`head=m5/dual-write`、`isDraft=true`（两次调用 `GH_EXIT=0`）。远端 `main` 仍为 `59332f4`。这个计数读的是**本节这笔 docs 提交之前**的时点，任何后续 docs 提交都会让它 +1，所以它只描述当时那一笔；PR 描述里的最终笔数与 head 一律以 `gh pr view` / `git ls-remote` 实测为准，本节不复述，避免自己把自己刷旧。
 
 这条 Linux 绿是同一检查**首次在 Linux 上通过**，因此 18.1 的读侧折叠缺陷得到正向确认：修复前 Linux 必红、
 修复后 Linux 必绿，不是抖动。
