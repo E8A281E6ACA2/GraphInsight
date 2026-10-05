@@ -253,7 +253,10 @@ PostgreSQL/Neo4j/Milvus 上运行本报告，且 §5.1 canary runner、§7 处�
 1. ✅ `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）——**已满足**（2026-10-05）：
    代码见 §9.1；验证 `backend/tests/check_vector_dual_write.py` 23/23 PASS，已注册统一门禁
    `vector_dual_write`（套件 `SUMMARY total=17 failed=0`，EXIT=0）。
-2. 授权运行 §5.1 合成 schema canary（写 Milvus，需单独批准）。
+2. 授权运行 §5.1 合成 schema canary（写 Milvus，需单独批准）。**开工前置审计已完成**：
+   见 `docs/ENTERPRISE_M5_MILVUS_V3_CANARY_PREAUDIT.md`（三条写路径的显式 INT64 检查与
+   upsert 返回数量/状态校验均已具备，含 4 项发现 F1–F4 与 canary 强制要求）；canary 编排器
+   已就绪（授权门控，默认零连接）。
 3. C3 处置清单（§7）中所有待迁 KB 的 blocked/orphan/unrecoverable/scope_* 归零或有批准
    的例外。
 4. 双写一致性 + 切换 + 回滚五步的验收脚本就绪（§6 判据落到可执行断言）。
