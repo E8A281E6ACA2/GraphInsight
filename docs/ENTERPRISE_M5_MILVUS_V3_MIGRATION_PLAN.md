@@ -623,7 +623,15 @@ backfill 仍未开始；共享生产 Gate 继续 OPEN，M5-B1 继续冻结。
 **证据文件**（同 RUN_ID/EXEC_TIME，单 JSON 文档可 `json.load` 直过）：
 `E:/projects/gate0-evidence/2026-10-05/phase4/` 下 `phase4_steps.json` / `phase4_meta.txt` /
 `PHASE4_EVIDENCE_REPORT.txt`；离线自查脚本 `check_phase4_count_semantics.py` /
-`check_phase4_doc_consistency.py` 同目录。
+`check_phase4_doc_consistency.py` / `check_phase4_evidence_contract.py` 同目录。
+
+**文案更正（复核方 2026-10-05 提出，未改动任何数字/判据/结论）**：原报告与 meta 的红线表述
+"未写 v2/v3" 易被理解为"连本轮合成 canary v3 也未写"。准确口径已统一为
+**"未写入任何生产 v2/v3 集合；仅写入本轮合成 canary 集合（`graphinsight_chunks_v3_canary_*`，跑完已 drop）"**。
+处理方式：① 生成器模板已改（报告 RED LINES 与 meta NOTE 两处，并附合成集合名）；
+② 已产出的两份文本**保留原文**并追加 `CORRIGENDUM` 段（不改数字，合同复验仍过：
+`check_phase4_evidence_contract.py` 全绿）；③ 一致性检查加防复发断言（生成器与证据都必须带精确口径）。
+另：`upsert_raw_result` 自本轮起同时记录**结构化对象**与原文 `repr`（便于机器核对键名/数量）。
 
 ## 10. 与既有章节的对应
 
