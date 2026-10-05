@@ -16,7 +16,7 @@ from core.exceptions import ErrorCode, KnowledgeScopeError
 from services.embedding_service import embedding_service
 from services.rerank_service import rerank_service
 from services.runtime_config import get_retrieval_runtime_config
-from services.vector_store import VectorSearchHit, vector_store
+from services.vector_store import DualWriteShadowError, VectorSearchHit, vector_store
 
 
 logger = get_logger()
@@ -255,6 +255,16 @@ class RetrievalOrchestrator:
         revision、再传 map 进来，不允许默默写无版本向量。不传 map 时逐 chunk 保持 None
         （reindex_chunks / backfill 不走本方法，它们直接 `vector_store.upsert_chunks`
         并自带 target_revision；这里只剩测试旁路，保持原行为不炸）。
+
+        失败口径（Wave 3 / 用户 2026-10-04 定案"结构化：逐 chunk 失败清单 + 错误类别"）：
+        - `failure_details`：每个失败批次一条 `{chunk_ids, error, error_class, is_shadow}`。
+          `chunk_ids` 必须完整——调用方要按 chunk 回写 `vector_status='failed'` 并把这批
+          chunk 转交 reindex job，这里丢一个 id 就等于永久虚标 indexed。
+        - `failed_chunk_ids`：跨批次去重排序后的完整清单（同上，供调用方直接消费）。
+        - `failures`：仍保留有界的错误文本样例，只给日志/作业报错用，不再是收敛判据。
+        `error_class` 取异常类名（DualWriteShadowError / VectorStoreUpsertError /
+        VectorStoreSchemaError / 嵌入侧异常），`is_shadow` 单独成列：§16.1 S1 的影子脏写
+        必须与普通写失败区分，否则运维无法判断要不要迁 v3 collection。
         """
         # 作用域强制点：先于任何 enabled 检查，缺失即拒绝
         from services.scope_contract import require_kb_scope
@@ -274,14 +284,35 @@ class RetrievalOrchestrator:
         batch_size = int(cfg.get("batch_size") or 32)
         indexed = 0
         failures: List[str] = []
+        failure_details: List[Dict[str, Any]] = []
         for offset in range(0, len(chunks), batch_size):
+            window = chunks[offset : offset + batch_size]
+            # 空 text 的 chunk 不进批次也不会生成向量，但它确有 chunk_id/revision：
+            # 记成失败而不是静默过滤，否则调用方会把它当"无失败"回写 indexed。
+            empty_ids = sorted(
+                {
+                    str(item.get("chunk_id") or "").strip()
+                    for item in window
+                    if str(item.get("chunk_id") or "").strip() and not str(item.get("text") or "").strip()
+                }
+            )
+            if empty_ids:
+                failure_details.append(
+                    {
+                        "chunk_ids": empty_ids,
+                        "error": "chunk text 为空，未生成向量",
+                        "error_class": "CHUNK_TEXT_EMPTY",
+                        "is_shadow": False,
+                    }
+                )
             batch = [
                 item
-                for item in chunks[offset : offset + batch_size]
+                for item in window
                 if str(item.get("chunk_id") or "").strip() and str(item.get("text") or "").strip()
             ]
             if not batch:
                 continue
+            batch_chunk_ids = sorted({str(item.get("chunk_id") or "") for item in batch})
             try:
                 vectors = embedding_service.embed_texts([str(item.get("text") or "") for item in batch])
                 vector_chunks = [
@@ -309,12 +340,25 @@ class RetrievalOrchestrator:
                 indexed += vector_store.upsert_chunks(vector_chunks, vectors)
             except Exception as exc:  # noqa: BLE001
                 failures.append(str(exc))
-                logger.warning("Milvus chunk 索引写入失败", context={"error": str(exc), "offset": offset})
+                failure_details.append(
+                    {
+                        "chunk_ids": batch_chunk_ids,
+                        "error": str(exc)[:300],
+                        "error_class": type(exc).__name__,
+                        "is_shadow": isinstance(exc, DualWriteShadowError),
+                    }
+                )
+                logger.warning(
+                    "Milvus chunk 索引写入失败",
+                    context={"error": str(exc), "offset": offset, "chunk_count": len(batch_chunk_ids)},
+                )
         return {
             "enabled": True,
             "indexed": indexed,
             "kb_id": normalized_kb,
             "failures": failures[:5],
+            "failure_details": failure_details,
+            "failed_chunk_ids": sorted({cid for item in failure_details for cid in item["chunk_ids"]}),
             "embedding_model": str(cfg.get("model") or ""),
         }
 
