@@ -1153,3 +1153,161 @@ Windows stat-cache 假脏复跑（`git hash-object` 对 `git rev-parse HEAD:<pat
 - 草稿 PR：**#2** `https://github.com/E8A281E6ACA2/GraphInsight/pull/2`，`gh pr view` 复核 `isDraft=True`、`state=OPEN`、`base=main`、`head=m5/dual-write`、创建时 `commits=35`、`diff +11410/-280`。
 - 未做：合并、部署、共享库 `--confirm` 迁移、S2、通用白名单放行（`supportedJobTypes` 仍不含 `reindex_chunks`）。
 - 复核当前远端 SHA：`git ls-remote ssh://git@ssh.github.com:443/E8A281E6ACA2/GraphInsight.git refs/heads/m5/dual-write`
+
+---
+
+## 18. Wave 10：远端 CI 真红 → revision 检查折叠缺陷根因与修复
+
+**本轮指令口径**：PR 已推送并保持草稿，但因远端 CI 真红不能通过合并前验收。审查员在 PR #2 head `2d0305d`
+独立确认：36 笔提交、48 个文件，Go 测试与前端构建通过，两次统一门禁都是 `total=21 failed=1`，失败项
+`content_change_bumps_revision_in_real_build_graph`——传进去的 revision map 是 2，但检查读回的结果仍是
+rev1 的 `superseded` 行。据此三条硬要求：① 分别读取 current 行与历史行，明确断言"唯一 current=rev2、
+旧 rev1=superseded、投影版本对齐"，**不得只调整排序让断言碰巧通过**；② 修复后重跑该检查与统一门禁，
+推送修复提交，取得最新 head 对应的 CI 绿态；③ 更新 PR 描述（仍写 35 笔提交、远端 `4ccaf30`；"入口仍是
+404"须限定到未开放路径，明确专用 `/reindex-chunks` 已实现；本地结果与远端 CI 分开记录）。
+
+审查员对四项待拍板的裁定（本轮据此执行，不再申请）：通用白名单继续关闭；PR 保持 draft、先修 CI 再进
+完整代码评审、暂不合并；共享库 `--confirm` 与 S2 暂不放行；DNS 另立运维议题（单个 IP 超时不足以证明
+DNS 配置错误，官方 SSH-over-443 已可用，**不必为本 PR 修改系统 DNS**）。另：W9-F1 的 `0xD800` 已被审查员
+独立核验为正确；新增 hash 变体向量已在 CI 通过。
+
+### 18.1 先认账：这不是环境假红，是测试缺陷
+
+上一轮我把"本地 21/0、CI 21/1"当成需要解释的落差，审查员的指认是对的：**缺陷在读侧**，本地绿只是
+同一缺陷在 Windows 上恰好落到了另一侧。取证顺序（先证据后结论）：
+
+1. 拉取失败 run 的原始日志（`37333244923`、`37333267865`，两者 `conclusion=failure`），失败行逐字为：
+
+   ```
+   CHECK content_change_bumps_revision_in_real_build_graph FAIL docs=1 bumped=[] map={'doc-w2-000': 2}
+     rows={'doc-w2-000': {'rev': 1, 'status': 'superseded', 'graph_rev': 1, 'vector_rev': 1, ...}}
+   ```
+
+   `map` 是服务真实传入的（rev=2，说明写侧行为正确），`rows` 是检查自己查回来的（rev=1 且
+   `status=superseded`）。写侧对、读侧错 → 断言的失败不在产品代码里。
+2. 读 `backend/tests/check_m5_build_graph_revision.py:296` 的 `rows()`：它
+   `SELECT … FROM chunk_revisions WHERE kb_id=:kb AND doc_id=:doc ORDER BY chunk_id` 取了**该文档全部
+   历史 revision 行**，再用 `{str(row[0]): {...} for row in found}` 以 `chunk_id` 单键折叠。
+3. 该文档此时有 2 行（`content_revision=1` 已 `superseded`、`=2` 为 `current`），`ORDER BY chunk_id`
+   对同一 `chunk_id` 的两行**不做区分**，谁留在 dict 里取决于数据库返回顺序 → 平台相关（Linux CI 取到
+   rev1，Windows 本地取到 rev2）。这就是"本地绿、CI 红"的机制，与 `bumped=[]` 完全自洽：
+   判据要求 `rev==2` 的行存在，而 dict 里唯一那条值是 rev1。
+
+结论：**必须改读语义**，排序本身不是可修复的正确性来源。
+
+### 18.2 修复：按 `revision_status` 分离读取，并把"唯一 current"变成显式断言
+
+`chunk_revisions` 上有部分唯一索引 `uq_chunk_revisions_current`（§15.1，数据库级强制"每
+(kb_id, chunk_id) 至多一条 `current`"）。修复就是把这条不变量搬到读侧，让两次读取各自最多命中一行：
+
+```python
+def _select_rows(where_status: str) -> list[dict]:
+    # 按 revision_status 分离读取，绝不把同一 chunk 的多条 revision 折进同一个键。
+    … WHERE kb_id = :kb AND doc_id = :doc AND revision_status = :status
+      ORDER BY chunk_id, content_revision
+
+def rows() -> dict:                    # current 行（带重复 current 守卫）
+    by_chunk: dict = {}
+    for item in _select_rows("current"):
+        assert item["chunk_id"] not in by_chunk, f"同一 chunk 出现两条 current：{item['chunk_id']}"
+        by_chunk[item["chunk_id"]] = item
+    return by_chunk
+
+def history_rows() -> list[dict]:      # 历史行按列表保留，不折叠
+    return _select_rows("superseded")
+
+def raw_row_count() -> int:            # 该文档在 chunk_revisions 里的总行数
+```
+
+判据（`content_change_bumps_revision_in_real_build_graph`，全部为 `and` 串联，不再依赖 dict 里"恰好剩哪条"）：
+
+- `result3["documents"] == 1`，服务侧 `content_revisions` map 的键集合等于本次 `chunk_ids` 且值全为 2；
+- `len(final) == 1` 且 `current_rev2 == set(final)`——**唯一 current 行就是 rev2**；
+- `rev1_superseded == bumped` 且 `len(history) == 1`——**旧 rev1 确为 superseded 且只有一条**；
+- `raw_n == 2`——库里确实是两条历史，折叠无处藏身；
+- `aligned`：每条 current 的 `graph_content_revision == 2`、`vector_content_revision == 2`、
+  `graph_status == 'indexed'`，即**投影版本与新 revision 对齐**（新拆出独立判据
+  `content_change_projection_versions_align_with_new_revision` 再断言一次，含 `history[0]["rev"] == 1`）。
+
+关于"不要只调整排序"：`ORDER BY` 里加了 `content_revision` 只为让 `history_rows()` 的输出稳定可读，
+**它不参与任何判据成立**——两次读取已被 `revision_status` 谓词分开，在每个状态内同一 `chunk_id` 最多
+出现一次（部分唯一索引保证），因此无论数据库以什么顺序返回都不可能发生折叠。这一点由 18.3 的变异取证
+直接证明，而不是靠叙述。
+
+其余 `rows()` 调用点（:345/:351/:405/:444/:477/:486/:489）执行时该文档只有一条 revision，改后的语义
+（"current 行"）与原先等价，并且额外获得重复 current 守卫。
+
+### 18.3 变异取证：证明新断言会咬，而不是构造上恒真
+
+同一脚本内完成"变异 → 跑 → 按字节还原 → 再跑"，还原后与工作树 blob 逐字节一致（`RESTORED_IDENTICAL=True`）：
+
+| 变异 | 预期 | 实跑 |
+|---|---|---|
+| M1：`rows()` 误读 `superseded` | 必须变红 | `rc=1`，`bumped=[]`、`current={… 'rev': 1, 'status': 'superseded'}`，`passed=20 failed=3` |
+| M2：去掉 `revision_status` 过滤 | 必须撞上重复 current 守卫 | `rc=1`，`AssertionError: 同一 chunk 出现两条 current：doc-w2-000` |
+| 还原 | 必须变绿 | `rc=0`，`passed=23 failed=0` |
+
+如实记录一处瑕疵：M2 那行断言消息在 `output/w10/mutation_w10.log` 里呈 mojibake——是采集脚本按错误
+代码页解码子进程 stderr 造成的**日志问题**，不是产品代码问题；断言本身生效（`rc=1`），检查脚本自身
+已 `sys.stdout.reconfigure` 强制 UTF-8。
+
+### 18.4 本地结果（与远端 CI 分开记录）
+
+```bash
+cd backend
+PYTHONPATH= python tests/check_m5_build_graph_revision.py
+PYTHONPATH= python tests/run_unified_boundary_guards.py
+PYTHONPATH= python tests/check_m5_p6_disposable_pg.py
+PYTHONPATH= python tests/_w9_secret_baseline.py 97645ac10658867b268216a042290b732cfdb641
+```
+
+| 项 | 本轮实跑 |
+|---|---|
+| revision 检查 | `M5_BUILD_GRAPH_REVISION_SUMMARY passed=23 failed=0`，EXIT=0 |
+| 统一门禁 | `SUMMARY total=21 failed=0`（含 `SECRET_SCAN_SELFTEST_SUMMARY assertions=53 failed=0`） |
+| 一次性 PG + Go 写侧 | `P6_DISPOSABLE_SUMMARY criteria=14 failed_criteria=0 failed_steps=0 go_phases=2 skipped=0`，`RESULT: PASS`；`docker ps -a --filter name=gi-p6` 与 `docker network ls --filter name=gi-p6` 均空（零残留，退出码 0） |
+| 固定基线密钥复核 | `SECRET_BASELINE_SUMMARY files=19 new_findings=0 failed=0`（`rc=1` 只出现在基线与工作树同为 23 条的 `[baseline]` 文件上，`new=0`） |
+| Go（linux 容器 `golang:1.27`，挂载宿主 module cache、`GOPROXY=off`） | `gofmt -l`（9 个改动文件逐字列出）输出为空；`BUILD_EXIT=0`、`VET_EXIT=0`、`TEST_EXIT=0`；8 个包 `ok`、0 `FAIL` |
+
+**证据自我更正（必须留痕）**：本轮第一次 Go 容器取证用错了挂载与 `-w`（挂 `go-backend` 子目录、未挂
+宿主 module cache），`go build` 因 `module lookup disabled by GOPROXY=off` 根本没编译成功，`gofmt -l .`
+还打印了整仓文件清单。那份日志（`output/w10/go_suite_w10.log`）**作废，不得作为 Go 证据引用**；
+正确命令见 §16.8 / §14.7（`-v "E:/projects/GraphInsight:/src" -v "C:/Users/yh/go:/go" -w /src/go-backend`），
+重跑结果为 `output/w10/go_suite_w10_v2.log`，即上表那一行。
+
+### 18.5 远端 CI（权威源，逐条留退出码）
+
+| 事实 | 证据 |
+|---|---|
+| 修复前红 | run `37333244923`、`37333267865`（head `2d0305d`）`conclusion=failure`，`total=21 failed=1` |
+| 修复提交 | `72bbe6b test(m5): 修 revision 检查按 chunk_id 折叠多 revision 行的缺陷（CI 21/1 根因）`，只 stage `backend/tests/check_m5_build_graph_revision.py`；推送 `2d0305d..72bbe6b m5/dual-write -> m5/dual-write`，`PUSH_EXIT=0` |
+| 远端 head | `git ls-remote ssh://git@ssh.github.com:443/E8A281E6ACA2/GraphInsight.git refs/heads/m5/dual-write` → `72bbe6bba9bb920d3d636f282e9bcd25cf471bc8`，`LSREMOTE_EXIT=0`（未使用本地 tracking ref） |
+| 修复后绿 | run `37338598712`（event `pull_request`，`headSha=72bbe6b…`）`completed / success`；job `Go backend tests` 与 `Backend unified boundary guards` 均 `conclusion=success` |
+| CI 日志逐字 | `M5_BUILD_GRAPH_REVISION_SUMMARY passed=23 failed=0`、`SUMMARY total=21 failed=0`、`RBAC_CATALOG_PARITY_SUMMARY permissions=19/19 roles=4/4 passed=16 failed=0`（`gh run view 37338598712 --log` → `output/w10/ci_green_72bbe6b.log`） |
+
+PR #2 元数据（权威复核）：`gh pr view 2 --json commits --jq '.commits|length'` → **37**，`headRefOid=72bbe6b…`、`base=main`、`head=m5/dual-write`、`isDraft=true`（两次调用 `GH_EXIT=0`）。远端 `main` 仍为 `59332f4`。
+
+这条 Linux 绿是同一检查**首次在 Linux 上通过**，因此 18.1 的读侧折叠缺陷得到正向确认：修复前 Linux 必红、
+修复后 Linux 必绿，不是抖动。
+
+### 18.6 边界与未做事项
+
+- 未合并、未部署、未执行共享库 `--confirm` 迁移、未进 S2、通用白名单未开放（`supportedJobTypes` 仍不含
+  `reindex_chunks`）；专用 `/api/admin/jobs/reindex-chunks` 端点已实现并有 Go 集成判据覆盖。
+- 未改系统 DNS / hosts，未关闭任何 TLS 校验；GitHub 连通性走 `ssh.github.com:443`，DNS 议题另立运维条目。
+- `stash@{0}`/`stash@{1}`（GI-11）仍未触碰。
+- 密钥扫描口径不变：CI 扫描范围只有 `artifacts/playwright-report/test-results/logs/dev`；
+  `frontend/src`、`go-backend`、`docs` 是**待复核项**，本报告任何位置都不声明"全仓库扫描通过"。
+- Windows stat-cache 假脏复跑（`git hash-object` vs `git rev-parse HEAD:<path>`）：`git status` 报 M 的
+  8 个 `go-backend/internal/adminstore/*.go` 判 SAME、未 stage；本轮只提交真实改动的那一个测试文件。
+- 本节（§18）为 docs-only 提交，其后一笔提交的 CI 结果记在 PR 描述与交审话术里，不在本节宣称。
+
+### 18.7 交审可复查入口
+
+- 修复 diff：`git show 72bbe6b -- backend/tests/check_m5_build_graph_revision.py`
+- 检查脚本：`backend/tests/check_m5_build_graph_revision.py`（`_select_rows` / `rows` / `history_rows` / `raw_row_count`
+  与两条判据 `content_change_bumps_revision_in_real_build_graph`、
+  `content_change_projection_versions_align_with_new_revision`）
+- 本地日志：`output/w10/{revision_check_fixed.log,unified_guards_w10.log,p6_disposable_pg_w10.log,secret_baseline_w10_finaltree.log,go_suite_w10_v2.log,mutation_w10.log}`
+- 远端日志：`output/w10/ci_green_72bbe6b.log`（run `37338598712`）
+- 作废日志（勿引用）：`output/w10/go_suite_w10.log`
