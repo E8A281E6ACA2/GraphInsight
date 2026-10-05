@@ -80,6 +80,17 @@ class Harness:
         )
         return proc.returncode, proc.stdout + proc.stderr
 
+    def guard_sqlite(self) -> None:
+        """方言 fail-closed（Wave 4-3 隔离铁律）：夹具必须是 sqlite。
+
+        判据形态与既有 driver 一致：子进程回读 `engine.dialect.name` 并打印 `DIALECT`，
+        非 sqlite 立即判红——防止注入的 env 被 backend/.env 覆盖后回落共享开发库。
+        """
+        code, out = self.run_python_code(
+            "from admin.database import engine; print('DIALECT', engine.dialect.name)"
+        )
+        step("引擎隔离守卫（必须 sqlite）", code == 0 and "DIALECT sqlite" in out, out[-300:])
+
     def run_python_code(self, code: str) -> tuple:
         env = dict(os.environ)
         env["PYTHONUTF8"] = "1"
@@ -157,6 +168,13 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="m5a-manifest-") as raw:
         tmp = Path(raw)
         h = Harness(tmp)
+
+        print("[T0] 夹具隔离守卫")
+        # 必须先写 env 文件：admin/database.py 只在 ADMIN_DATABASE_URL 指向**存在的文件**时才走
+        # 隔离分支，否则回落 backend/.env 的共享开发 PG（本脚本初版把探针放在 use_db 之前，
+        # 探针实测回落到 postgresql —— 正是该守卫要防的形态，已修正顺序）。
+        h.use_db("guard.db")
+        h.guard_sqlite()
 
         print("[T1/T2/T3] 执行模式清单")
         mdir = tmp / "mf_exec"

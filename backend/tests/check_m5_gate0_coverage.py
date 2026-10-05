@@ -64,6 +64,10 @@ def _make_engine():
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
+    # 方言 fail-closed（Wave 4-3 隔离铁律）：本夹具必须是 sqlite 内存库。
+    # 一旦 URL 被环境/默认配置改写成 PG，这里立刻退出，绝不把 DDL 打到共享开发库。
+    if engine.dialect.name != "sqlite":
+        raise SystemExit(f"isolation broken: engine dialect is {engine.dialect.name}, expected sqlite")
     with engine.begin() as conn:
         conn.execute(
             text("CREATE TABLE knowledge_bases (id VARCHAR PRIMARY KEY, status VARCHAR)")

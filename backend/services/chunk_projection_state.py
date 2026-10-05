@@ -127,3 +127,82 @@ def _worse(current: str, candidate: str) -> str:
     current_rank = PROJECTION_PRIORITY.get(current, PROJECTION_PRIORITY["pending"])
     candidate_rank = PROJECTION_PRIORITY.get(candidate, PROJECTION_PRIORITY["pending"])
     return candidate if candidate_rank < current_rank else current
+
+
+def write_back_job_failure(
+    kb_id: str,
+    targets: List[Dict[str, Any]],
+    *,
+    keep_vector_untouched: bool = False,
+) -> Dict[str, Any]:
+    """作业（父）终态 failed → 投影（子）回写（§15.5，用户 2026-10-04 定案口径）。
+
+    规则：
+    - 只降级"尚未收敛"的那一侧：`graph_status/vector_status <> 'indexed'` 才置 'failed'
+      （CASE 在旧行值上求值，两条腿各自独立判断）。已 indexed 的腿不回退——作业失败不代表
+      已成功写入的那条腿失败，回退会把可审计的收敛态擦成 pending/failed。
+    - `keep_vector_untouched=True`：§8.5 的 REVISION_FIELD_ABSENT / INDEX_UNAVAILABLE 属
+      "collection 缺字段"而非写入失败，vector 保持 pending 等 v3 迁移，这里整列不动。
+    - CAS：`content_revision = target_revision AND revision_status='current'`。current 已被
+      并发移动就跳过（§8.3 旧任务保护），计入 `current_moved` 而不是补写。
+    - 返回 `doc_ids` 供调用方跑 `aggregate_document_states`，让文档级同步落 failed。
+
+    不新增迁移，复用 chunk_revisions 既有列。
+    """
+    clean_kb = str(kb_id or "").strip()
+    if not clean_kb:
+        raise ValueError("write_back_job_failure 需要 kb_id")
+    report: Dict[str, Any] = {"targets": 0, "updated": 0, "current_moved": 0, "doc_ids": []}
+    chunk_ids: List[str] = []
+    by_chunk: Dict[str, int] = {}
+    for item in targets:
+        chunk_id = str(item.get("chunk_id") or "").strip()
+        try:
+            revision = int(item.get("target_revision"))
+        except (TypeError, ValueError):
+            raise ValueError(f"target_revision 非法: chunk_id={chunk_id}") from None
+        if not chunk_id or revision < 1:
+            raise ValueError(f"write_back_job_failure 需要合法 chunk_id 与 target_revision>=1: {item}")
+        if chunk_id in by_chunk:
+            continue
+        by_chunk[chunk_id] = revision
+        chunk_ids.append(chunk_id)
+    if not chunk_ids:
+        return report
+
+    assignments = [
+        "graph_status = CASE WHEN graph_status <> 'indexed' THEN 'failed' ELSE graph_status END",
+        "graph_content_revision = CASE WHEN graph_status <> 'indexed' THEN NULL ELSE graph_content_revision END",
+    ]
+    if not keep_vector_untouched:
+        assignments += [
+            "vector_status = CASE WHEN vector_status <> 'indexed' THEN 'failed' ELSE vector_status END",
+            "vector_content_revision = CASE WHEN vector_status <> 'indexed' THEN NULL ELSE vector_content_revision END",
+        ]
+    with _engine().begin() as conn:
+        if not inspect(conn).has_table("chunk_revisions"):
+            raise RuntimeError("chunk_revisions 表不存在，无法回写作业终态")
+        rows = conn.execute(
+            text(
+                f"SELECT doc_id, chunk_id FROM chunk_revisions WHERE kb_id = :kb_id "
+                f"AND revision_status = 'current' AND chunk_id IN ({_placeholders(chunk_ids)})"
+            ),
+            {"kb_id": clean_kb, **{f"doc_{i}": cid for i, cid in enumerate(chunk_ids)}},
+        ).fetchall()
+        report["targets"] = len(rows)
+        report["doc_ids"] = sorted({str(r[0]) for r in rows if str(r[0] or "").strip()})
+        for chunk_id, revision in sorted(by_chunk.items()):
+            result = conn.execute(
+                text(
+                    f"UPDATE chunk_revisions SET {', '.join(assignments)} "
+                    "WHERE kb_id = :kb_id AND chunk_id = :chunk_id "
+                    "AND content_revision = :expected_revision AND revision_status = 'current'"
+                ),
+                {"kb_id": clean_kb, "chunk_id": chunk_id, "expected_revision": revision},
+            )
+            rowcount = int(result.rowcount or 0)
+            if rowcount:
+                report["updated"] += 1
+            else:
+                report["current_moved"] += 1
+    return report

@@ -8,7 +8,9 @@ from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-JobType = Literal["build_graph", "clear_kb", "reindex"]
+# reindex_chunks（M5-B0 worker / §8.2）必须在此登记：JobItem.job_type 用它做校验，
+# 缺字面量时任务中心 list/get 一读到 reindex_chunks 行就抛 ValidationError，整个列表页 500。
+JobType = Literal["build_graph", "clear_kb", "reindex", "reindex_chunks"]
 JobStatus = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 
 
@@ -34,6 +36,8 @@ class JobItem(BaseModel):
     max_retries: int = 3
     requested_by: Optional[int] = None
     trace_id: Optional[str] = None
+    # §16.3 去重键：运维要能看出两条 job 是"同一批 targets 复用"还是"另一次提交"。
+    targets_hash: Optional[str] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     created_at: datetime
