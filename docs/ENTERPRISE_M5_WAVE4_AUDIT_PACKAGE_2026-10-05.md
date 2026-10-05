@@ -22,18 +22,20 @@ Wave 4 交审后再裁定方向 B 与 push。
 | 项 | 值 |
 |---|---|
 | 分支 | `m5/dual-write`（本地） |
-| 本地 HEAD | `ee7002529b3345523b5bcd0fa0c7606366be8f44` |
+| 本地 HEAD | `6cabff9`（本包与守卫两笔交付提交后的树）。其后仅有 docs 修正笔，**终值请用 `git rev-parse --short HEAD` 现取** |
 | 权威远端 `main` | `59332f42503443872d382dbce0710c7226175abb`（`git ls-remote origin main` 取值，非本地缓存） |
-| 领先提交数 | `git rev-list --count 59332f4..HEAD` = **19** |
+| 领先提交数 | `git rev-list --count 59332f4..HEAD`；`6cabff9` 树 = **21**（docs 修正笔后为 22，以命令现值为准） |
 | 远端分支 | `git ls-remote origin 'refs/heads/m5*'` = 空 → **Wave 0–4 全部提交均未推送** |
 | 已推送？ | 否。本轮无任何 push / amend / force；未改 `remote.origin.url`、hosts、证书校验 |
-| 提交集规模 | `git diff --shortstat origin/main..HEAD` = 25 files changed, 5011 insertions(+), 147 deletions(-) |
+| 提交集规模 | `git diff --shortstat 59332f4..HEAD`；在 `6cabff9` 树实测 = 28 files changed, 5461 insertions(+), 162 deletions(-)。本包随后还有文档修正笔，**以复核命令现值为准**，不要把本行当终值 |
 | Wave 4 改动面 | 6 项：守卫脚本、两处 docstring 口径改正、迁移方案 §9.4、本审计包、`.gitignore` 白名单行；分两笔本地提交（守卫笔 + 文档笔），**均未 push** |
 
 Wave 0–4 逐笔（`git log --oneline origin/main..HEAD`，新→旧）：
 
 | SHA | 类型 | 意图 |
 |---|---|---|
+| `6cabff9` | docs | Wave 4 审计交付包 + §9.4 记录 + Go 侧过期引用修正（`supportedJobTypes` / 400 `INVALID_BODY`，409 NOT-IMPLEMENTED） |
+| `5034fcb` | test | Wave 4-3 建引擎脚本隔离守卫（禁裸 `DATABASE_URL`、方言闸门、钉 env/URL/sqlite） |
 | `ee70025` | test | Wave 3 连续场景取证 `check_m5_wave3_handoff.py` + 注册统一门禁 |
 | `856f7de` | feat | reindex_chunks 提交路径走去重入队 + 作业终态失败回写投影 |
 | `e3aca62` | fix | `targets_hash` 不在 ORM 声明单列索引，恢复迁移回滚可执行 |
@@ -200,7 +202,7 @@ Neo4j/Milvus，而 Go 建任务端点一旦放行就会入队并被 worker 消�
 | P1 | 是否让 Go 放行 `reindex_chunks`（写侧开门） | 推荐 **暂不放行**：先补 W4-F6 的 Go 单测（白名单 + 400 语义）再开，避免开门无网；零迁移、零成本 |
 | P2 | `targets_hash` 是否进 Go DTO + 前端类型/筛选 | 推荐 **下一波最小闭环**：Go `JobItem` 加字段、前端 `JobType` 加字面量 + `jobTypeOptions` 加项；不改 DB、不新增迁移 |
 | P3 | §16.3 的 409 语义要不要真做 | 推荐 **不做**，改文档口径为"超限拒绝走 Python 3xxx `OPERATION_NOT_ALLOWED` + 结构化 details；Go 提交路径未落地"（本轮已按此改正三处旧误述） |
-| P4 | 方向 B 与 push | 本包交审后由用户裁定；当前 19 笔只在本地 |
+| P4 | 方向 B 与 push | 本包交审后由用户裁定；当前所有提交只在本地（`git ls-remote origin 'refs/heads/m5*'` 为空） |
 
 ## 10. 复核命令（可直接复制）
 
