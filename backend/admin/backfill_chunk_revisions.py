@@ -39,6 +39,17 @@ chunk_revisions 存量 backfill（M5-A，设计 §9 / §15.3 / §16.2 / §17.1 v
     python backend/admin/backfill_chunk_revisions.py --kb <kb_id> --dry-run
     python backend/admin/backfill_chunk_revisions.py --kb <kb_id>
 
+运行清单（backfill run manifest，v3 backfill 路线图阶段 2）：
+    每轮执行（含 dry-run 与异常中止）在 finally 落盘一份单 JSON 文档清单：
+    trace_id / mode / capabilities / inventory / gate_decision / writes（含
+    inserted_chunk_ids 与失败 id）/ reindex_jobs / gate_final / exception /
+    exit_code。目录来源：--manifest-dir > 环境变量 BACKFILL_MANIFEST_DIR >
+    未设置（不落盘）。写入成功打印 `RUN_MANIFEST path=<file>`；失败打印
+    `RUN_MANIFEST_WRITE_FAILED`（不改变退出码语义——清单是审计产物，门判定
+    仍由数据库状态与 evaluate_gate 决定；编排器须对清单缺失 fail-closed）。
+    异常也留痕（exception + exit_code=1），供 disposable 验证的失败注入与
+    幂等重跑对账。同轮复跑产生新 trace_id 新文件，历史清单不覆盖不追加。
+
 退出码：
     0 = 成功（dry-run，或执行且前置门 CLOSED / CLOSED_DEGRADED）
     1 = 执行错误
@@ -51,6 +62,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -76,6 +88,74 @@ settings = get_settings()
 JOB_TYPE = "reindex_chunks"
 MILVUS_QUERY_LIMIT = 16384
 MAX_MILVUS_QUERY_PASSES = 64
+MANIFEST_SCHEMA = "m5a-backfill-manifest-v1"
+_MANIFEST_ENV = "BACKFILL_MANIFEST_DIR"
+# run(manifest_dir=...) 的三态：UNSET=按环境变量解析；None=显式关闭；Path=显式目录
+_UNSET = object()
+
+
+def _resolve_manifest_dir(manifest_dir: Any) -> Optional[Path]:
+    """三态解析：显式 Path 优先，其次 BACKFILL_MANIFEST_DIR，未设置=不落盘。"""
+    if manifest_dir is _UNSET:
+        raw = (os.environ.get(_MANIFEST_ENV) or "").strip()
+        return Path(raw) if raw else None
+    if manifest_dir is None:
+        return None
+    return Path(str(manifest_dir))
+
+
+def _new_manifest(kb_id: str, mode: str, trace_id: str, started_at: datetime) -> Dict[str, Any]:
+    """清单骨架：writes 恒在且零值起步（dry-run 契约 = 全零写入）。"""
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "trace_id": trace_id,
+        "kb_id": kb_id,
+        "mode": mode,
+        "started_at": started_at.isoformat(),
+        "finished_at": None,
+        "duration_ms": None,
+        "exit_code": None,
+        "outcome": None,
+        "exception": None,
+        "capabilities": {},
+        "inventory": {},
+        "gate_decision": {},
+        "gate_final": None,
+        "writes": {
+            "pg_rows_inserted": 0,
+            "pg_insert_conflicts_skipped": 0,
+            "inserted_chunk_ids": [],
+            "neo4j_indexed": 0,
+            "neo4j_failed": 0,
+            "milvus_upserted": 0,
+            "milvus_failed": 0,
+            "milvus_skipped": 0,
+            "revision_field_absent": 0,
+            "projection_state_updated": 0,
+            "state_write_failed": 0,
+            "state_write_failed_ids": [],
+        },
+        "reindex_jobs": {"enqueued": 0, "reused": 0, "targets": 0},
+        "manifest_write_ok": False,
+    }
+
+
+def _write_manifest(manifest_dir: Optional[Path], mf: Dict[str, Any]) -> None:
+    """清单落盘：单 JSON 文档（json.load 必须直过，证据合同）；失败只响铃不改退出码。"""
+    mf["manifest_write_ok"] = False
+    if manifest_dir is None:
+        return
+    try:
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        path = manifest_dir / f"{mf['trace_id']}.json"
+        # 落盘标记必须在序列化之前置真，否则文件里的 manifest_write_ok 永远是 false，
+        # 编排器会把它读成"本轮清单不可信"（自证失败）。
+        mf["manifest_write_ok"] = True
+        path.write_text(json.dumps(mf, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        print(f"RUN_MANIFEST path={path}")
+    except Exception as exc:  # noqa: BLE001 - 清单失败不允许掩盖/改写门判定退出码
+        mf["manifest_write_ok"] = False
+        print(f"RUN_MANIFEST_WRITE_FAILED trace_id={mf['trace_id']} error={exc}", file=sys.stderr)
 
 
 @dataclass
@@ -948,10 +1028,34 @@ def _print_report(inventory: Inventory, gate: Dict[str, Any], dry_run: bool) -> 
     print(f"[gate] {status} mode={mode} needs_reindex={gate['needs_reindex']} blocked={gate['blocked']}")
 
 
-def run(kb_id: str, dry_run: bool) -> int:
-    trace_id = f"backfill-{kb_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+def _run_impl(kb_id: str, dry_run: bool, trace_id: str, mf: Dict[str, Any]) -> int:
     inventory = build_inventory(kb_id)
     gate = evaluate_gate(inventory)
+    mf["capabilities"] = {
+        "graph_enabled": inventory.graph_enabled,
+        "vector_enabled": inventory.vector_enabled,
+        "milvus_collection": inventory.milvus_collection,
+        "milvus_revision_field": inventory.milvus_revision_field,
+    }
+    mf["inventory"] = {
+        "neo4j_chunks": inventory.neo4j_count,
+        "milvus_chunks": inventory.milvus_count,
+        "parsed_chunks": inventory.parsed_count,
+        "overlap": inventory.overlap_count,
+        "revision_rows_current": inventory.revision_row_count,
+        "new_chunks": len(inventory.new_chunks),
+        "needs_reindex_targets": len(inventory.needs_reindex_targets),
+        "converged": inventory.converged,
+        "blocked": inventory.blocked,
+        "orphan_revisions": len(inventory.orphan_revisions),
+        "rows_skipped_existing": inventory.rows_skipped_existing,
+        "content_mismatch": inventory.content_mismatch,
+        "unrecoverable": len(inventory.unrecoverable),
+        "scope_unresolved": len(inventory.scope_unresolved),
+        "scope_mismatches": len(inventory.scope_mismatches),
+        "kb_scope_missing": inventory.kb_scope_missing,
+    }
+    mf["gate_decision"] = dict(gate)
 
     # 作用域冲突 fail-closed：先于任何写入与 dry-run 分支拒绝（审计修复 #4）
     if inventory.scope_mismatches:
@@ -963,6 +1067,7 @@ def run(kb_id: str, dry_run: bool) -> int:
                 exit_code=2,
                 details={"reason": "SCOPE_MISMATCH", "count": len(inventory.scope_mismatches)},
             )
+        mf["outcome"] = "rejected_scope_mismatch"
         print(f"✗ 拒绝执行：SCOPE_MISMATCH {len(inventory.scope_mismatches)} 处，零写入")
         return 2
 
@@ -978,6 +1083,7 @@ def run(kb_id: str, dry_run: bool) -> int:
                     "count": len(inventory.unrecoverable),
                 },
             )
+            mf["outcome"] = "dry_run_rejected_unrecoverable"
             print("✗ UNRECOVERABLE_MISMATCH：dry-run 终止，禁止写入，请走受控清库分支")
             return 2
         if inventory.scope_unresolved:
@@ -990,6 +1096,7 @@ def run(kb_id: str, dry_run: bool) -> int:
                     "count": len(inventory.scope_unresolved),
                 },
             )
+            mf["outcome"] = "dry_run_rejected_scope_unresolved"
             print(
                 f"✗ SCOPE_UNRESOLVED：{len(inventory.scope_unresolved)} 个 chunk 作用域三件套不全，"
                 "dry-run 终止，禁止写入（先补 knowledge_bases 登记或走 reindex 重建，不得伪造作用域落库）"
@@ -1008,16 +1115,19 @@ def run(kb_id: str, dry_run: bool) -> int:
                 "scope_unresolved": gate["scope_unresolved"],
             },
         )
+        mf["outcome"] = "dry_run_completed"
         print("✓ dry-run completed，未写库")
         return 0
 
     if inventory.unrecoverable:
         _print_report(inventory, gate, dry_run=True)
+        mf["outcome"] = "rejected_unrecoverable"
         print("✗ 拒绝执行：存在 UNRECOVERABLE_MISMATCH chunk，先走受控清库（§9 备选）")
         return 2
 
     if inventory.scope_unresolved:
         _print_report(inventory, gate, dry_run=True)
+        mf["outcome"] = "rejected_scope_unresolved"
         print(
             f"✗ 拒绝执行：SCOPE_UNRESOLVED {len(inventory.scope_unresolved)} 个 chunk，零写入"
             "（作用域三件套不全，禁止伪造 tenant/project 落库）"
@@ -1026,6 +1136,9 @@ def run(kb_id: str, dry_run: bool) -> int:
 
     print(f"[backfill] trace_id={trace_id}")
     pg = _insert_revision_rows(kb_id, inventory.new_chunks, trace_id)
+    mf["writes"]["pg_rows_inserted"] = len(pg["inserted_ids"])
+    mf["writes"]["pg_insert_conflicts_skipped"] = pg["existing"]
+    mf["writes"]["inserted_chunk_ids"] = sorted(pg["inserted_ids"])
     # 仅对本次真正新插入 revision 1 行的 chunk 补写索引侧（重复跑不触碰已有行，§17.1）
     inserted_ids = set(pg["inserted_ids"])
     fresh_plans = [plan for plan in inventory.new_chunks if plan.chunk_id in inserted_ids]
@@ -1105,6 +1218,12 @@ def run(kb_id: str, dry_run: bool) -> int:
     if state_write_failed:
         print("✗ projection state CAS did not update exactly one current row; gate remains OPEN")
 
+    for key in ("neo4j_indexed", "neo4j_failed", "milvus_upserted", "milvus_failed",
+                "milvus_skipped", "revision_field_absent", "state_write_failed"):
+        mf["writes"][key] = counts[key]
+    mf["writes"]["projection_state_updated"] = len(fresh_plans) - len(state_write_failed)
+    mf["writes"]["state_write_failed_ids"] = sorted(state_write_failed)
+
     # 入队必须基于写入之后的新鲜 inventory（活栈执行态取证发现的静默漏排）：
     # 决策时清单只包含"本轮之前就有 current 行"的 chunk，本轮新写入但投影未收敛的 chunk
     # （例如 §8.5 下 vector 保持 pending）不在其中。若沿用决策时清单，同一轮最终报告会把它
@@ -1126,18 +1245,55 @@ def run(kb_id: str, dry_run: bool) -> int:
 
     # job 尚未执行时 needs_reindex 不收敛，门保持 OPEN
     fresh_gate = evaluate_gate(fresh_inventory)
+    mf["reindex_jobs"] = dict(job_report)
+    mf["gate_final"] = dict(fresh_gate)
     _print_report(fresh_inventory, fresh_gate, dry_run=False)
     if not fresh_gate["closed"]:
+        mf["outcome"] = "gate_open"
         print("✗ 前置门 OPEN：backfill 技术迁移完成，但 needs_reindex/blocked 投影未收敛，M5-A 验收门未关闭")
         return 3
+    mf["outcome"] = "completed"
     print("✓ backfill 完成，前置门 CLOSED" + ("（含 DEGRADED_SKIPPED，不得宣布完整索引验收通过）" if fresh_gate["degraded_skipped"] else ""))
     return 0
+
+
+def run(kb_id: str, dry_run: bool, manifest_dir: Any = _UNSET) -> int:
+    """backfill 入口：包装 _run_impl，任何出口（含异常）都落运行清单。
+
+    manifest_dir 三态：_UNSET=按 BACKFILL_MANIFEST_DIR 解析；None=关闭；Path=显式目录。
+    清单是审计产物：写失败只响铃（stderr），不改变门判定退出码。
+    """
+    started_at = datetime.now(timezone.utc)
+    trace_id = f"backfill-{kb_id}-{started_at.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    mf = _new_manifest(kb_id, "dry-run" if dry_run else "execute", trace_id, started_at)
+    resolved = _resolve_manifest_dir(manifest_dir)
+    try:
+        exit_code = _run_impl(kb_id, dry_run, trace_id, mf)
+        mf["exit_code"] = exit_code
+        return exit_code
+    except Exception as exc:  # noqa: BLE001 - 异常必须留痕后原样上抛，不得吞掉
+        mf["exit_code"] = 1
+        if mf.get("outcome") is None:
+            mf["outcome"] = "exception"
+        mf["exception"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        finished_at = datetime.now(timezone.utc)
+        mf["finished_at"] = finished_at.isoformat()
+        mf["duration_ms"] = int((finished_at - started_at).total_seconds() * 1000)
+        _write_manifest(resolved, mf)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backfill chunk_revisions for existing KB chunks (M5-A)")
     parser.add_argument("--kb", required=True, help="目标知识库 kb_id（必填，禁止全局扫描）")
     parser.add_argument("--dry-run", action="store_true", help="只输出 inventory 与前置门预览，不写库")
+    parser.add_argument(
+        "--manifest-dir",
+        default=None,
+        help=f"运行清单落盘目录（覆盖环境变量 {_MANIFEST_ENV}；未设置则不落盘）",
+    )
+    parser.add_argument("--no-manifest", action="store_true", help="显式关闭运行清单落盘")
     return parser.parse_args()
 
 
@@ -1181,7 +1337,8 @@ def main() -> int:
                 )
             return 2
     try:
-        return run(kb_id, dry_run=bool(args.dry_run))
+        manifest_dir = None if args.no_manifest else (Path(args.manifest_dir) if args.manifest_dir else _UNSET)
+        return run(kb_id, dry_run=bool(args.dry_run), manifest_dir=manifest_dir)
     except Exception as exc:  # noqa: BLE001 - 运维脚本失败必须显式退出码
         print(f"✗ backfill 执行失败: {exc}")
         if args.dry_run:
