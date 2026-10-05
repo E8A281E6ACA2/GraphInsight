@@ -119,7 +119,7 @@ Neo4j/Milvus，而 Go 建任务端点一旦放行就会入队并被 worker 消�
 | W4-F2 | **入口防线是路由分派，不是建任务白名单**（Wave 5 更正，原判据口径有误）。① HTTP 入口：`switch r.URL.Path`（`admin_jobs_native.go:228`）只列出 `/api/v1/admin/jobs/build-graph`、`/clear-kb`、`/reindex` 三个 case（`:229`），`reindex_chunks` 不在其中 → 落 default 分支返回 **404 `NOT_FOUND`**（`:278`），`adminJobTypeFromPath`（`:686-697`）对未知路径返回 `""`，`CreateJob` 从未被调用。② store 侧第二道线：白名单 `supportedJobTypes`（`go-backend/internal/adminstore/jobs.go:26-30`）= `build_graph/clear_kb/reindex`，`validateJobCreateRequest`（`jobs.go:592-605`，在 `CreateJob:139` 调用、`BeginTx`（`:147`）与 `INSERT` **之前**）返回 `ErrJobValidation`，由 `admin_jobs_native.go:758-761` 映射为 **400 `INVALID_BODY`**——只有内部/测试调用方直接触 `CreateJob` 时才会看到 | 结论不变：前端/运维无法通过 Go 控制面新建 reindex_chunks，且两层拒绝都在写库之前、fail-closed 成立。**但对外可观测语义是 404 而非 400**，runbook 与审计须按 404 判"入口未放行"；把 400 当成入口防线会高估白名的暴露面 |
 | W4-F3 | 读侧不校验类型白名单：`buildJobWhere`（`jobs.go:570`）只在 `jobs.go:574-576` 对 `job_type` 做**等值过滤**（值任意，不在 `supportedJobTypes` 也照样进 WHERE）；`ListJobs`（`jobs.go:325`）、`GetJob`（`jobs.go:386`）、`RetryJob`（`jobs.go:181`）、`CancelJob`（`jobs.go:258`）均无 job_type 闸门 | 已存在的 reindex_chunks 行**能被列出、按类型筛出、查看、重试、取消**——写侧关门、读侧开门，语义不对称；`?job_type=reindex_chunks` 在 Go 层是合法读过滤 |
 | W4-F4 | `targets_hash` 对上层不可见：Go `JobItem` 结构体（`jobs.go:32-50`）无该字段，`grep -rn "targets_hash" go-backend --include=*.go` = 0 命中；前端同样 0 命中（`grep -rn targets_hash frontend/src` 空） | §16.3 去重结果（reused/retried/rejected）在任务中心**无法核对**，审计只能读 DB |
-| W4-F5 | 前端类型与筛选项缺项：`frontend/src/types/admin.ts:732` `JobType = 'build_graph' | 'clear_kb' | 'reindex'`（无 `reindex_chunks`），`frontend/src/pages/Admin/JobsPage.tsx:48-52` `jobTypeOptions` 同样缺项；表格直出原始值（`JobsPage.tsx:472` `{item.job_type}`），URL 参数按选项校验（`JobsPage.tsx:144-146`） | 行能显示（裸字符串），但类型层不认、筛选下拉选不到、`?job_type=reindex_chunks` 深链被忽略 |
+| W4-F5 | 前端类型与筛选项缺项：`frontend/src/types/admin.ts:732` `JobType = 'build_graph' | 'clear_kb' | 'reindex'`（无 `reindex_chunks`），`frontend/src/pages/Admin/JobsPage.tsx:48-52` `jobTypeOptions` 同样缺项；表格直出原始值（`JobsPage.tsx:472` `{item.job_type}`），URL 参数按选项校验（`JobsPage.tsx:144-146`） | 行能显示（裸字符串），但类型层不认、筛选下拉选不到、`?job_type=reindex_chunks` 深链被忽略。**Wave 5 已按 §11.1-P2 补只读契约**（现树 `admin.ts:734` 含 `reindex_chunks`、`:765` 有 `targets_hash`），本行保留为 Wave 4 快照 |
 | W4-F6 | 白名单判定无测试载体：`grep -rn "validateJobCreateRequest\|supportedJobTypes" --include=*_test.go internal/` = 0 命中 | 未来给 Go 放行 reindex_chunks 时，没有回归网兜住 400/404 语义 |
 
 > 与上一轮文档口径的修正：先前 §9.3 把标识符写成 `allowedJobTypes` 并暗示存在 HTTP 409 映射，
@@ -236,7 +236,7 @@ cd .. && git ls-remote origin main                                 # 权威远�
 | P1 / W4-F2 | 机制更正就地写入 §4.1（入口=路由 404，白名=第二道线 400），两层各由测试钉住 | `admin_jobs_native.go:228-229`/`:278`/`:686-697`；`jobs.go:26-30`/`:592-605`（`CreateJob:139` 调用、`BeginTx:147` 之前） |
 | P2 / W4-F4 | `targets_hash` 进 Go 读投影（**只加读侧，不加写路径**） | `jobs.go:71`（`TargetsHash *string \`json:"targets_hash,omitempty"\``）、`jobColumns:34-51`、`scanJobItem:430`→`:474` |
 | P2 / W4-F5 | 前端 `JobType` 加 `reindex_chunks`、`JobItem.targets_hash?`、筛选下拉加"分片重建"（全部只读，页面无新建入口） | `frontend/src/types/admin.ts`、`frontend/src/pages/Admin/JobsPage.tsx` |
-| P3 | **不实现 409**；维持 §9 P3 口径，并加"出现 409 即判口径漂移"的断言 | `admin_jobs_native_test.go:44`（表格内 `rec.Code == http.StatusConflict` → `t.Fatalf`） |
+| P3 | **不实现 409**；维持 §9 P3 口径，并加"出现 409 即判口径漂移"的断言 | `admin_jobs_native_test.go:77`（表格内 `rec.Code == http.StatusConflict` → `t.Fatalf`；另有 `:149` 同断言） |
 | W4-F1 | 未动：Python `create_job` 仍无生产调用方，属真实取证/canary 范畴，待授权 | §7 保持 NOT-IMPLEMENTED |
 
 改动量（`git diff --numstat`，本轮实测）：`jobs.go` 31/102（六处内联列清单收敛为 `jobColumns` 单一真相源）、
@@ -312,10 +312,13 @@ EXIT=0；`check_m5_wave3_handoff` `RESULT: PASS` ✓=71；`check_m5_dual_write` 
 `check_migration_cleanup_guards` `GUARDS_OK`；Go 容器 `gofmt -l`（本轮 3 个 Go 文件）无输出、
 build/vet EXIT=0、`go test ./... -count=1` 8 包 `ok` 0 FAIL；前端 `tsc -b` 与 `eslint` 均 EXIT=0。
 密钥扫描：本轮 8 个改动/新增文件单独跑 `check_artifact_secrets.py` → `frontend/src/types/admin.ts`
-报 11 条 `credential_assignment`，**取 HEAD 版本同扫也是同样 11 条**（TS 类型声明的形状匹配，非本轮引入）；
-CI 的扫描面为 `artifacts`/`playwright-report`/`test-results`/`logs/dev`（`ci.yml:418-421`、`616-621`、
-`1010-1011`、`1087-1088`），不含 `frontend/src`，故不构成门禁风险；该既有形状匹配是发现级问题，本轮不动
-（见 §11.5-5）。
+报 11 条 `credential_assignment`，**取 HEAD 版本同扫也是同样 11 条**（TS 类型声明的形状匹配，非本轮引入）。
+**口径按裁定收紧**：这只说明"该问题不在现有门禁的拦截面内、不会让 CI 变红"，
+**不等于全仓库密钥扫描通过**——本轮从未做全仓扫描，CI 的扫描面只有 `artifacts`、
+`frontend/playwright-report`、`frontend/test-results`、`logs/dev/*.log`（`ci.yml:418-421`、`616-621`、
+`1010-1011`、`1087-1088`），`frontend/src`、`go-backend`、`docs` 全在扫描范围外。
+因此这 11 条是**扫描范围外的待复核项**，列为独立议题（§11.5-5），其"非本轮引入"的判断依据仅限
+"HEAD 同文件同扫计数相同"这一条证据。
 
 Windows 宿主限制不变：`httpserver` 仍不能在本机编译（`admin_monitor_native.go:896-899` 调 Unix-only
 `syscall.Statfs`），Go 侧证据一律来自 linux 容器。
@@ -332,11 +335,43 @@ Windows 宿主限制不变：`httpserver` 仍不能在本机编译（`admin_moni
 
 ## 12. Wave 5 待拍板 + 复核命令
 
-| # | 议题 | 选项与推荐 |
+| # | 议题 | 裁定（2026-10-05 审计回执，见 §13） |
 |---|---|---|
-| P5 | `targets_hash` 是否在任务中心可见（加列/详情展示） | 推荐 **暂不加列**：读侧契约已到位；历史行全为 NULL，先上加列容易被读成"去重没生效"；等真实取证出现 reused/retried 样本后再定 |
-| P6 | Go 写侧何时放行 `reindex_chunks` | 推荐 **真实取证（含 §16.3 reused 原地 retry 路径）通过后再放行**；回归网已就位（§11.2 #1/#2/#6），届时只需同批改 `admin_jobs_native.go:229` 的 case 列表 + `jobs.go:26-30` 白名单，两处都有测试兜住 |
-| P4（沿用） | 方向 B（dual_write 影子侧）与 push | 仍等单独授权。远端状态以 `git ls-remote origin` 现值判定，不信本地缓存 |
+| P5 | `targets_hash` 是否在任务中心可见 | **裁定：暂不在列表加列**，但必须保住可审计性 —— 四条留存前提见 §12.1。等真实 `reused/retried` 样本到手后再决定是否加列 |
+| P6 | Go 写侧何时放行 `reindex_chunks` | **裁定：暂不放行**。下一步**不碰共享生产库**：先补 disposable Postgres + Go HTTP 集成验证（§12.2 六项判据），全绿后再单独申请受控真实库取证 |
+| P4（沿用） | 方向 B（dual_write）与 push | 维持：dual_write 继续关闭、不进 S2、不做真实库 `--confirm`、不 push。**远端口径收紧**：本轮 `git ls-remote origin` 因 github.com:443 连接超时**未能核实**，故只能写"本轮未执行 push、分支 `m5/dual-write` 无 upstream"，**不得写成"远端已验证一致"** |
+
+### 12.1 P5 的可审计性前提（逐条回代码核实，不是承诺）
+
+| 前提 | 现状（实测） | 证据（现树 file:line） |
+|---|---|---|
+| 结构化结果带 `targets_hash` | **已具备** | `entry` 起始四键 `kb_id/doc_id/targets_hash/target_count`（`backend/services/reindex_queue.py:286-291`），`outcome`/`job_id` 在各分支内补齐（`outcome` 首次赋值 `:301`）；outcome 取值 `enqueued/reused/retried/reset/rejected`（`:54-58`） |
+| 结构化结果带"新建 vs 复用"判定 | **已具备，但键名是 `enqueued`，不是 `created`** | 作业日志 `action="job_created" if outcome == OUTCOME_ENQUEUED else "job_reused"`（`backend/admin/services/job_service.py:336`） |
+| 复用行指针（`child_job_id` 语义） | **已具备，但键名是 `job_id`；全仓 `child_job_id` 命中数 = 0**（`grep -rn child_job_id backend go-backend frontend/src` 实测 0） | `entry["job_id"]` 取新建行 id（`reindex_queue.py:302`）或 `_lock_existing_job` 既有行 id（`:315`）；读不到既有行时置 `None` 并走"不猜不补建"异常（`:311`、`job_service.py:312-318`） |
+| 计数与超限拒绝可追 | **已具备** | 日志 details 带 `enqueued/reused/retried/reset`（`job_service.py:344-347`）；超限拒绝写 `kb_chunk_reindex_failed` 审计行（`:367`、`:427`），HTTP 侧 `OPERATION_NOT_ALLOWED` + details（`:296-309`，`error_code` 在 `:301`） |
+| 上层能否读到这条链 | 作业日志端点在 Go 侧存在（`admin_jobs_native.go:186`），**但本轮未做活栈实测**，只证到代码存在 | 未验证项见 §11.5-3 |
+
+> 结论：P5 的"列表不展示 ≠ 去重不可见"成立，审计链落在 `admin_job_logs` 与 `report["jobs"]`。
+> 命名对齐（`created`/`child_job_id` ↔ 实际的 `enqueued`/`job_id`）若要统一口径，需单独一轮再裁；
+> 本轮不改键名——改会牵动既有取证脚本与门禁断言。
+
+### 12.2 P6 的前置集成验证（**NOT-IMPLEMENTED**，本轮只登记判据）
+
+落点：一次性容器 `postgres:16-alpine`（不发布端口、跑完即删），schema 由 Python 侧迁移建到临时库，
+Go 用真实 `database/sql` 连它跑 HTTP 集成用例。六项判据：
+
+1. 路由未开放时 `POST /api/v1/admin/jobs/reindex_chunks` → **404**（单测已钉，集成层再复现一次）。
+2. 内部创建路径接受 `reindex_chunks` —— **当前事实必须写准**：Go `CreateJob` 白名单**仍拒绝**该类型
+   （`adminstore/jobs.go:26-30`），今天能接受它的"内部创建路径"是 Python `JobService.create_job`
+   （`job_service.py:191`）分派到 `_create_reindex_chunks_job`（`:248`）。用例要标明验的是
+   Python 提交路径，不能写成"Go store 接受"。
+3. 同 `targets_hash` 二次提交 → **原地复用同一行**，`SELECT count(*)` 不增。
+4. `failed` / `cancelled` 再提交 → 仍复用同一行（分别走 `retried` / `reset` 分支）。
+5. `targets_hash` 缺列时 Go 读侧 → **503 `ADMIN_STORE_UNAVAILABLE`**，不得退化成"空列表 200"
+   （§11.3 只证到 SQL 层 42703，HTTP 层 503 要在集成层补证）。
+6. 旧 17 列库投影仍可读 —— 与 §11.3-C 同结论，但须在 Go 真实查询路径上复现。
+
+六项全绿才是 P6 的评估门槛；在此之前 Go 写侧保持关闭，真实库取证仍需单独授权。
 
 ```bash
 # Go —— Windows 宿主不能编译 httpserver，必须走 linux 容器
@@ -363,4 +398,33 @@ cd .. && git ls-remote origin main       # 权威远端；refs/heads/m5* 应为�
 
 部署顺序判据（源自 §11.3 实测）：先 `python backend/admin/migrate_jobs_targets_hash.py`，
 再上带 `jobColumns` 的 Go 构建；回滚该列必须先回滚 Go。
+
+> 上面最后一行 `git ls-remote origin main` 本轮**实际超时未取到值**
+> （`Failed to connect to github.com:443 after 21061 ms`），所以 §1 与 §12-P4 的远端口径
+> 只写到"未执行 push、分支无 upstream"为止；复核者若在可联网环境跑通这一行，才可升级为
+> "远端已核实"。
+
+## 13. Wave 5 审计回执（2026-10-05 裁定，登记进本文以便文档自足）
+
+裁定人（用户）本轮在 `E:\projects\aistudio` 会话内完成审计，**未独立重跑 GraphInsight 最终树**，
+结论基于本文 §11 的证据包。因此本文所有"绿"都受 §11.4 的限定约束：**隔离证据，非真实取证**。
+
+| 议题 | 裁定 | 本文落点 |
+|---|---|---|
+| Wave 5 接收为 | **本地回归与读侧契约完成** | 不得据此宣布方向 B 通过，也不得据此放行 Go 写侧 / 真实库取证 / push |
+| P5 `targets_hash` 列表列 | **暂不加列** | 四条留存前提（DTO/前端类型可读、不展示≠不可见、结构化结果或日志必须留痕、等真实 `reused/retried` 样本再议）逐条核实见 §12.1 |
+| P6 Go 写侧 `reindex_chunks` | **暂不放行** | 门槛 = §12.2 六项 disposable 集成验证全绿；在那之前不碰共享生产库，全绿后再单独申请受控真实库取证 |
+| W4-F2 拒绝机制口径 | 修正**接收** | 入口防线 = 路由 404，白名单 400 是第二道线（§4.1、§7、两份 Python docstring 已改） |
+| 409 语义 | 修正**接收** | 全仓无 409 实现，文档只写 NOT-IMPLEMENTED（§11.2 用例 4 的反 409 断言兜回归） |
+| 远端口径 | **收紧，强制** | `git ls-remote` 超时未核实 → 只能写"本轮未执行 push、分支 `m5/dual-write` 无 upstream"，禁止写"远端已验证一致"（§12-P4、§12 末复核提醒） |
+| 绿色结果口径 | **收紧，强制** | 所有绿色必须标注为隔离证据（§2 分栏、§11.4 方法声明） |
+| 密钥扫描口径 | **收紧，强制** | CI 扫描面不含 `frontend/src`、`go-backend`、`docs`；admin.ts 的 11 条命中是**扫描范围外的待复核项**，不得表述为"全仓库密钥扫描通过"（§11.4） |
+
+回执后的状态机（本轮唯一权威口径）：
+
+```
+dual_write 继续默认关闭 · 不做真实库 --confirm · 不进 S2 · 不 push
+下一轮候选动作 = §12.2 的 disposable Postgres + Go HTTP 集成套件，
+其设计先过一轮人工确认再实现。
+```
 
