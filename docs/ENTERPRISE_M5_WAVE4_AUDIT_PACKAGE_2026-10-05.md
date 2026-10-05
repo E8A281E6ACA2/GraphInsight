@@ -866,7 +866,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "E:/projects/GraphInsight:/src" -v "C:/Use
          go test ./... -count=1 ; echo TEST_EXIT=\$?"
 # 期望：gofmt 输出空 + BUILD_EXIT=0 + VET_EXIT=0 + TEST_EXIT=0（8 包 ok、0 FAIL，httpserver ≈10s）
 
-# 跨语言 hash 向量重算（纯复算，不建引擎；期望 11 条向量，重算后 testdata/targets_hash_vectors.json 零 diff）
+# 跨语言 hash 向量重算（纯复算，不建引擎；Wave 8 当时 11 条，Wave 9 补齐后 28 条，重算后 testdata/targets_hash_vectors.json 零 diff）
 PYTHONPATH= python tests/_w8_gen_vectors.py
 ```
 
@@ -925,3 +925,223 @@ ok  graphinsight/go-backend/internal/adminstore  0.008s   TEST_EXIT=0
 确认换行归一没有动到向量内容——JSON 里的换行是 `"l\nm"` 这类转义，不受文件 EOL 影响。
 
 
+
+---
+
+## 17. Wave 9（2026-10-05）：跨语言 hash 变体补齐（抓出并修掉真缺陷）+ 固定提交基线密钥复核 + 远端退出码留痕
+
+Wave 9 授权原文（本轮范围的唯一依据）：
+
+> "Wave 8 专用端点隔离验收材料接收，通用白名单保持关闭。补齐跨语言 targets 规范化 hash 变体测试，并用固定提交基线核实密钥扫描零新增；远端查询记录退出码。通过后允许推送审查分支、开草稿 PR，不合并、不部署、不执行共享库 --confirm，不进入 S2。"
+
+### 17.1 W9-1 变体补齐：11 条 → 28 条，并因此抓出 W9-F1（Go 星外平面转义错算）
+
+生成器 `backend/tests/_w8_gen_vectors.py` 的用例集从 11 条扩到 28 条。新增 17 条，每条钉一个此前无人证明的边界：
+
+| 用例名 | 钉住的点 |
+| --- | --- |
+| `empty_list` | 空 targets 的规范化文本必须是字面 `[]`（不是 `null`/空串） |
+| `numeric_string_order` | 排序按字符串字节序，`"1" < "10" < "2"`，不是数值序 |
+| `case_and_prefix_order` | 大写字母排在小写之前；前缀短的排在前面（`A` < `B` < `a` < `ab`） |
+| `cjk_vs_latin_order` | CJK 与拉丁混排的次序（UTF-8 字节序 == 码点序这条依据的真实回归） |
+| `ascii_boundary_tilde_del` | `0x20`、`0x7E`、`0x7F` 三条 ASCII 边界的转义与次序 |
+| `nul_and_low_controls` | `NUL`/`\x01`/`\x1f` 低控制位必须 `\u00XX` 转义 |
+| `short_escapes` | Python 的短转义 `\b \f \t \r`（不是 `\u0008` 等等价长式） |
+| `star_plane_emoji` | U+1F600 / U+2000B 的**代理对**转义（本轮抓出缺陷的用例） |
+| `nfc_vs_nfd_acutes` | NFC `é`（U+00E9）与 NFD `e`+U+0301 视为不同 chunk_id，不做归一 |
+| `hebrew_rtl` | RTL 文字按码点排序，不受显示方向影响 |
+| `slash_lt_gt_amp` | `/ < > &` 必须原样输出（Go `encoding/json` 会 HTML 转义，故此处是对"手写编码器"的钉子） |
+| `quote_backslash_mix` | `"` 与 `\` 的转义组合与重复反斜杠 |
+| `line_separators_2028` | U+2028/U+2029 走 `\uXXXX`（Go 默认原样输出，是真实分歧点） |
+| `negative_revision` | 负 `target_revision` 参与排序且不带 `+` |
+| `i64_max_revision` | `9223372036854775807` 不被转科学计数法/不丢精度 |
+| `same_chunk_rev_tie` | 同 chunk_id 多 revision 且含重复项时的稳定次序 |
+| `fifty_targets_unpadded` | 50 个目标（逆序喂入）——规模化验证排序收敛 |
+
+`testdata/targets_hash_vectors.json` 重算后的 `git diff --numstat` 是 **`474 insertions / 0 deletions`**：Wave 8 已交付的 11 条 hash 与 canonical 文本一个字节都没变，扩的是覆盖面，不是改契约。
+
+新门禁 `backend/tests/check_m5_targets_hash_vectors.py`（已注册进统一门禁，case 名 `m5_targets_hash_vectors`）做的不是"跑一遍 Python"，而是**独立复算**：逐条断言 `hash == canonical_targets_hash(input)` 且 `sha256(canonical) == hash`（生成器里也有同一条自证，两处任一算错都会红），外加命名覆盖、乱序收敛、空列表字面量，以及"文件里除 `\n` 外不得出现裸 C0 字节"这条换行/编码钉子。
+
+W9-F1（真实缺陷，已修）：`go-backend/internal/adminstore/targets_hash.go:98` 的高代理位写成了 `0xD7C0+(value>>10)`，正确是 `0xD800+(value>>10)`。
+
+- 现象：`star_plane_emoji` 用例里 Go 产出 `\ud7fd\ude00`，Python 产出 `\ud83d\ude00`（U+1F600）。
+- 直接后果：任何 `chunk_id` 含 U+10000 以上字符（emoji、CJK 扩展 B 区等），Go 与 Python 会算出**不同的 `targets_hash`**。§16.3 的去重是按 hash 精确匹配复用的，hash 分叉意味着同一目标在两语言写入路径下被当成不同目标——重复建行、复用失效，而不是报错，属于静默语义分裂。
+- 修复范围仅此一处常数；低代理位 `0xDC00+(value&0x3FF)` 原先即正确。
+
+红绿取证（本轮实跑，`output/w9/red_green_w9.log`）：把常数临时改回 `0xD7C0` 后 `go test -count=1` **必须红**，还原后**必须绿**，且脚本内断言还原后文件字节与修改前完全一致。
+
+```
+[RED] go test -count=1 退出码 = 1
+    targets_hash_test.go:44: star_plane_emoji 规范化文本不一致
+         Go: [{"chunk_id":"\ud7fd\ude00","target_revision":1},...]
+         Py: [{"chunk_id":"\ud83d\ude00","target_revision":1},...]
+FAIL	graphinsight/go-backend/internal/adminstore	0.225s
+[GREEN] 还原后 go test -count=1 -v 退出码 = 0
+--- PASS: TestCanonicalTargetsHashMatchesPythonVectors (0.00s)
+RESTORE_IDENTICAL=True
+```
+
+### 17.2 W9-2 密钥扫描：改成固定提交基线，零新增成立且口径收紧
+
+Wave 8 的做法（把工作树与"当前 HEAD"对比）在本轮不再可用：Wave 9 自己会产生提交，HEAD 一动，"零新增"就变成同义反复。因此本轮把基线钉在**Wave 7 的提交** `97645ac10658867b268216a042290b732cfdb641`（Wave 8 两个提交之后的树才是工作树，比较对象是一个不动的 SHA）。
+
+工具：`backend/tests/_w9_secret_baseline.py`（**这是取证脚本，不是门禁**——它依赖 `git diff <SHA>` 这一时间相关输入，不适合进 `run_unified_boundary_guards.py`）。对每个文件分别物化"基线字节"（`git show SHA:path`）与"工作树字节"到两个临时目录，保留相对路径，各自跑一次 `check_artifacts_secrets` 扫描器，然后按 `(kind, match_sha256, value)` **计数**比较。
+
+三处口径值得单列，因为它们决定了这个结论能不能信：
+
+1. findings 用 `Counter` 计数而非集合——同一明文出现两次，基线 2 / 工作树 2 才算持平；若用集合去重，"重复出现"会被洗成"零新增"。
+2. 扫描器退出码只接受 `0`（干净）或 `1`（有命中）；`2`（前置缺失，例如路径不存在）一律判失败，不允许把"没扫"读成"扫了且干净"。
+3. 断言"扫描器自报 `findings=N` 等于逐行解析出的条数"，并在出现 `SECRET_FINDINGS_TRUNCATED`（40 行截断）时直接中止——否则"零新增"可能只是被截断后的假绿。
+
+结果（`output/w9/secret_baseline_w9.log`，EXIT=0）：
+
+```
+BASELINE_SHA=97645ac10658867b268216a042290b732cfdb641
+SCAN_SCOPE files=18
+SECRET_BASELINE_SUMMARY files=18 new_findings=0 failed=0
+```
+
+18 个文件 = 与固定基线的 diff 文件集 ∪ 未跟踪文件（限 `backend/ go-backend/ frontend/ docs/ scripts/`）。两侧都命中且数量相同的两处**既有**命中照旧如实登记，不被本轮措辞掩盖：
+
+- `frontend/src/types/admin.ts`：基线 11 / 工作树 11，两侧扫描器 EXIT 均为 1
+- `go-backend/internal/httpserver/admin_control_plane_routes_test.go`：基线 23 / 工作树 23，两侧 EXIT 均为 1
+
+维持不变的范围口径（不夸口）：CI 门禁扫描的作用域仍是 `artifacts/playwright-report/test-results/logs/dev`，`frontend/src`、`go-backend`、`docs` **不在 CI 作用域内**，属既有的"待复核项"。本轮结论是"**相对固定提交基线零新增**"，不是"全仓库扫描通过"。
+
+### 17.3 W9-3 远端查询逐条退出码 + HTTPS 失败根因 + SSH:443 权威事实
+
+全部留痕在 `output/w9/remote_probes_w9.log`，每条命令单独记录真实 `EXIT`（不经管道，避免 `pipefail`/`$?` 误读）。
+
+本地侧：
+
+```
+$ git rev-parse --abbrev-ref HEAD        → m5/dual-write                          EXIT=0
+$ git rev-parse --abbrev-ref @{u}        → fatal: no upstream configured …        EXIT=128
+$ git remote -v                          → origin https://github.com/…(fetch/push) EXIT=0
+```
+
+HTTPS 远端侧（四条查询 + 三次重试，全部失败）：
+
+```
+$ git ls-remote origin refs/heads/m5/dual-write   EXIT=128  Failed to connect to github.com:443 after 21085 ms
+$ git ls-remote origin refs/heads/main            EXIT=128  Failed to connect to github.com:443 after 21081 ms
+$ git ls-remote --heads origin                    EXIT=128  Failed to connect to github.com:443 after 21126 ms
+TRY1 EXIT=128 Recv failure: Connection was reset
+TRY2 EXIT=128 Failed to connect to github.com:443 after 21127 ms
+TRY3 EXIT=128 Failed to connect to github.com:443 after 21066 ms
+```
+
+根因不是"重试次数不够"，逐 IP 探测给出的是一眼能判的结论：
+
+```
+TCP github.com:443        fail EXIT=1 :: TimeoutError
+TCP 20.205.243.166:443    fail EXIT=1 :: TimeoutError     ← github.com 当前解析到的地址，黑洞
+TCP 140.82.116.4:443      ok  EXIT=0                        ← GitHub 真实 IP，通
+TCP 140.82.112.4:443      ok  EXIT=0
+TCP ssh.github.com:443    ok  EXIT=0
+```
+
+即本机 DNS 把 `github.com` 解析到 `20.205.243.166`，该 IP 的 443 只丢包。**处置**：不改 hosts、不关证书校验、不做静默重试；走 GitHub 官方 `ssh.github.com:443` 通道，并在本轮只读验证身份与远端事实：
+
+```
+$ ssh -p 443 -o BatchMode=yes -T git@ssh.github.com
+OUTPUT=[Hi E8A281E6ACA2! You've successfully authenticated, but GitHub does not provide shell access.]
+EXIT=1        ← GitHub 对 SSH 认证探测的约定返回码，非失败
+```
+
+权威远端事实（`git ls-remote ssh://git@ssh.github.com:443/E8A281E6ACA2/GraphInsight.git`，`LS_REMOTE_SSH_EXIT=0`）：
+
+```
+59332f42503443872d382dbce0710c7226175abb	HEAD
+a201e723325b7c29d6269cbc6b8aa4f0e6c25340	refs/heads/audit/m5-gate0-coverage
+59332f42503443872d382dbce0710c7226175abb	refs/heads/main
+a201e723325b7c29d6269cbc6b8aa4f0e6c25340	refs/pull/1/head
+```
+
+据此确定的三件事（本地缓存态一律让位于此）：
+
+1. 远端 `main` = `59332f4`，且它正是本地 `m5/dual-write` 的 merge-base；`m5/dual-write` 相对远端 `main` 领先 **33 个提交**，即审查分支的 PR 范围就是这 33 个提交。
+2. **远端不存在 `refs/heads/m5/dual-write`**——审查分支此前从未推送过。
+3. 本地 `main`（`13303dc`，含 26 个不在本分支上的 enterprise 文档提交）与远端 `main` 已经不同线；本轮不碰它，也不把它的内容算进 PR 范围。此前 `git branch -vv` 显示 `origin/main: ahead 26` 是本地 tracking ref 的过期缓存态，不作为判据。
+
+### 17.4 Wave 9 总回归（本轮真实数字，全绿；隔离证据与真实取证分栏不变）
+
+| 层 | 命令/日志 | 结果 |
+| --- | --- | --- |
+| Go 格式 | 容器内 `gofmt -l` | `GOFMT_DONE` 前清单为空 |
+| Go 构建/静态 | `go build ./...` / `go vet ./...` | `BUILD_EXIT=0` / `VET_EXIT=0` |
+| Go 套件 | `go test ./...`（`output/w9/go_suite_w9.log`） | `TEST_EXIT=0`，8 包 ok、0 FAIL |
+| hash 对等 | `TestCanonicalTargetsHashMatchesPythonVectors` | 28/28 一致（修复前红，见 §17.1） |
+| 新门禁 | `check_m5_targets_hash_vectors.py` | `SUMMARY total=28 failed=0`，EXIT=0 |
+| 统一门禁 | `run_unified_boundary_guards.py`（`output/w9/unified_guards_w9.log`） | `SUMMARY total=21 failed=0`（Wave 8 为 20，本轮 +1） |
+| 扫描器自检 | `check_artifact_secrets_selftest.py` | `assertions=53 failed=0 result=pass` |
+| 一次性 PG 真实写入 | `output/w9/p6_disposable_pg_w9.log` | 判据 1–14 全 PASS，`GO_EVIDENCE phase=post_migrate expected=11 ran=11 passed=11 failed=0 skipped=0`，`RESULT: PASS`，`P6_EXIT=0` |
+
+一次性 PG 仍是**隔离证据**：独立临时实例、非共享开发库；共享库的 `--confirm` 迁移本轮依旧未执行（授权明确禁止）。
+
+### 17.5 本轮维持的边界与授权范围
+
+- Wave 8 交付的**专用端点隔离验收**已被接收；`reindex_chunks` 仍**不在**通用作业创建白名单 `supportedJobTypes` 内，入口防御仍是路由 404（store 白名单 400 只是第二道）。白名单放行需要单独申请，本轮未申请。
+- Go 侧无 409 主张（`JOB_409` 仍 NOT-IMPLEMENTED）；`requireJobKnowledgeBase` 的 409 是 KB_ARCHIVED/KB_INVALID_STATE 的另一主题，不冲突。
+- 不合并、不部署、不执行共享库 `--confirm`、不进入 S2——本轮只做到"提交 + 推送审查分支 + 草稿 PR"。
+- `stash@{0}`/`stash@{1}`（GI-11）仍未触碰，原样保留。
+
+### 17.6 复核命令（Wave 9 口径）
+
+```bash
+# 以下脚本均自强制 UTF-8（sys.stdout.reconfigure），不需要外挂 -X utf8；退出码就是判据
+cd backend
+
+# 1) 重算向量（幂等，重跑后 testdata 零 diff；生成器自带 hash 自证）
+python tests/_w8_gen_vectors.py
+
+# 2) 新门禁：独立复算 + 变体覆盖（期望 SUMMARY total=28 failed=0，EXIT=0）
+python tests/check_m5_targets_hash_vectors.py; echo EXIT=$?
+
+# 3) Go 字节级对等（期望 28 条全过；星外平面用例即 W9-F1 的钉子）
+cd ../go-backend && go test ./internal/adminstore/ -run TestCanonicalTargetsHashMatchesPythonVectors -count=1 -v
+
+# 4) 统一门禁（期望 SUMMARY total=21 failed=0）
+cd ../backend && python tests/run_unified_boundary_guards.py; echo EXIT=$?
+
+# 5) 固定提交基线密钥复核（基线是位置参数、SHA 不随提交移动；期望 new_findings=0 failed=0）
+python tests/_w9_secret_baseline.py 97645ac10658867b268216a042290b732cfdb641; echo EXIT=$?
+
+# 6) 一次性 PG 真实写入判据（隔离实例，非共享库）
+python tests/check_m5_p6_disposable_pg.py; echo EXIT=$?
+
+# 7) 远端权威事实（HTTPS 被 DNS 黑洞时用官方 SSH:443；不要用本地 tracking ref 下结论）
+git ls-remote ssh://git@ssh.github.com:443/E8A281E6ACA2/GraphInsight.git refs/heads/main
+```
+
+### 17.7 逐字证据片段（提交进仓库，不依赖本地日志）
+
+```
+wrote 28 vectors -> E:\projects\GraphInsight\go-backend\internal\adminstore\testdata\targets_hash_vectors.json
+474	0	go-backend/internal/adminstore/testdata/targets_hash_vectors.json        ← git diff --numstat
+[OK] m5_targets_hash_vectors duration=0.4s
+SUMMARY total=28 failed=0        ← check_m5_targets_hash_vectors.py
+SUMMARY total=21 failed=0        ← run_unified_boundary_guards.py（Wave 8=20，+1）
+SECRET_SCAN_SELFTEST_SUMMARY assertions=53 failed=0 result=pass
+GOFMT_DONE / BUILD_EXIT=0 / VET_EXIT=0 / TEST_EXIT=0（8 包 ok、0 FAIL）
+GO_EVIDENCE phase=post_migrate expected=11 ran=11 passed=11 failed=0 skipped=0
+RESULT: PASS / P6_EXIT=0
+BASELINE_SHA=97645ac10658867b268216a042290b732cfdb641
+SCAN_SCOPE files=18
+SECRET_BASELINE_SUMMARY files=18 new_findings=0 failed=0
+LS_REMOTE_SSH_EXIT=0 / refs/heads/main=59332f42503443872d382dbce0710c7226175abb（远端无 refs/heads/m5/dual-write）
+```
+
+### 17.8 本轮提交 stage 清单与假脏复核
+
+Wave 9 实际改动的 7 个文件（提交只 stage 这些）：
+
+1. `backend/tests/_w8_gen_vectors.py`（11 → 28 用例 + 生成器自证）
+2. `backend/tests/check_m5_targets_hash_vectors.py`（新门禁）
+3. `backend/tests/run_unified_boundary_guards.py`（注册 `m5_targets_hash_vectors`）
+4. `backend/tests/_w9_secret_baseline.py`（固定基线密钥复核工具，非门禁）
+5. `go-backend/internal/adminstore/targets_hash.go`（W9-F1 高代理位修正）
+6. `go-backend/internal/adminstore/testdata/targets_hash_vectors.json`（重算，474/0）
+7. `docs/ENTERPRISE_M5_WAVE4_AUDIT_PACKAGE_2026-10-05.md`（§16.8 锚点措辞 + 本节）
+
+Windows stat-cache 假脏复跑（`git hash-object` 对 `git rev-parse HEAD:<path>`）：`git status` 报 M 的 13 个文件里，8 个 `go-backend/internal/adminstore/*.go`（`client.go`、`configs.go`、`logs.go`、`monitor.go`、`monitor_test.go`、`rbac_bindings.go`、`rbac_seed.go`、`users.go`）与工作树字节完全一致，判 SAME，未 stage；剩下 5 个 DIFF 文件（本节的 1/3/5/6/7）加 2 个新增文件（本节的 2/4）才是真实改动，7 个一起 stage。
