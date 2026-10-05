@@ -45,6 +45,7 @@ chunk_revisions 存量 backfill（M5-A，设计 §9 / §15.3 / §16.2 / §17.1 v
     2 = 拒绝执行（chunk_revisions/admin_jobs 表缺失、UNRECOVERABLE_MISMATCH、
         SCOPE_MISMATCH、SCOPE_UNRESOLVED、kb_id 非法）
     3 = 执行完成但前置门 OPEN（needs_reindex targets 待收敛 / blocked 投影）
+    4 = 执行完成但 §16.3 审计留痕未落盘（admin_logs 写入失败，整批事务回滚）
 """
 from __future__ import annotations
 
@@ -818,6 +819,80 @@ def _enqueue_reindex_jobs(targets: List[Dict[str, Any]], trace_id: str) -> Dict[
     )
 
 
+def _write_reindex_audit(job_report: Dict[str, Any], *, trace_id: str) -> List[str]:
+    """§16.3 逐组结果落 admin_logs；返回失败描述列表（空 = 全部落盘）。
+
+    任务中心提交路径（`admin/services/job_service.py`）每轮都写 `job_created`/`job_reused`
+    审计行，CLI 路径过去只 print 聚合计数：库里查不到"哪个 doc_id 的哪批 targets 交给了
+    哪个 child job"，事后无法复核（P5 缺口 1）。action 映射与 details 键名统一取自
+    `services.reindex_queue`（P5 缺口 2），两条路径不再各写一套字面量。
+
+    整批放在同一个事务里：Postgres 语句级报错会中止当前事务，逐条 try 会让"前半段落盘、
+    后半段全失败"这种半截留痕看起来像成功。
+    """
+    from services.reindex_queue import (
+        JOB_TYPE as REINDEX_CHUNKS_JOB_TYPE,
+        OUTCOME_REJECTED,
+        audit_action_for_outcome,
+        audit_details,
+    )
+
+    jobs = job_report.get("jobs") or []
+    if not jobs:
+        return []
+    failures: List[str] = []
+    with engine.begin() as conn:
+        if not _table_exists(conn, "admin_logs"):
+            return [f"admin_logs 表不存在，{len(jobs)} 条 §16.3 留痕未落盘"]
+        try:
+            for entry in jobs:
+                child_job_id = entry.get("child_job_id")
+                row = (
+                    conn.execute(
+                        text("SELECT job_type, status FROM admin_jobs WHERE id = :job_id"),
+                        {"job_id": child_job_id},
+                    ).fetchone()
+                    if child_job_id is not None
+                    else None
+                )
+                outcome = entry.get("outcome")
+                details = audit_details(
+                    entry,
+                    job_type=str(row[0]) if row else REINDEX_CHUNKS_JOB_TYPE,
+                    kb_id=str(entry.get("kb_id") or ""),
+                    status=str(row[1]) if row else "",
+                    source="backfill_chunk_revisions",
+                    report=job_report,
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO admin_logs (kb_id, trace_id, action, resource, resource_id, "
+                        "details, status, error_message) "
+                        "VALUES (:kb_id, :trace_id, :action, :resource, :resource_id, "
+                        ":details, :status, :error_message)"
+                    ),
+                    {
+                        "kb_id": details["kb_id"] or None,
+                        "trace_id": trace_id,
+                        "action": audit_action_for_outcome(outcome),
+                        "resource": "job",
+                        "resource_id": str(child_job_id) if child_job_id is not None else None,
+                        "details": json.dumps(details, ensure_ascii=False),
+                        "status": "failed" if outcome == OUTCOME_REJECTED else "success",
+                        "error_message": (
+                            "reindex_chunks 重试额度已用尽，backfill 拒绝再次入队（§16.3）"
+                            if outcome == OUTCOME_REJECTED
+                            else None
+                        ),
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 - 留痕失败必须带退出码冒出来，不能静默半落盘
+            failures.append(
+                f"§16.3 留痕整批回滚（jobs={len(jobs)}，已落盘 0 条）：{type(exc).__name__}: {exc}"
+            )
+    return failures
+
+
 def evaluate_gate(inventory: Inventory) -> Dict[str, Any]:
     """v3.2.1 前置门：needs_reindex/blocked 未收敛不关闭；skipped 放行记 DEGRADED_SKIPPED。"""
     gate = {
@@ -1070,13 +1145,13 @@ def run(kb_id: str, dry_run: bool) -> int:
     # 否则会和 rows_new 重复计数，运维无法区分"跳过存量"与"本次新增"。
     fresh_inventory.rows_skipped_existing = inventory.rows_skipped_existing
 
-    job_report = {"enqueued": 0, "reused": 0, "targets": 0}
+    job_report = {"created": 0, "reused": 0, "targets": 0}
     if fresh_inventory.needs_reindex_targets:
         for item in fresh_inventory.needs_reindex_targets:
             item["kb_id"] = kb_id
         job_report = _enqueue_reindex_jobs(fresh_inventory.needs_reindex_targets, trace_id)
         print(
-            f"[reindex] jobs_enqueued={job_report['enqueued']} jobs_reused={job_report['reused']} "
+            f"[reindex] jobs_created={job_report['created']} jobs_reused={job_report['reused']} "
             f"jobs_retried={job_report['retried']} jobs_reset={job_report['reset']} "
             f"jobs_rejected={job_report['rejected']} targets_total={job_report['targets']}"
         )
@@ -1084,14 +1159,23 @@ def run(kb_id: str, dry_run: bool) -> int:
         # 门会一直 OPEN 却无人可干预。
         for item in job_report.get("rejected_detail") or []:
             print(
-                f"REINDEX_REJECTED job_id={item['job_id']} kb_id={item['kb_id']} "
+                f"REINDEX_REJECTED child_job_id={item['child_job_id']} kb_id={item['kb_id']} "
                 f"targets_hash={item['targets_hash']} retry_count={item['retry_count']}/{item['max_retries']} "
                 f"chunk_ids={','.join(item['chunk_ids'])}"
             )
 
+    # 留痕缺口 1：逐组结果（doc_id/targets_hash/child_job_id/outcome）必须进 admin_logs，
+    # 否则 CLI 轮次的 §16.3 判定只存在于 stdout，事后不可复核。
+    audit_failures = _write_reindex_audit(job_report, trace_id=trace_id)
+
     # job 尚未执行时 needs_reindex 不收敛，门保持 OPEN
     fresh_gate = evaluate_gate(fresh_inventory)
     _print_report(fresh_inventory, fresh_gate, dry_run=False)
+    if audit_failures:
+        for msg in audit_failures:
+            print(f"✗ REINDEX_AUDIT_WRITE_FAILED {msg}")
+        print("✗ §16.3 审计留痕未完整落盘（退出码 4）：计数不能替代逐组留痕，需人工补录后重跑")
+        return 4
     if not fresh_gate["closed"]:
         print("✗ 前置门 OPEN：backfill 技术迁移完成，但 needs_reindex/blocked 投影未收敛，M5-A 验收门未关闭")
         return 3

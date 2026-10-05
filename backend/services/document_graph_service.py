@@ -901,7 +901,7 @@ class DocumentGraphService:
                     max_retries=3,
                 )
             except Exception as exc:  # noqa: BLE001
-                reindex_handoff_report = {"enqueued": 0, "targets": 0, "error": str(exc)}
+                reindex_handoff_report = {"created": 0, "targets": 0, "error": str(exc)}
                 logger.error("reindex 转交入队失败", context={"error": str(exc)})
 
         # §6.2：chunk 投影状态回写后重算文档级 graph_status/vector_status，

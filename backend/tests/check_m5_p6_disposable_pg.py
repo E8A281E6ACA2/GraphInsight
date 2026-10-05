@@ -54,6 +54,25 @@ PROJECT_ID = "p1"
 MARKER_RE = re.compile(r"^__([A-Z_]+)__ (.*)$", re.MULTILINE)
 GO_TEST_RE = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.MULTILINE)
 
+# 每阶段**点名**要跑到的 Go 用例：`-run TestP6` 是前缀匹配，改名或新增用例都会悄悄改变
+# 匹配面（甚至匹配到 0 个也照样 `ok`）。这里把清单写死并把 `-run` 收紧成精确 alternation，
+# 于是"该有的用例没跑到"和"跑到了但不 PASS"都会显式变红，而不是靠 SKIP 蒙混。
+GO_EXPECTED_TESTS: Dict[str, List[str]] = {
+    "pre_migrate": [
+        "TestP6UnlistedJobTypeIsRejectedAtRouteDispatch",
+        "TestP6ReadPathIsStructuredUnavailableWithoutColumn",
+    ],
+    "post_migrate": [
+        "TestP6UnlistedJobTypeIsRejectedAtRouteDispatch",
+        "TestP6ReadPathSucceedsWithTargetsHashAfterMigration",
+        "TestP6LegacyRowStaysReadableAfterMigration",
+        "TestP6JobLogsExposePythonAuditDetails",
+    ],
+}
+
+# 每阶段 Go 侧证据账（ran/pass/fail/skip + 未预期用例），用于 skipped=0 的显式断言
+GO_EVIDENCE: Dict[str, Dict[str, Any]] = {}
+
 FAILURES: List[str] = []
 CRITERIA: Dict[str, Tuple[bool, str]] = {}
 LOG: List[str] = []
@@ -233,6 +252,7 @@ def migrate(action: str) -> Tuple[int, str]:
 
 
 def go_phase(phase: str, env: Dict[str, str]) -> Tuple[int, str, Dict[str, str]]:
+    expected = GO_EXPECTED_TESTS[phase]
     args = [
         "run", "--rm", "--network", NET,
         "-v", f"{SRC_MOUNT}:/src",
@@ -248,9 +268,35 @@ def go_phase(phase: str, env: Dict[str, str]) -> Tuple[int, str, Dict[str, str]]
     ]
     for key, value in env.items():
         args += ["-e", f"{key}={value}"]
-    args += [GO_IMAGE, "go", "test", "./internal/httpserver/", "-run", "TestP6", "-count=1", "-v"]
+    args += [GO_IMAGE, "go", "test", "./internal/httpserver/", "-run", f"^({'|'.join(expected)})$", "-count=1", "-v"]
     rc, out = docker(*args, timeout=900, label=f"go test {phase}")
     verdicts = {name: status for status, name in GO_TEST_RE.findall(out)}
+    skipped = sum(1 for status in verdicts.values() if status == "SKIP")
+    failed = sum(1 for status in verdicts.values() if status == "FAIL")
+    passed = sum(1 for status in verdicts.values() if status == "PASS")
+    missing = [name for name in expected if name not in verdicts]
+    extra = sorted(set(verdicts) - set(expected))
+    GO_EVIDENCE[phase] = {
+        "expected": len(expected),
+        "ran": len(verdicts),
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "missing": missing,
+        "extra": extra,
+        "no_tests_ran": "warning: no tests to run" in out,
+    }
+    ev = GO_EVIDENCE[phase]
+    check(
+        f"Go {phase} 精确跑到清单内 {len(expected)} 个用例（无缺失/无越界/没有 no-tests-to-run）",
+        not missing and not extra and not ev["no_tests_ran"] and ev["ran"] == len(expected),
+        f"verdicts={verdicts} missing={missing} extra={extra}",
+    )
+    check(f"Go {phase} 零失败零跳过（skipped=0）", failed == 0 and skipped == 0, f"failed={failed} skipped={skipped}")
+    say(
+        f"    GO_EVIDENCE phase={phase} expected={ev['expected']} ran={ev['ran']} "
+        f"passed={passed} failed={failed} skipped={skipped}"
+    )
     return rc, out, verdicts
 
 
@@ -322,16 +368,19 @@ def main() -> int:
         dump_out(out, rc, 26)
         sub = m4.get("SUBMIT", {})
         check("submit 退出码 0", rc == 0, f"rc={rc}")
-        job_id = sub.get("job_id")
+        job_id = sub.get("child_job_id")
         targets_hash = sub.get("targets_hash")
         outcomes = sub.get("outcomes") or []
         criterion(2, "Python 内部路径创建 reindex_chunks",
                   rc == 0 and isinstance(job_id, int) and sub.get("reindex_chunks_count") == 1 and bool(targets_hash),
                   f"marker={sub}")
-        criterion(6, "同 targets_hash 不新增且回读既有 child ID",
-                  rc == 0 and sub.get("reindex_chunks_count") == 1 and "reused" in outcomes
-                  and int(sub.get("for_update_sql_count") or 0) >= 1,
-                  f"count={sub.get('reindex_chunks_count')} outcomes={outcomes} for_update={sub.get('for_update_sql_count')}")
+        detail_child_ids = sub.get("detail_child_job_ids") or []
+        criterion(6, "同 targets_hash 不新增且留痕回读既有 child_job_id",
+                  rc == 0 and sub.get("reindex_chunks_count") == 1 and "created" in outcomes and "reused" in outcomes
+                  and int(sub.get("for_update_sql_count") or 0) >= 1
+                  and len(detail_child_ids) == 4 and all(x == job_id for x in detail_child_ids),
+                  f"count={sub.get('reindex_chunks_count')} outcomes={outcomes} "
+                  f"for_update={sub.get('for_update_sql_count')} detail_child_job_ids={detail_child_ids}")
         criterion(7, "failed/cancelled 原地 retry/reset",
                   rc == 0 and "retried" in outcomes and "reset" in outcomes,
                   f"outcomes={outcomes}")
@@ -407,7 +456,12 @@ def finish() -> int:
     failed_criteria = sum(1 for i in range(1, 8) if not CRITERIA.get(f"C{i}", (False, ""))[0])
     failed_steps = len(FAILURES)
     ok = failed_criteria == 0 and failed_steps == 0
-    say(f"P6_DISPOSABLE_SUMMARY criteria=7 failed_criteria={failed_criteria} failed_steps={failed_steps}")
+    # Go 证据账：两个阶段都跑完才给 skipped 计数；未跑完写 NA，不能让"没跑"读成"零跳过"。
+    if len(GO_EVIDENCE) == 2:
+        go_summary = f"go_phases=2 skipped={sum(int(ev.get('skipped') or 0) for ev in GO_EVIDENCE.values())}"
+    else:
+        go_summary = f"go_phases={len(GO_EVIDENCE)} skipped=NA"
+    say(f"P6_DISPOSABLE_SUMMARY criteria=7 failed_criteria={failed_criteria} failed_steps={failed_steps} {go_summary}")
     say("RESULT: PASS" if ok else "RESULT: FAIL")
     return 0 if ok else 1
 

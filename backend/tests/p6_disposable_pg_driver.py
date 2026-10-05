@@ -298,12 +298,13 @@ def stage_submit(engine) -> None:
     check("判据2 新行 status=pending", row1.get("status") == "pending", str(row1))
     check("判据2 targets_hash 落列且等于 canonical 复算值", row1.get("targets_hash") == expected_hash, str(row1))
     check("判据2 作用域冻结为 t1/p1/kb-p6", (row1.get("tenant_id"), row1.get("project_id"), row1.get("kb_id")) == (TENANT, PROJECT, KB), str(row1))
-    check("判据2 留痕 outcome=enqueued 且带同一 targets_hash", first["log"].get("details", {}).get("outcome") == "enqueued" and first["log"].get("details", {}).get("targets_hash") == expected_hash, str(first["log"]))
+    check("判据2 留痕 outcome=created 且带同一 targets_hash", first["log"].get("details", {}).get("outcome") == "created" and first["log"].get("details", {}).get("targets_hash") == expected_hash, str(first["log"]))
+    check("判据2 留痕 child_job_id 就是新建行 id（键名用 child_job_id，不用 job_id）", first["log"].get("details", {}).get("child_job_id") == row1.get("id") and "job_id" not in (first["log"].get("details") or {}), str(first["log"]))
 
     # 判据 6：同 hash 二次提交不新增，且回读到既有 child ID
     second = submit("second")
     check("判据6 二次提交后 reindex_chunks 仍只有 1 行", second["count"] == 1, str(second))
-    check("判据6 回读到的 job_id 就是既有行 id（不是新建 id）", second["row"].get("id") == row1.get("id"), f"first={row1} second={second['row']}")
+    check("判据6 回读到的 child_job_id 就是既有行 id（不是新建 id）", second["row"].get("id") == row1.get("id") and second["log"].get("details", {}).get("child_job_id") == row1.get("id"), f"first={row1} second={second['row']} details={second['log'].get('details')}")
     check("判据6 复用留痕 outcome=reused + action=job_reused", second["log"].get("action") == "job_reused" and second["log"].get("details", {}).get("outcome") == "reused", str(second["log"]))
     for_update = [s for s in CAPTURED_SQL if "FOR UPDATE" in s and "admin_jobs" in s]
     check("Postgres 复用分支确实走了 FOR UPDATE 行锁（SQLite 套件到不了这条分支）", bool(for_update), f"captured={len(CAPTURED_SQL)}")
@@ -330,10 +331,14 @@ def stage_submit(engine) -> None:
     marker(
         "SUBMIT",
         {
-            "job_id": row1.get("id"),
+            "child_job_id": row1.get("id"),
             "targets_hash": expected_hash,
             "reindex_chunks_count": fourth["count"],
             "outcomes": [first["log"].get("details", {}).get("outcome"), second["log"].get("details", {}).get("outcome"), third["log"].get("details", {}).get("outcome"), fourth["log"].get("details", {}).get("outcome")],
+            "detail_child_job_ids": [
+                (x["log"].get("details") or {}).get("child_job_id")
+                for x in (first, second, third, fourth)
+            ],
             "for_update_sql_count": len(for_update),
             "log_actions": [first["log"].get("action"), second["log"].get("action")],
         },

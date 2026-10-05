@@ -202,10 +202,10 @@ def section_continuity(h: Harness) -> None:
 
     jobs = (handoff.get("handoff") or {}).get("jobs") or []
     step(
-        "转交报表 enqueued=1 / outcome=enqueued / 来源 build_graph_m5_wave3",
-        (handoff.get("handoff") or {}).get("enqueued") == 1
+        "转交报表 created=1 / outcome=created / 来源 build_graph_m5_wave3",
+        (handoff.get("handoff") or {}).get("created") == 1
         and bool(jobs)
-        and jobs[0].get("outcome") == "enqueued"
+        and jobs[0].get("outcome") == "created"
         and handoff.get("payload_source") == "build_graph_m5_wave3",
         f"handoff={handoff.get('handoff')}",
     )

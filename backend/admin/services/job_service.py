@@ -19,9 +19,11 @@ from services.chunk_projection_state import aggregate_document_states, write_bac
 from services.job_runtime import execute_job
 from services.reindex_queue import (
     JOB_TYPE as REINDEX_CHUNKS_JOB_TYPE,
-    OUTCOME_ENQUEUED,
+    OUTCOME_CREATED,
     OUTCOME_REJECTED,
     REJECT_REASON_RETRY_EXHAUSTED,
+    audit_action_for_outcome,
+    audit_details,
     enqueue_on_connection,
     targets_from_payload,
 )
@@ -201,7 +203,7 @@ class JobService:
             raise ValidationException(f"不支持的任务类型: {job_type}")
         # reindex_chunks 走 §16.3 共享去重入队，且必须留在兜底 except 之外——
         # 落进 `except Exception: raise BusinessException("创建任务失败")` 会把
-        # 超限拒绝的结构化 details（job_id/targets_hash/reason）压成一句空话。
+        # 超限拒绝的结构化 details（child_job_id/targets_hash/reason）压成一句空话。
         if job_type == REINDEX_CHUNKS_JOB_TYPE:
             return self._create_reindex_chunks_job(
                 db, request=request, requested_by=requested_by, trace_id=trace_id
@@ -289,18 +291,20 @@ class JobService:
             max_retries=request.max_retries,
         )
         entry = (report.get("jobs") or [{}])[0]
-        job_id = entry.get("job_id")
+        child_job_id = entry.get("child_job_id")
         outcome = entry.get("outcome")
         detail = (report.get("rejected_detail") or [{}])[0]
 
         if outcome == OUTCOME_REJECTED:
             db.rollback()
-            self._audit_reindex_rejected(db, job_id=job_id, requested_by=requested_by, detail=detail)
+            self._audit_reindex_rejected(
+                db, job_id=child_job_id, requested_by=requested_by, detail=detail
+            )
             raise BusinessException(
                 "reindex_chunks 重试额度已用尽，需人工介入后再提交",
                 error_code=ErrorCode.OPERATION_NOT_ALLOWED,
                 details={
-                    "job_id": job_id,
+                    "child_job_id": child_job_id,
                     "kb_id": scope["kb_id"],
                     "targets_hash": detail.get("targets_hash"),
                     "reason": REJECT_REASON_RETRY_EXHAUSTED,
@@ -308,7 +312,7 @@ class JobService:
                     "max_retries": detail.get("max_retries"),
                 },
             )
-        if job_id is None:
+        if child_job_id is None:
             # 唯一索引拦住新增却读不到既有行（§16.3 分支表外的异常）：不猜、不补建。
             db.rollback()
             raise BusinessException(
@@ -318,12 +322,12 @@ class JobService:
             )
 
         db.commit()
-        job = db.query(AdminJob).filter(AdminJob.id == job_id).first()
+        job = db.query(AdminJob).filter(AdminJob.id == child_job_id).first()
         if job is None:
             raise BusinessException(
                 "reindex_chunks 入队后任务行读取失败",
                 error_code=ErrorCode.OPERATION_FAILED,
-                details={"job_id": job_id, "kb_id": scope["kb_id"]},
+                details={"child_job_id": child_job_id, "kb_id": scope["kb_id"]},
             )
         if requested_by is not None and job.requested_by is None:
             # 共享入队的裸 INSERT 不含 requested_by，这里补登记（审计要能追到人）。
@@ -333,19 +337,15 @@ class JobService:
         self._write_job_log(
             db,
             job=job,
-            action="job_created" if outcome == OUTCOME_ENQUEUED else "job_reused",
-            details={
-                "job_type": job.job_type,
-                "status": job.status,
-                "outcome": outcome,
-                "targets_hash": entry.get("targets_hash"),
-                "target_count": entry.get("target_count"),
-                "kb_id": job.kb_id,
-                "enqueued": report.get("enqueued"),
-                "reused": report.get("reused"),
-                "retried": report.get("retried"),
-                "reset": report.get("reset"),
-            },
+            action=audit_action_for_outcome(outcome),
+            details=audit_details(
+                entry,
+                job_type=job.job_type,
+                kb_id=job.kb_id,
+                status=job.status,
+                source="admin_api",
+                report=report,
+            ),
         )
         return _to_item(job)
 

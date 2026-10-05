@@ -374,7 +374,7 @@ func TestP6JobLogsExposePythonAuditDetails(t *testing.T) {
 	data, _ := resp.Data.(map[string]interface{})
 	items, _ := data["items"].([]interface{})
 	if len(items) < 4 {
-		t.Fatalf("四次提交（enqueued/reused/retried/reset）应在审计里各留一行，实际 %d 行 body=%s", len(items), raw)
+		t.Fatalf("四次提交（created/reused/retried/reset）应在审计里各留一行，实际 %d 行 body=%s", len(items), raw)
 	}
 	actions := map[string]int{}
 	hashSeen := ""
@@ -387,16 +387,33 @@ func TestP6JobLogsExposePythonAuditDetails(t *testing.T) {
 		if value, _ := details["targets_hash"].(string); value != "" {
 			hashSeen = value
 		}
-		if value, _ := details["outcome"].(string); value != "" {
-			outcomes[value]++
+		outcome, _ := details["outcome"].(string)
+		if outcome == "" {
+			continue
+		}
+		outcomes[outcome]++
+		// Wave 7 口径统一：结构化边界只用 child_job_id 表达"复用/重试/复位指向的既有行"。
+		// 旧键名 job_id 若在真实 PG 读侧复活，说明两条写入路径（任务中心提交 / CLI backfill）
+		// 又分叉了，运维按 child_job_id 检索就会漏行。
+		if _, legacy := details["job_id"]; legacy {
+			t.Fatalf("details 仍带旧键名 job_id（应统一为 child_job_id）：%s", raw)
+		}
+		if id, ok := details["child_job_id"].(float64); !ok || int64(id) != int64(env.jobID) {
+			t.Fatalf("outcome=%s 的 details.child_job_id 必须回读为既有行 id=%d，实际 %v", outcome, env.jobID, details["child_job_id"])
+		}
+	}
+	if hashSeen == "" {
+		t.Fatalf("四条留痕都没带 targets_hash，无法与列表侧对账：body=%s", raw)
+	}
+	for _, want := range []string{"created", "reused", "retried", "reset"} {
+		if outcomes[want] != 1 {
+			t.Fatalf("outcome=%s 应恰好 1 条，实际 %d（全量=%v）", want, outcomes[want], outcomes)
 		}
 	}
 	if hashSeen != env.targetsHash {
 		t.Fatalf("审计 details 里的 targets_hash 与库列不一致，期望 %q 实际 %q", env.targetsHash, hashSeen)
 	}
-	for _, want := range []string{"enqueued", "reused", "retried", "reset"} {
-		if outcomes[want] == 0 {
-			t.Fatalf("details.outcome 缺少 %q 分支，实际 %v（actions=%v）", want, outcomes, actions)
-		}
+	if actions["job_created"] < 1 || actions["job_reused"] < 1 {
+		t.Fatalf("action 侧必须与 outcome 同源映射（job_created/job_reused），实际 %v", actions)
 	}
 }

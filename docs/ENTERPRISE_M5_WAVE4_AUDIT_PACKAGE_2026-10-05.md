@@ -271,9 +271,9 @@ jobs_test.go:137: jobColumns 19 列但 scanJobItem 只有 18 个目标 —— �
 
 | 步骤 | 动作 | 实测输出 |
 |---|---|---|
-| A | 建 17 列表（迁移前形态），跑 Go 的 18 列投影 | `ERROR: column "targets_hash" does not exist`（SQLSTATE 42703） |
+| A | 建**手写 17 列最小复刻表**（当作"迁移前"替身；真实模型回滚后是 20 列，见 §14.2/§15.1），跑 Go 的 18 列投影 | `ERROR: column "targets_hash" does not exist`（SQLSTATE 42703） |
 | B | `ALTER TABLE admin_jobs ADD COLUMN targets_hash VARCHAR(64) NULL`（逐字抄自 `backend/admin/migrate_jobs_targets_hash.py:122`），再跑 18 列投影 | 成功，`(0 rows)` |
-| C | 迁移后再跑**旧 17 列**投影 | 成功 —— 加列对旧读兼容 |
+| C | 迁移后再跑**那张 17 列复刻表的投影** | 成功 —— 加列对旧读兼容 |
 | D | `DROP COLUMN targets_hash`（回滚形态），再跑 18 列投影 | 再次 `column "targets_hash" does not exist` |
 
 结合读路径映射（`ListJobs` 错误 → `admin_jobs_native.go:144-145`、`GetJob` → `:173`，均 503
@@ -373,6 +373,11 @@ Windows 宿主限制不变：`httpserver` 仍不能在本机编译（`admin_moni
 当前是"去重生效、留痕不可见"，要真正收口需补 backfill 侧的结构化落痕（写 `admin_logs`
 或持久化 `report["jobs"]`），属新一轮改动，需单独拍板。
 
+> **Wave 7 更新（缺口 1 / 2 已收口）**：本节是 P5/Wave 6 时的状态快照，保留不改。Wave 7 按裁定
+> 补齐了 backfill 的逐组 §16.3 留痕（缺口 1）并把口径统一为 `created/reused/... + child_job_id +
+> targets_hash`（缺口 2），两者的正向与反向（缺 `admin_logs` 表 → 退出码 4）证据见 §15.2 / §15.3。
+
+
 ### 12.2 P6 的前置集成验证（**设计已获批 2026-10-05；七项判据已于 Wave 6 一次性容器全绿，结果与口径修正见 §14**）
 
 落点：一次性容器 `postgres:16-alpine`（不发布端口、跑完即删），schema 由 Python 侧迁移建到临时库，
@@ -383,7 +388,9 @@ Go 用真实 `database/sql` 连它跑 HTTP 集成用例。六项判据：
 - **D1 只验 Python 内部路径**：Go 路由继续 404、`supportedJobTypes` 白名单继续不放行
   （`adminstore/jobs.go:26-30` 不动）。用例里"能创建 reindex_chunks"的一方是 Python
   `JobService.create_job:191` → `_create_reindex_chunks_job:248`，**不得写成"Go store 接受"**。
-- **D2 临时库先进"旧 17 列"形态**，再按真实迁移脚本 `admin/migrate_jobs_targets_hash.py` 加列；
+- **D2 临时库先进"迁移前形态"**（口径修正见 §15.1：Wave 5 曾手写 17 列最小复刻表，Wave 6/7 用真实模型 +
+  真实回滚脚本量得的生产迁移前形态是 **20 列、无 `targets_hash`**），再按真实迁移脚本
+  `admin/migrate_jobs_targets_hash.py` 加列；
   **禁止** `create_all` 一步到位——否则"缺列 503"与"旧列可读"两条判据造不出形态，必假绿。
   （既有可抄的样板：`check_b0_reindex_chunks.py:174-195` 的三件套 bootstrap + 真跑迁移脚本。）
 - **D3 一次性 Docker network**：Python 迁移容器与 Go 测试容器都不发布宿主端口，
@@ -397,7 +404,7 @@ Go 用真实 `database/sql` 连它跑 HTTP 集成用例。六项判据：
 3. 缺 `targets_hash` 列时 Go 读侧 → **结构化 503 `ADMIN_STORE_UNAVAILABLE`**，
    不得退化成"空列表 200"（§11.3 只证到 SQL 层 42703，HTTP 层 503 在集成层补证）。
 4. 跑完迁移脚本加列之后，Go 读侧 → **200 且 `targets_hash` 字段可读**。
-5. 旧 17 列投影（历史行全 NULL）仍能被 Go 真实查询路径读出。
+5. 迁移前形态（复刻表，`targets_hash` 为 NULL）的旧列投影仍能被 Go 真实查询路径读出。
 6. 相同 `targets_hash` 二次提交 → **不产生第二个任务**（`SELECT count(*)` 不增），
    **且能回读既有 child ID**（`report["jobs"][i].job_id` = 既有行 id，非新建 id）。
 7. `failed` / `cancelled` 再提交 → 仍复用同一行，分别走 `retried` / `reset` 分支
@@ -503,7 +510,9 @@ failed_steps=0` / `RESULT: PASS`）。因此 P6 的门槛条件已满足；但**
 - §11.3 的 A/C 两行（17 列复刻表）作为**当时那张表的实测记录**保留，数字不改；
 - 但"旧 17 列"作为**生产 admin_jobs 的形态描述是错的**，往后的行文应读作"迁移前形态（20 列，无 `targets_hash`）"。
   本轮新代码的注释与阶段标题已按实测措辞（编排器阶段 3 标签、判据 5 标题）。
-  要不要回头修 §12.2 D2 / 判据 5 的"17 列"字样，请裁定。
+  **Wave 7 已按此裁定修正**（Wave 7 指令："先修正 17→20 列文档口径"）：§12.2 D2（现第 386 行）与
+  判据 5（现第 402 行）的"旧 17 列"字样统一改读作"迁移前形态（20 列，无 `targets_hash`）"。
+  §11.3 的 A/C 两行是当时那张手写复刻表的实测记录，数字与措辞保持不动。详见 §15.1。
 
 ### 14.3 七项通过标准（本轮真实数字，全绿）
 
@@ -556,8 +565,9 @@ failed_steps=0` / `RESULT: PASS`）。因此 P6 的门槛条件已满足；但**
 - **真实共享库仍零取证**：没跑 `migrate_jobs_targets_hash.py --confirm`，没碰 `gi-phase3-pg` 里的生产形态数据。
 - **Go 写侧未放行**：`supportedJobTypes` 不含 `reindex_chunks`；是否放行是 §13 约定的**用户单独裁定**，
   七项全绿只是把门槛凑齐，不构成自动放行。
-- **P5 缺口 1 / 2 未动**：`backfill_chunk_revisions.py:1077` 仍丢弃 `report["jobs"]`（按 target 的结构化留痕不落表）；
-  键名 `enqueued/reused/retried/reset/rejected` vs 裁定文本 `created/child_job_id` 仍未统一（改名牵动既有断言）。
+- **P5 缺口 1 / 2 未动**（Wave 6 口径）：`backfill_chunk_revisions.py:1077` 曾丢弃 `report["jobs"]`（按 target
+  的结构化留痕不落表）；键名 `enqueued/reused/...` vs 裁定文本 `created/child_job_id` 曾未统一。
+  **→ Wave 7 已收口，正向 + 退出码 4 反向证据见 §15.2 / §15.3。**
 - **前端/真实浏览器**：本轮无前端改动，故无 UI 实测口径可声明。
 - **密钥扫描**：本轮只对 4 个新文件跑扫描器（`paths=4 files=4 bytes=50074 … findings=0 result=pass`），
   加上本文档；`frontend/src`、`go-backend`、`docs` 整体仍在 CI 扫描面外，
@@ -577,4 +587,128 @@ docker network ls --filter name=gi-p6 --format '{{.Name}}' # 期望空
 
 Windows 宿主不能编译 `httpserver`（`syscall.Statfs`），所以 Go 判据**只能**在 linux 容器里取证；
 Go 用例在无 `GI_P6_PG_DSN` 时整体 `t.Skip`，`go test ./...`（CI）永远不会连库。
+
+---
+
+## 15. Wave 7（2026-10-05）：口径修正 + P5 缺口 1/2 收口 + Go 证据补强（skipped=0）
+
+指令原文："先修正 17→20 列文档口径；补齐 backfill 的 jobs 留痕，并统一 created/reused/child_job_id/targets_hash
+结构化字段；补强 Go 集成证据，明确 skipped=0。重跑 Wave 6/P6 门禁后，再单独申请 Go 写侧白名单。继续不跑共享库
+`--confirm`，不 push，不进 S2。" 本节所有绿都是**隔离证据**（一次性容器 / SQLite 载体 / 手写复刻表），非真实共享库取证。
+
+### 15.1 口径修正：17 列 → 迁移前 20 列 / 迁移后 21 列
+
+- 事实真相（Wave 6 §14.2 已量得）：真实模型 + 真实回滚脚本下，`admin_jobs` 迁移前 **20 列**（无
+  `targets_hash`）、迁移后 **21 列**。"旧 17 列"来自 Wave 5 手写的 17 列最小复刻表，只是投影列清单耦合的替身，
+  **不是生产形态**。
+- 本轮按裁定改的两处行文（§14.2:506 的"待裁定"据此结清）：
+  - §12.2 D2（现第 386 行）："旧 17 列形态" → "迁移前形态（20 列、无 `targets_hash`）"，并指向本节；
+  - §12.2 判据 5（现第 402 行）："旧 17 列投影" → "迁移前形态（复刻表，`targets_hash` 为 NULL）的旧列投影"。
+- **不动**：§11.3 A/C 两行是当时那张手写复刻表的实测记录，数字与措辞保留；§14.2 的实测列数账不改。
+
+### 15.2 P5 缺口 1：backfill 逐组 §16.3 留痕落 `admin_logs`（正向 + 退出码 4 反向）
+
+改点（单一真相源复用，不新造形状）：`backend/admin/backfill_chunk_revisions.py`
+
+- `_write_reindex_audit(job_report, trace_id=...)`（`:822`）：把 `report["jobs"]` 逐条写进 `admin_logs`，
+  details 由 `services.reindex_queue.audit_details(...)`（`reindex_queue.py:80`）生成，形状与 Python 内部提交、
+  父任务转交三条路径**同源**。整批一次事务：任一条抛错 → 全批回滚并记 `REINDEX_AUDIT_WRITE_FAILED`
+  （`:1176`），不留半写。`resource_id = child_job_id`（`:879`）。
+- stdout 聚合行键名同步改口径：`jobs_created=`（`:1154`）、`REINDEX_REJECTED child_job_id=`（`:1162`）。
+- 新增退出码 **4（留痕未落盘）**：`admin_logs` 表缺失 → 显式失败（`:846`），优先级高于闭环门（先给 4 再谈 3），
+  审计缺失绝不被计数掩盖。
+
+证据（均为隔离证据，本轮 `/tmp/w7_m5a.txt` 实跑，`M5A_EXIT=0`，`✓` 149 步、`✗` 0）：
+
+| 判据 | 输出行 |
+|---|---|
+| 缺口 1 正向：run() 把逐组 §16.3 结果写进 `admin_logs`（1 行 `job_created`，非仅 stdout 计数） | `/tmp/w7_m5a.txt:58` |
+| 复用轮追加 `job_reused` 行并回读同一 `child_job_id`（留痕到实例，不只聚合数） | `/tmp/w7_m5a.txt:61` |
+| 缺口 2：details 用 `created/child_job_id/targets_hash`，旧名 `enqueued/job_id` 不得出现 | `/tmp/w7_m5a.txt:59` |
+| 退出码 4 反向守卫：`admin_logs` 表缺失 → exit 4 + `REINDEX_AUDIT_WRITE_FAILED`（不静默、不返 3） | `/tmp/w7_m5a.txt:68` |
+
+### 15.3 P5 缺口 2：结构化词表统一（created / child_job_id / targets_hash）
+
+冻结后的唯一口径（三条写入路径 + Go 读侧共用 `reindex_queue` 的常量与映射，不再有 `enqueued`/边界 `job_id`）：
+
+| 语义 | outcome 值（`details.outcome`） | action 值（`admin_logs.action`） | 边界键（details 里指向既有子任务） |
+|---|---|---|---|
+| 新建 | `created` | `job_created` | `child_job_id` = 新行 id |
+| 复用（同 hash 命中 pending） | `reused` | `job_reused` | `child_job_id` = 既有行 id |
+| 失败原地重试 | `retried` | `job_reused` | `child_job_id` = 既有行 id |
+| 取消原地复位 | `reset` | `job_reused` | `child_job_id` = 既有行 id |
+| §16.3 拒写 | `rejected` | `kb_chunk_reindex_failed` | `child_job_id`（`rejected_detail[0]` 带） |
+
+- 聚合键：`AGGREGATE_KEYS = ("created","reused","retried","reset","rejected")`（`reindex_queue.py:68`）。
+- 说明保留：Python **局部变量/kwargs/SQL bind 名仍叫 `job_id`**（`:853` 等），改的是**结构化留痕的对外键名** =
+  `child_job_id`；二者不是同一层，无残留歧义。全仓 `child_job_id` 命中已从 0 变正，旧边界键 `job_id`
+  在 details 断言中作为**负向判据**出现（`p6_disposable_pg_integration_test.go:398` 要求 `job_id` 键不得存在）。
+
+证据（`/tmp/w7_p6.txt`，一次性 PG + Go 容器，`RESULT: PASS`）：
+
+| 判据 | 输出行 / marker |
+|---|---|
+| 判据2 留痕 `outcome=created` 且带同一 `targets_hash` | `/tmp/w7_p6.txt:101` |
+| 判据2 留痕 `child_job_id` = 新建行 id（键名 `child_job_id`，不用 `job_id`） | `/tmp/w7_p6.txt:102` |
+| 判据6 复用留痕 `outcome=reused` + `action=job_reused` | `/tmp/w7_p6.txt:105` |
+| 判据7 `retried`/`reset` 各 1 条留痕 | `/tmp/w7_p6.txt:109`/`:112` |
+| marker 四路径 outcomes 序列 = `[created, reused, retried, reset]`，`detail_child_job_ids=[2,2,2,2]`（四次指向同一既有行），`targets_hash=42d6adf0…61023` | `/tmp/w7_p6.txt:149` |
+
+### 15.4 Go 集成证据补强：skipped=0 显式化
+
+改点：`backend/tests/check_m5_p6_disposable_pg.py` 把 Go 阶段从"前缀 `-run TestP6`"改为**每阶段精确用例名
+alternation**（`GO_EXPECTED_TESTS`，`:60`），并用集合相等核对"预期用例 == 实际跑到用例"，所以：
+
+- 阶段内不再产生 off-phase 的 `t.Skip`（不匹配的 phase 用例根本不进 run 列表）；
+- "matched 0 tests" 单独判红；`skipped` 由 `verdicts` 里 SKIP 计数得出（`:274`），断言 `failed==0 and skipped==0`
+  （`:295`），并打印 `GO_EVIDENCE phase=… expected=… ran=… passed=… failed=… skipped=…`（`:297`）；
+- 收尾账只有两阶段都跑完才给 `go_phases=2 skipped=<n>`，否则写 `skipped=NA`，**杜绝把"没跑"读成"零跳过"**（`:459-463`）。
+
+证据（`/tmp/w7_p6.txt`，本轮实跑）：
+
+```
+GO_EVIDENCE phase=pre_migrate  expected=2 ran=2 passed=2 failed=0 skipped=0   （:59）
+GO_EVIDENCE phase=post_migrate expected=4 ran=4 passed=4 failed=0 skipped=0   （:119）
+P6_DISPOSABLE_SUMMARY criteria=7 failed_criteria=0 failed_steps=0 go_phases=2 skipped=0   （:155）
+RESULT: PASS   （:156，全文 ✗ 计数 = 0）
+```
+
+判据 6 同步升级：断言 `detail_child_job_ids` 四条全等且 = 既有行 id，把"复用/重试/复位都回读同一子任务"钉进留痕对账。
+
+### 15.5 Wave 7 总回归（本轮真实数字，全绿；均隔离证据）
+
+| 门禁 / 套件 | 命令 | 结果 |
+|---|---|---|
+| M5-A backfill 全量（含缺口 1/2 + 退出码 4 守卫） | `check_m5a_revision_backfill.py` | `M5A_EXIT=0`，✓149 步、✗0，末行 `all M5-A acceptance checks passed` |
+| B0 reindex_chunks 闭环 | `check_b0_reindex_chunks.py` | `B0_EXIT=0`，`all M5-B0 reindex_chunks checks passed` |
+| Wave 3 转交连续场景 | `check_m5_wave3_handoff.py` | `WAVE3_EXIT=0`，`RESULT: PASS`，`转交报表 created=1 / outcome=created`（口径已是 created） |
+| P6 一次性 PG + Go 七判据 | `check_m5_p6_disposable_pg.py` | `criteria=7 failed_criteria=0 failed_steps=0 go_phases=2 skipped=0`，`RESULT: PASS` |
+| 统一边界门禁 | `run_unified_boundary_guards.py` | `SUMMARY total=20 failed=0`，密钥自测 `assertions=53 failed=0`，`GUARDS_EXIT=0` |
+| gofmt（改动的 Go 测试文件） | `gofmt -l` | 输出空，`gofmt-exit=0` |
+| 密钥扫描（本轮 13 个改动文件，**扫描范围外的目录仍为待复核项**） | `check_artifact_secrets.py --path ×13` | `paths=13 files=13 findings=0 result=pass`（非"全仓库扫描通过"） |
+
+- 一次性容器/网络零残留：`docker ps -a --filter name=gi-p6`、`docker network ls --filter name=gi-p6` 均空
+  （`/tmp/w7_p6.txt:141-142`）；D3 边界维持。
+
+### 15.6 仍守的边界 + Wave 7 收口后的单独申请
+
+维持（本轮复核）：不改 Go 写侧白名单、不跑真实库 `--confirm`、不碰共享 PG/Neo4j/Milvus、不进 S2、
+不 push、不动 stash。`git branch --show-current = m5/dual-write`，`git rev-parse --short HEAD = 15662b1`，
+13 个改动文件未 staged，本轮只做**本地提交**。远端口径止于"本轮未执行 push、`m5/dual-write` 无 upstream"。
+
+- **Go 写侧白名单：Wave 6/P6 门禁已重跑全绿、缺口 1/2 已收口、skipped=0 已显式化 —— 门槛凑齐。
+  是否把 `reindex_chunks` 加入 `supportedJobTypes`（`adminstore/jobs.go:26-30`）放行，按 §13 约定
+  仍是用户单独裁定；本轮不自行放行，改为在交付后正式提出申请。**
+
+### 15.7 复核命令（Wave 7 口径）
+
+```bash
+cd backend
+PYTHONPATH= python tests/check_m5a_revision_backfill.py    # 期望末行 all M5-A acceptance checks passed，含退出码 4 守卫
+PYTHONPATH= python tests/check_b0_reindex_chunks.py        # 期望 all M5-B0 reindex_chunks checks passed
+PYTHONPATH= python tests/check_m5_wave3_handoff.py         # 期望 RESULT: PASS（报表口径 created=1）
+PYTHONPATH= python tests/check_m5_p6_disposable_pg.py      # 期望 criteria=7 failed=0 … go_phases=2 skipped=0 / RESULT: PASS
+PYTHONPATH= python tests/run_unified_boundary_guards.py    # 期望 SUMMARY total=20 failed=0
+```
+
 
