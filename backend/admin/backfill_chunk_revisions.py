@@ -419,7 +419,12 @@ def _load_milvus_chunks(kb_id: str) -> Dict[str, Dict[str, Any]]:
         return {}
     output_fields = _milvus_query_output_fields(client, cfg_collection)
     if output_fields is None:
-        output_fields = MILVUS_BASE_OUTPUT_FIELDS + ["content_revision"]
+        # F3（审计发现，本轮整改）：schema 探测失败时**不再无条件**请求 content_revision——
+        # 在无该显式字段的 v2 上请求它会直接让 query 报错，把"有向量"错报成读取失败。
+        # 口径改为与写侧同源：只有显式 INT64 字段确实存在时才追加（同一 helper）。
+        output_fields = list(MILVUS_BASE_OUTPUT_FIELDS)
+        if _milvus_has_revision_field(client, cfg_collection):
+            output_fields.append("content_revision")
     filter_expr = milvus_kb_filter([kb_id])
     rows: Dict[str, Dict[str, Any]] = {}
     offset = 0

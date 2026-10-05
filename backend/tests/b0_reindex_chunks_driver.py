@@ -423,6 +423,89 @@ def scenario_dual_write_shadow_failure() -> None:
     )
 
 
+class ReadbackClient:
+    """写入后回读（F2）用假体：upsert 真记录；query 按 mismatch 开关回读。"""
+
+    def __init__(self, *, mismatch: bool):
+        self.upserts: Dict[str, list] = {}
+        self.mismatch = mismatch
+
+    def has_collection(self, name):
+        return True
+
+    def upsert(self, *, collection_name, data):  # noqa: A002 - 匹配 pymilvus 关键字
+        self.upserts.setdefault(collection_name, []).append(data)
+        return {"upsert_count": len(data)}
+
+    def query(self, *, collection_name, filter, output_fields, limit=None):  # noqa: A002
+        rows = [row for page in self.upserts.get(collection_name, []) for row in page]
+        out = []
+        for row in rows[: (limit or len(rows))]:
+            rev = row.get("content_revision")
+            out.append(
+                {
+                    "chunk_id": row.get("chunk_id"),
+                    "text": row.get("text", ""),
+                    # mismatch=True 模拟"upsert 报成功但读回版本不对"（F2 要抓的形态）
+                    "content_revision": (int(rev) + 1) if (self.mismatch and rev is not None) else rev,
+                }
+            )
+        return out
+
+
+def _install_real_vector_write(client) -> None:
+    """向量腿保持**真实** `_write_milvus_projection` + 真实 `upsert_chunks`，只换 client。
+
+    注意导入形态：必须取**单例** `services.embedding_service.embedding_service`；
+    `from services import embedding_service` 拿到的是模块，补丁不会作用于 worker 使用的实例
+    （本轮实测踩过：模块级赋值静默无效，向量腿仍走真实 embedding → 数量不一致）。
+    """
+    from services.embedding_service import embedding_service
+
+    worker._write_neo4j_projection = W.fake_graph
+    worker.get_projection_capabilities = lambda: {"graph": True, "vector": True}
+    worker._existing_milvus_fields = lambda kb_id, chunk_ids: {}
+    embedding_service.embed_texts = lambda texts: [[0.1, 0.2] for _ in texts]
+    embedding_service.config = lambda: {"model": "m-test"}
+    embedding_service.content_hash = lambda value: "h-test"
+
+    from services.vector_store import vector_store
+
+    vector_store._get_client = lambda: client
+    vector_store._revision_field = {"graphinsight_chunks_v2": True}
+    vector_store.is_enabled = lambda: True
+    vector_store.config = lambda: {
+        "enabled": True,
+        "provider": "milvus",
+        "collection": "graphinsight_chunks_v2",
+        "dual_write": False,
+        "shadow_collection": "",
+    }
+    vector_store.ensure_collection = lambda **k: None
+    vector_store.has_content_revision_field = lambda *a, **k: True
+
+
+def scenario_readback_verified() -> None:
+    """F2 正向：写入后回读一致（text + content_revision 都对）→ vector indexed。"""
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    client = ReadbackClient(mismatch=False)
+    _install_real_vector_write(client)
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+    print("__MILVUS_WRITTEN__" + json.dumps(client.upserts, ensure_ascii=False, default=str))
+
+
+def scenario_readback_mismatch() -> None:
+    """F2 反向：upsert 数量确认通过但**回读版本不一致** → fail-closed 记 write_failed。"""
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    client = ReadbackClient(mismatch=True)
+    _install_real_vector_write(client)
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+
+
 def scenario_current_moved() -> None:
     _seed_kb()
     _seed_doc(DOC)
@@ -747,6 +830,8 @@ SCENARIOS = {
     "revision_field_absent": scenario_revision_field_absent,
     "graph_write_failed": scenario_graph_write_failed,
     "dual_write_shadow_failure": scenario_dual_write_shadow_failure,
+    "readback_verified": scenario_readback_verified,
+    "readback_mismatch": scenario_readback_mismatch,
     "current_moved": scenario_current_moved,
     "current_deleted_race": scenario_current_deleted_race,
     "idempotent_rerun": scenario_idempotent_rerun,

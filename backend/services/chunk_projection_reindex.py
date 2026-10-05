@@ -350,6 +350,79 @@ def _existing_milvus_fields(kb_id: str, chunk_ids: List[str]) -> Dict[str, Dict[
     return merged
 
 
+MILVUS_READBACK_FIELDS = ("chunk_id", "text", "content_revision")
+
+
+def _verify_milvus_readback(
+    kb_id: str,
+    items: List[Dict[str, Any]],
+    collection: str,
+) -> Optional[bool]:
+    """写入后回读校验（审计发现 F2）。
+
+    返回三态，**绝不把"没校验"读成"已校验"**：
+      True  = 每条 chunk 都能读回，且 `content_revision == target`、`text` 与写入内容一致；
+      False = 读回成功但与写入不一致（调用方必须记 write_failed，禁止标 indexed）；
+      None  = 无法校验（store 未启用 / client 不支持 query / 读回抛错）→ 告警并保留数量口径。
+
+    client 取自 `vector_store._get_client()`（与 mutation 同一条连接来源）：生产环境是真 client，
+    隔离假体若不支持 query 会走 None 分支，从而不影响既有隔离测试的语义。
+    """
+    from services.vector_store import vector_store
+
+    try:
+        client = vector_store._get_client()
+    except Exception as exc:  # noqa: BLE001 - 取不到 client 不等于写入失败，但必须显式告警
+        logger.warning(
+            "reindex_chunks 写入后回读不可用：无法获取 Milvus client",
+            context={"kb_id": kb_id, "error": str(exc)[:200]},
+        )
+        return None
+    query = getattr(client, "query", None)
+    if not callable(query):
+        logger.warning(
+            "reindex_chunks 写入后回读不可用：client 不支持 query（隔离假体）",
+            context={"kb_id": kb_id, "collection": collection},
+        )
+        return None
+    chunk_ids = [str(item.get("chunk_id") or "") for item in items]
+    expr = " && ".join(
+        [
+            milvus_kb_filter([kb_id]),
+            "chunk_id in [" + ", ".join(f'"{_escape(cid)}"' for cid in chunk_ids) + "]",
+        ]
+    )
+    try:
+        rows = list(
+            query(
+                collection_name=collection,
+                filter=expr,
+                output_fields=list(MILVUS_READBACK_FIELDS),
+                limit=len(chunk_ids),
+            )
+            or []
+        )
+    except Exception as exc:  # noqa: BLE001 - 读回失败无法判定一致性 → 走 None 并告警
+        logger.warning(
+            "reindex_chunks 写入后回读失败",
+            context={"kb_id": kb_id, "collection": collection, "error": str(exc)[:200]},
+        )
+        return None
+    got = {str(row.get("chunk_id") or ""): row for row in rows if isinstance(row, dict)}
+    for item in items:
+        row = got.get(str(item.get("chunk_id") or ""))
+        if row is None:
+            return False
+        if str(row.get("text") or "") != str(item.get("content") or ""):
+            return False
+        try:
+            if int(row.get("content_revision")) != int(item.get("target_revision")):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def _write_milvus_projection(
     kb_id: str,
     items: List[Dict[str, Any]],
@@ -416,6 +489,21 @@ def _write_milvus_projection(
                 outcome[item["chunk_id"]] = OUTCOME_WRITE_FAILED
             continue
         state = OUTCOME_INDEXED if written == len(chunks) else OUTCOME_WRITE_FAILED
+        if state == OUTCOME_INDEXED:
+            # F2：数量确认之后必须再回读校验（写入 != 可读回）。读回不一致 → fail-closed 记 write_failed。
+            collection = str((vector_store.config() or {}).get("collection") or "")
+            verified = _verify_milvus_readback(kb_id, batch, collection)
+            if verified is False:
+                logger.warning(
+                    "reindex_chunks 写入后回读不一致 → 记 write_failed（fail-closed）",
+                    context={"kb_id": kb_id, "collection": collection, "chunks": len(chunks)},
+                )
+                state = OUTCOME_WRITE_FAILED
+            elif verified is None:
+                logger.warning(
+                    "reindex_chunks 写入后回读不可用：本批 indexed 仅基于 upsert 数量确认（未回读）",
+                    context={"kb_id": kb_id, "collection": collection},
+                )
         for item in batch:
             outcome[item["chunk_id"]] = state
     return outcome

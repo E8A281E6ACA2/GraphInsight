@@ -544,6 +544,57 @@ def section_g(h: Harness) -> None:
     step("current 行终态 indexed/1 双侧一致", rev_map(out).get("c-1", {}).get("graph_status") == "indexed" and rev_map(out).get("c-1", {}).get("vector_content_revision") == 1, f"revs={rev_map(out)}")
 
 
+# ---------------------------------------------------------------------------
+# E3. F2 写入后回读校验（审计发现 → 产品整改的回归网）
+# ---------------------------------------------------------------------------
+
+
+def section_e3(h: Harness) -> None:
+    print("[E3] F2 写入后回读：一致 → indexed；不一致 → fail-closed write_failed")
+
+    out = scenario(h, "readback_ok.db", "readback_verified")
+    counts = counts_of(out)
+    revs = rev_map(out)
+    written = obj_marker(out, "__MILVUS_WRITTEN__")
+    rows_written = (written.get("graphinsight_chunks_v2") or [[]])[0]
+    step(
+        "上写行携带显式 content_revision（回读比对的基准）",
+        bool(rows_written) and rows_written[0].get("content_revision") == 1,
+        f"written={written}",
+    )
+    row = revs.get("c-1", {})
+    step(
+        "回读一致 → 向量腿 indexed 且 vector_content_revision=target",
+        counts.get("vector_indexed") == 1
+        and row.get("vector_status") == "indexed"
+        and row.get("vector_content_revision") == 1,
+        f"counts={counts} row={row}",
+    )
+
+    out = scenario(h, "readback_bad.db", "readback_mismatch")
+    counts = counts_of(out)
+    revs = rev_map(out)
+    row = revs.get("c-1", {})
+    step(
+        "upsert 数量确认通过但回读版本不一致 → 记 write_failed（不虚报 indexed）",
+        counts.get("vector_failed") == 1
+        and counts.get("vector_indexed") == 0
+        and row.get("vector_status") == "failed"
+        and row.get("vector_content_revision") is None,
+        f"counts={counts} row={row}",
+    )
+    step(
+        "回读不一致告警可定位（日志含原因文案）",
+        "写入后回读不一致" in out,
+        out[-300:],
+    )
+    step(
+        "图腿不受影响（失败隔离在向量腿）",
+        counts.get("graph_indexed") == 1,
+        f"counts={counts}",
+    )
+
+
 def main() -> int:
     print("=" * 60)
     print("GraphInsight M5-B0 reindex_chunks worker acceptance tests (sqlite)")
@@ -562,6 +613,7 @@ def main() -> int:
         section_e2(h)
         section_f(h)
         section_f2(h)
+        section_e3(h)
         section_g(h)
     print("-" * 60)
     if FAILURES:

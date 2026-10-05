@@ -560,6 +560,33 @@ v3 backfill 路线图阶段 3 要求"真实数据读回 / 失败注入 / 回滚 
 
 ---
 
+---
+
+### 9.8 canary 前置审计发现 F2/F3 整改（2026-10-05 · 分支 `integration/m5-phase3-4-p6`）
+
+前置审计（`docs/ENTERPRISE_M5_MILVUS_V3_CANARY_PREAUDIT.md` §4）的 F2/F3 已整改，判据在隔离层可回归：
+
+| 发现 | 整改 | 落点（file:line 现树实测） |
+|---|---|---|
+| F2：worker 无写入后回读校验（`indexed` 仅依据 upsert 数量） | 新增 `_verify_milvus_readback()`：写入数量确认通过后再回读 `chunk_id/text/content_revision`。三态**绝不把"没校验"读成"已校验"**——`True`（一致）/`False`（不一致 → 记 `write_failed`，fail-closed）/`None`（store 未启用、client 不支持 query、读回抛错 → 告警并保留数量口径） | `backend/services/chunk_projection_reindex.py`（`_verify_milvus_readback` + `_write_milvus_projection` 调用点） |
+| F3：`_load_milvus_chunks` schema 探测失败时无条件请求 `content_revision`（v2 上直接 query 报错） | 回退改为：仅当显式 INT64 字段确实存在时才追加 `content_revision`（复用写侧同一 helper `_milvus_has_revision_field`） | `backend/admin/backfill_chunk_revisions.py`（`_load_milvus_chunks`） |
+
+**回归网（新增，钉住整改）**：`backend/tests/check_b0_reindex_chunks.py` 新增 E3 分节 5 断言——上写行携带显式
+`content_revision`、回读一致 → `vector_indexed`、回读不一致 → `write_failed`（`vector_content_revision` 保持 NULL）、
+告警可定位、图腿不受牵连；驱动新增 `readback_verified` / `readback_mismatch` 场景，向量腿走**真实**
+`_write_milvus_projection` + 真实 `upsert_chunks`，只替换 client。
+
+**本轮实测**：`check_b0_reindex_chunks.py` 全绿；统一门禁 `SUMMARY total=21 failed=0`；M5 家族 8 项全绿
+（`m5_dual_write` 23/23、`m5a` 全绿、`m5_wave3_handoff` PASS、`build_graph_shadow_retry` PASS、
+`m5_build_graph_revision` 22/22、`kb_scope_isolation` 全绿、`backfill_manifest` 全绿）；
+F2/F3 整改后 Phase 4 **仅**跑未授权预检（零连接、零落盘、exit 3）。
+
+**如实记录的两条边界**：① F2 的 `None` 分支在隔离假体（client 无 `query`）下仍保留数量口径；真实 Milvus 上的
+强校验由 Phase 4 canary 的"写入后读回"承担，不得据此宣称"worker 在所有环境下都已回读校验"。
+② 本轮踩到测试夹具陷阱：`from services import embedding_service` 取到的是**模块**，
+必须取单例 `from services.embedding_service import embedding_service`，否则补丁静默无效、
+向量腿会走真实 embedding（已在驱动注释中固化该口径）。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
