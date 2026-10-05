@@ -142,15 +142,6 @@ def _sha256(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
 
 
-def _canonical_targets_hash(targets: List[Dict[str, Any]]) -> str:
-    ordered = sorted(
-        [{"chunk_id": str(t["chunk_id"]), "target_revision": int(t["target_revision"])} for t in targets],
-        key=lambda item: (item["chunk_id"], item["target_revision"]),
-    )
-    canon = json.dumps(ordered, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
-
-
 # ---------------------------------------------------------------------------
 # 证据加载（外部依赖封装为模块级函数，测试以 patch 替换）
 # ---------------------------------------------------------------------------
@@ -809,57 +800,22 @@ def _update_projection_state(
     )
 
 
-def _enqueue_reindex_jobs(targets: List[Dict[str, Any]], trace_id: str) -> Dict[str, int]:
-    """needs_reindex_targets 按 doc_id 分组生成 current revision 的 reindex targets 入队（§15.3 步骤 7）。"""
-    report = {"enqueued": 0, "reused": 0, "targets": 0}
-    if not targets:
-        return report
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for item in targets:
-        groups.setdefault(str(item.get("doc_id") or ""), []).append(item)
-    with engine.begin() as conn:
-        if not _table_exists(conn, "admin_jobs"):
-            raise RuntimeError("admin_jobs 表不存在，请先执行任务中心迁移")
-        for doc_id, group in sorted(groups.items()):
-            payload_targets = [
-                {"chunk_id": item["chunk_id"], "target_revision": item["target_revision"]} for item in group
-            ]
-            payload_targets.sort(key=lambda t: (t["chunk_id"], t["target_revision"]))
-            targets_hash = _canonical_targets_hash(payload_targets)
-            tenant_id = next((item["tenant_id"] for item in group if item["tenant_id"]), "")
-            project_id = next((item["project_id"] for item in group if item["project_id"]), "")
-            kb_id = group[0]["kb_id"]
-            payload = {
-                "kb_id": kb_id,
-                "tenant_id": tenant_id,
-                "project_id": project_id,
-                "doc_id": doc_id or None,
-                "source": "backfill_m5a",
-                "targets": payload_targets,
-            }
-            result = conn.execute(
-                text(
-                    "INSERT INTO admin_jobs (job_type, status, tenant_id, project_id, kb_id, payload, "
-                    "retry_count, max_retries, trace_id, targets_hash) "
-                    "VALUES ('reindex_chunks', 'pending', :tenant_id, :project_id, :kb_id, :payload, "
-                    "0, 3, :trace_id, :targets_hash) "
-                    "ON CONFLICT (job_type, kb_id, targets_hash) WHERE targets_hash IS NOT NULL DO NOTHING"
-                ),
-                {
-                    "tenant_id": tenant_id or None,
-                    "project_id": project_id or None,
-                    "kb_id": kb_id,
-                    "payload": json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                    "trace_id": trace_id,
-                    "targets_hash": targets_hash,
-                },
-            )
-            report["targets"] += len(payload_targets)
-            if result.rowcount:
-                report["enqueued"] += 1
-            else:
-                report["reused"] += 1
-    return report
+def _enqueue_reindex_jobs(targets: List[Dict[str, Any]], trace_id: str) -> Dict[str, Any]:
+    """needs_reindex_targets 按 doc_id 分组生成 current revision 的 reindex targets 入队（§15.3 步骤 7）。
+
+    §16.3 的去重/复用/重试分支只在 services.reindex_queue 实现一次：这里若再留一份
+    INSERT SQL，build_graph 侧的入队与 backfill 侧的入队会对同一 (job_type, kb_id,
+    targets_hash) 给出不同判定，运维看到的 jobs_reused 就不再可信。
+    """
+    from services.reindex_queue import enqueue_reindex_jobs
+
+    return enqueue_reindex_jobs(
+        targets,
+        source="backfill_m5a",
+        trace_id=trace_id,
+        max_retries=3,
+        engine=engine,
+    )
 
 
 def evaluate_gate(inventory: Inventory) -> Dict[str, Any]:
@@ -1121,8 +1077,17 @@ def run(kb_id: str, dry_run: bool) -> int:
         job_report = _enqueue_reindex_jobs(fresh_inventory.needs_reindex_targets, trace_id)
         print(
             f"[reindex] jobs_enqueued={job_report['enqueued']} jobs_reused={job_report['reused']} "
-            f"targets_total={job_report['targets']}"
+            f"jobs_retried={job_report['retried']} jobs_reset={job_report['reset']} "
+            f"jobs_rejected={job_report['rejected']} targets_total={job_report['targets']}"
         )
+        # §16.3 超限拒绝必须点名到 chunk：只报 rejected 计数，运维就不知道是哪条 job 卡死，
+        # 门会一直 OPEN 却无人可干预。
+        for item in job_report.get("rejected_detail") or []:
+            print(
+                f"REINDEX_REJECTED job_id={item['job_id']} kb_id={item['kb_id']} "
+                f"targets_hash={item['targets_hash']} retry_count={item['retry_count']}/{item['max_retries']} "
+                f"chunk_ids={','.join(item['chunk_ids'])}"
+            )
 
     # job 尚未执行时 needs_reindex 不收敛，门保持 OPEN
     fresh_gate = evaluate_gate(fresh_inventory)
