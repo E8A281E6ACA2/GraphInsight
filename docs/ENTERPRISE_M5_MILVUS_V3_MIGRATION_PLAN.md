@@ -302,8 +302,12 @@ S1 双写要落显式 INT64 revision，前提是本仓建图路径自己能建�
    建的部分唯一索引 `uq_admin_jobs_targets_hash`，ORM 再声明单列索引会让 `create_all` 出的库多出一个
    已迁移库没有的 `ix_admin_jobs_targets_hash`，而 SQLite 的 `ALTER TABLE … DROP COLUMN` 在列仍被索引
    引用时直接报错，把迁移回滚堵死（`check_m5a_revision_backfill.py` [B] 三条断言因此转红，本轮修回）。
-   注意：Go 控制面仍无 `reindex_chunks`（`go-backend/internal/adminstore/jobs.go:27-29` allowedJobTypes），
-   §7 reindex-chunks HTTP 端点整体 NOT-IMPLEMENTED，HTTP 409 映射不在 Python 侧。
+   注意：Go 控制面仍不接受 `reindex_chunks`——白名单标识符是 `supportedJobTypes`
+   （`go-backend/internal/adminstore/jobs.go:26-30`，仅 build_graph/clear_kb/reindex），
+   `validateJobCreateRequest`（`jobs.go:647-650`）在 INSERT 之前返回 `ErrJobValidation`，
+   映射为 HTTP 400 `INVALID_BODY`（`go-backend/internal/httpserver/admin_jobs_native.go:758-761`）。
+   §7 reindex-chunks HTTP 端点整体 NOT-IMPLEMENTED；§16.3 文里的 HTTP 409 / `JOB_409` 映射在
+   Go 与 Python 两侧都不存在（NOT-IMPLEMENTED，Wave 4-2 实测核实）。
 4. **作业（父）终态 → 投影（子）回写**：`services/chunk_projection_state.py:132 write_back_job_failure`
    两条腿各自用 `CASE WHEN < > 'indexed'` 只降级未收敛侧，已 indexed 的腿不回退；CAS 条件
    `content_revision=target_revision AND revision_status='current'`，current 已被并发移动则计入
@@ -324,6 +328,44 @@ continuity / terminal_exhausted / terminal_crash / retry_not_terminal / index_un
 
 - **未做**：真实 Neo4j/Milvus/PG 上的转交与回写验证（`check_m5a_live_execution.py --confirm` 会写真实库，
   仍未获授权、未运行）、v3 建集合与切读源、§5.1/§5.2 canary、Go 侧 reindex-chunks 端点与 409 映射。
+
+---
+
+### 9.4 实现落地记录（2026-10-05 · Wave 4 验证轮，分支 `m5/dual-write`）
+
+用户指令边界：本轮**仅**总回归 + 前端/Go 任务中心验证 + 隔离 fail-closed 守卫 + 审计交付；
+不运行任何 `--confirm`、不连真实 Neo4j/Milvus、不 push、不 amend。交审后才裁方向 B 与 push。
+完整证据与复核命令见 `docs/ENTERPRISE_M5_WAVE4_AUDIT_PACKAGE_2026-10-05.md`（下称"Wave 4 审计包"）。
+
+- **总回归**（新鲜实跑，均 EXIT=0）：统一门禁两轮 `SUMMARY total=20 failed=0`；
+  `check_m5_wave3_handoff` 71 条断言 0 失败、`check_m5_dual_write passed=23 failed=0`、
+  `check_m5_build_graph_revision passed=22 failed=0`、`check_kb_scope_isolation passed=55 failed=0`、
+  `check_build_graph_shadow_retry` / `check_b0_reindex_chunks` / `check_m5a_revision_backfill`（[A]–[D]）通过。
+- **Go / 前端口径改正（本轮实核，覆盖 §9.3 的错误表述）**：白名单实名是
+  `supportedJobTypes`（`go-backend/internal/adminstore/jobs.go:26-30`），不是 `allowedJobTypes`；
+  不支持的类型由 `validateJobCreateRequest`（`jobs.go:647-650`）在 INSERT 前返回
+  `ErrJobValidation` → HTTP **400 `INVALID_BODY`**（`internal/httpserver/admin_jobs_native.go:758-761`）。
+  仓库内不存在 `JOB_409` / 409 作业映射（Go、Python 两侧均 NOT-IMPLEMENTED）。同口径已同步
+  `services/reindex_queue.py` 与 `admin/services/job_service.py` 的 docstring。
+- **任务中心处置事实**（只报不改）：写侧关门（Go 白名单 400）、读侧开门（`ListJobs`/`GetJob`/
+  `RetryJob`/`CancelJob` 无类型闸门）、`targets_hash` 对 Go DTO 与前端完全不可见、前端
+  `JobType`/`jobTypeOptions` 缺 `reindex_chunks`、Python `JobService.create_job` 无 HTTP 调用方、
+  白名单判定无 Go 单测。逐条 file:line 见 Wave 4 审计包 §4.1（W4-F1～F6）。
+- **Go 侧证据边界**：`go test ./internal/adminstore/` ok（含 3 个 Job 测试通过）；
+  `internal/httpserver` 在 Windows 宿主**构建失败**（`admin_monitor_native.go:896-899` 用 Unix-only
+  `syscall.Statfs`，该文件最后改动 `a053532`/2026-07-27，本轮提交集不含任何 `.go`）——既有平台限制，
+  非本轮回归；`GOOS=linux go vet ./internal/httpserver/` 与 `GOOS=linux go build ./...` 均 EXIT=0。
+- **隔离 fail-closed 静态守卫**（`backend/tests/check_migration_cleanup_guards.py`，既有
+  `migration_cleanup` 门禁项内扩展，不新增 case）：对所有 tracked 且含 `create_all(`/`create_engine(`
+  的 `backend/tests/*.py` 要求 ①禁裸 `DATABASE_URL` ②方言闸门 ③非 driver 必须钉
+  `GRAPHINSIGHT_BACKEND_ENV_FILE` + `ADMIN_DATABASE_URL` + `sqlite:///`；扫描面只用 `git ls-files`，
+  git 失败/追踪文件缺失/扫描面为空一律 raise。真树 findings=0；红证用**真实脚本源码**在内存里把
+  `ADMIN_DATABASE_URL` 退化成 `DATABASE_URL`（本轮事故形态）→ 必判红。见审计包 §5。
+- **事故记录（用户 2026-10-05 钦定口径，逐字）**：发生共享开发 PG 连接及 DDL 尝试，已检查范围内
+  未观察到持久化变化；因无事前全库快照，保留不可完全判定窗口。根因是探针脚本把注入变量写成
+  `DATABASE_URL`（正确名 `ADMIN_DATABASE_URL`）被 `admin/database.py` 静默忽略；"已检查范围"清单与
+  为何不做二次连库复核，见审计包 §6。本轮防再犯措施即上条静态守卫。
+
 
 ---
 

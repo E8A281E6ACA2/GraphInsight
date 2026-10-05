@@ -261,9 +261,10 @@ class JobService:
         `db.rollback()` 只能回滚一半，留下孤零零的 pending job。
 
         超限拒绝用 3xxx `OPERATION_NOT_ALLOWED` + 结构化 details 表达。§16.3 文里写的
-        HTTP 409 映射在 Go 控制面（`go-backend/internal/adminstore/jobs.go:27-29` 的
-        allowedJobTypes 尚无 reindex_chunks，§7 reindex-chunks 端点整体未落地），
-        Python 侧不新增错误码。
+        HTTP 409 映射在 Go 控制面并不存在：`go-backend/internal/adminstore/jobs.go:26-30`
+        的 `supportedJobTypes` 尚无 reindex_chunks，`validateJobCreateRequest` 会在
+        INSERT 前返回 `ErrJobValidation`，由 `admin_jobs_native.go:758-761` 映射为
+        HTTP 400 `INVALID_BODY`（409 映射 NOT-IMPLEMENTED），Python 侧不新增错误码。
         """
         scope, payload = self._resolve_job_scope(db, job_type=REINDEX_CHUNKS_JOB_TYPE, request=request)
         try:

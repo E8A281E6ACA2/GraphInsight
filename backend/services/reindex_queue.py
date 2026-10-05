@@ -21,8 +21,11 @@
 并发：Postgres 路径在冲突回读前 `SELECT ... FOR UPDATE` 锁既有行（§16.3 v3.2 收口）；
 SQLite 无行锁语义，靠单写者事务 + 唯一索引兜底，因此锁只在方言为 postgresql 时下发。
 
-不覆盖：HTTP 409 `JOB_409` 映射在 Go 控制面（§7 reindex-chunks 端点整体未落地，
-`go-backend/internal/adminstore/jobs.go:27-29` 的 allowedJobTypes 尚无 reindex_chunks）。
+不覆盖：Go 控制面的 reindex_chunks HTTP 入口。`go-backend/internal/adminstore/jobs.go:26-30`
+的 `supportedJobTypes` 白名单仍无 `reindex_chunks`，`validateJobCreateRequest`
+（`jobs.go:647-650`）在 INSERT 之前返回 `ErrJobValidation`，由
+`go-backend/internal/httpserver/admin_jobs_native.go:758-761` 映射为 HTTP 400
+`INVALID_BODY`；仓库内不存在 409 / `JOB_409` 的作业状态映射（NOT-IMPLEMENTED）。
 本模块按 §16.3 不新增错误码，只把"超限拒绝"作为结构化结果返回给调用方。
 """
 from __future__ import annotations
