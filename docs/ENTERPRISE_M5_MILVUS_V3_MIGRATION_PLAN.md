@@ -265,9 +265,13 @@ S1 双写要落显式 INT64 revision，前提是本仓建图路径自己能建�
   现该脚本在任何 backend 模块导入前把 `ADMIN_DATABASE_URL` 钉到临时 SQLite
   （`GRAPHINSIGHT_BACKEND_ENV_FILE`，唯一能盖过 `backend/.env` 的入口），入口断言方言必须为
   sqlite（否则 exit 9），并新增"revision 行只落临时库"复核（passed=55 failed=0）。
-  泄漏发生时开发库的完整行内容已留档：`kb_id='kb-a', doc_id='doc-a', chunk_id='doc-a-000',
-  content_revision=1, revision_status=current, graph_status=indexed, vector_status=indexed,
-  reason='build_graph_m5_wave2'`；该行不属于任何真实 KB，**删除需单独授权，本轮未动**。
+  泄漏发生时开发库的完整行内容已留档：`revision_id=17, kb_id='kb-a', doc_id='doc-a',
+  chunk_id='doc-a-000', content_revision=1, revision_status=current, graph_status=indexed,
+  vector_status=indexed, reason='build_graph_m5_wave2'`。经授权后该行已于 2026-10-05 删除
+  （`DELETE 1`，删后 `SELECT count(*) FROM chunk_revisions` = 0；`knowledge_base_documents`
+  无 doc-a/doc-b 残留、`admin_jobs` 无该 reason 残留），删除前整表数据备份在
+  `artifacts/dev_db_backups/chunk_revisions_stray_row_2026-10-05.sql`（gitignored，含
+  `setval` 序列位）。
 - **未做**：真实 Neo4j/Milvus 侧的 revision 写入验证、v3 建集合、切读源、§5.1/§5.2 canary——
   这些仍需单独授权；影子失败持久转交与连续场景在下一波（Wave 3）。
 
