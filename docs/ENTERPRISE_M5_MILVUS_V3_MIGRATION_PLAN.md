@@ -975,6 +975,25 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 默认 `--dry-run` 打印计划（exit 3）；执行需 `--authorize NONEMPTY-DISPOSABLE-AUTHORIZED`，执行范围另行确认。
 已知约束：一次性 Milvus standalone（内嵌 etcd）可能起不来，起不来则 fail-closed 报 FAIL，不假绿。
 
+---
+
+### 9.17 扫描规则区分两类（第五轮 · 2026-10-06）
+
+上轮新增的 `check_m5_nonempty_disposable.py` 被 `check_migration_cleanup_guards.py` 的 SQLite 隔离
+铁律误判（其 `create_all` 出现在字符串里、用真实引擎，却缺"sqlite URL + 方言 fail-closed"）。为此把
+扫描规则**明确区分两类**，不通过放宽 sqlite 判据解决：
+
+| 类 | 判据 | 自证 |
+|---|---|---|
+| SQLite 隔离测试 | 继续要求 sqlite URL + 方言 fail-closed（不变） | 既有正向 + 负向自证 |
+| 真实 disposable 测试 | 固定独立端口（禁共享端口 5432/5434/7474/7687/9003/19530/19531/29530/29531/55432）、独立容器/卷（docker 编排）、显式授权（--authorize/--confirm）、禁止默认 env 回落（显式钉 ADMIN_DATABASE_URL） | 新增正向（合规样本放行）+ 负向（缺授权门 / 共享端口 / 未钉 ADMIN_DATABASE_URL 判红） |
+
+识别特征 = 真实引擎（postgresql/psycopg/MilvusClient/GraphDatabase.driver/neo4j）+ docker 编排；作用面
+与 SQLite 隔离判据相同（建引擎/建表的脚本）。命中者从 SQLite 判据跳过，改由新判据约束。
+
+回归（实跑）：统一门禁 `total=23 failed=0`（migration_cleanup 通过）；契约矩阵 `77/0`、护栏自检 `12/0`、B0（含 E4–E6）全绿不变。
+连接范围不变：零真实服务连接，未 push；M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
