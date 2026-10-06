@@ -179,6 +179,12 @@ CASES: tuple[GuardCase, ...] = (
         120,
         "M5 非空 disposable 执行器离线故障注入契约（证据 fail-closed / finally 保护 / 不创建容器）",
     ),
+    GuardCase(
+        "m5_disposable_regressions",
+        "check_m5_disposable_regressions.py",
+        120,
+        "M5 非空 disposable 真实执行暴露的四个缺陷离线回归（建索引后 load / 确定性 embedding 不外连 / flush+load 后读回 / 端口占用 fail-closed）",
+    ),
 )
 
 
