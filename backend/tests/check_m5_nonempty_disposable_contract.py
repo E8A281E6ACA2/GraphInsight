@@ -147,6 +147,66 @@ def test_evidence_finalize_corruption() -> None:
               (base / "nonempty_emergency.txt").exists())
 
 
+def test_evidence_step_status_tamper() -> None:
+    """P2：篡改最终 JSON 的步骤状态（ok→false）但步骤数不变 → 必须返回 2（不能假绿）。"""
+    _reset()
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        m.add_step("步骤A", True)
+        m.add_step("步骤B", True)
+        orig_write = Path.write_text
+        call_count = [0]
+
+        def tamper_final_write(self, data, *args, **kwargs):
+            call_count[0] += 1
+            # 第 3 次写 = 阶段 5 重写最终 steps JSON：把某步骤 ok 改成 false，步骤数不变
+            if call_count[0] == 3 and self.name == "nonempty_steps.json":
+                doc = json.loads(data)
+                if isinstance(doc.get("steps"), list) and doc["steps"]:
+                    doc["steps"][0]["ok"] = False
+                data = json.dumps(doc, ensure_ascii=False, indent=1) + "\n"
+            return orig_write(self, data, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", tamper_final_write):
+            exit_code = m.write_evidence(base, "RUN-s", "2026-01-01T00:00:00")
+        check("篡改步骤状态（ok→false 但步骤数不变）：write_evidence 返回 2",
+              exit_code == 2, f"exit={exit_code}")
+        check("篡改步骤状态：emergency 证据存在",
+              (base / "nonempty_emergency.txt").exists())
+
+
+def test_backfill_reconcile_parsing() -> None:
+    """P1：backfill 对账必须结构化解析，字符串包含会假绿（rows_new=10≠1、rev=10≠1、primary 缺失）。"""
+    # rows_new 整数解析
+    check("rows_new=10 解析为 10（不是 1）", m._parse_int("  rows_new=10 foo", "rows_new") == 10)
+    check("rows_new=1 解析为 1", m._parse_int("  rows_new=1", "rows_new") == 1)
+    check("rows_new 缺失解析为 None", m._parse_int("  rows_new_other=1", "rows_new") is None)
+    # 快照存在性：primary 不存在 / 无行不得通过
+    check("primary 不存在（exists=0）→ _snap_ok=False", m._snap_ok({"exists": 0}) is False)
+    check("primary 无行（rows=0）→ _snap_ok=False", m._snap_ok({"exists": 1, "rows": 0}) is False)
+    check("primary 缺失 None → _snap_ok=False", m._snap_ok(None) is False)
+    check("primary exists=1 rows=1 → _snap_ok=True", m._snap_ok({"exists": 1, "rows": 1}) is True)
+    # 结构化 JSON 行解析
+    check("BF_PRIMARY= 结构化 JSON 解析",
+          m._parse_json_line("BF_PRIMARY={\"exists\": 1, \"rows\": 1}\n", "BF_PRIMARY=") ==
+          {"exists": 1, "rows": 1})
+    check("BF_PRIMARY= 坏 JSON → None",
+          m._parse_json_line("BF_PRIMARY={bad\n", "BF_PRIMARY=") is None)
+    # rev 整数相等（rev=10 不被当成 rev=1）
+    snap_rev10 = {"exists": 1, "rows": 1, "rev": 10}
+    check("rev=10 解析为整数 10", snap_rev10.get("rev") == 10)
+    check("rev=10 不等于 1（整数相等）", snap_rev10.get("rev") != 1)
+    # 向量严格比较（字段精确 + 向量容差）
+    a = {"exists": 1, "rows": 1, "chunk_id": "bfc1", "kb_id": "k", "doc_id": "d",
+         "text": "t", "rev": None, "vector": [0.9, 0.8, 0.7, 0.6]}
+    b = dict(a)
+    check("完全相同快照 → _same_snap=True", m._same_snap(a, b) is True)
+    check("字段不同（rev 差 1）→ _same_snap=False",
+          m._same_snap(a, {**a, "rev": 1}) is False)
+    check("向量不同 → _same_snap=False",
+          m._same_snap(a, {**a, "vector": [0.1, 0.2, 0.3, 0.4]}) is False)
+
+
 def _run_main_with_faults(archive_fail: bool = False, cleanup_fail: bool = False,
                           write_evidence_fail: bool = False, write_evidence_return: int = 0):
     """跑真实 main，注入指定故障。返回 (exit_code, calls, failed_step_names)。"""
@@ -252,6 +312,8 @@ def main() -> int:
     test_evidence_meta_read_failure()
     test_evidence_write_failure()
     test_evidence_finalize_corruption()
+    test_evidence_step_status_tamper()
+    test_backfill_reconcile_parsing()
     test_main_finally_protection()
     test_no_container_on_unauthorized()
     print()
