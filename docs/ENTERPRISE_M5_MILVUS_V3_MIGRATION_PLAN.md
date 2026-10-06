@@ -994,6 +994,24 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 回归（实跑）：统一门禁 `total=23 failed=0`（migration_cleanup 通过）；契约矩阵 `77/0`、护栏自检 `12/0`、B0（含 E4–E6）全绿不变。
 连接范围不变：零真实服务连接，未 push；M5-B1 冻结。
 
+---
+
+### 9.18 非空 disposable 脚本深度整改 + 扫描规则加固（第六轮 · 2026-10-06）
+
+针对上轮 `check_m5_nonempty_disposable.py` 的复核，两处整改：
+
+**脚本侧（`check_m5_nonempty_disposable.py`，仍仅准备、未执行）**：
+- 子进程**真正传递受控 env**（清除宿主污染变量 `ADMIN_DATABASE_URL`/`NEO4J_*`/`MILVUS_*`/`*_ENABLED` 等，只受 env file 控制）并**固定 cwd=BACKEND**；
+- Docker 枚举/创建失败**立即停止**（枚举失败抛异常、创建检查退出码），cleanup 复查**容器/网络/卷三者**零残留（仅销毁本脚本创建的资源，预检拒绝时绝不误删他人同名对象）；
+- 补齐 **PG current 行播种**（chunk_revisions revision=1 + 双侧 pending）、**能力开启**（`EMBEDDING_ENABLED=true` + `EMBEDDING_API_KEY` 非空 + `VECTOR_STORE_ENABLED=true`，否则 `get_projection_capabilities().vector=false`、Milvus 腿不写）、**两种写入意图配置**（S1 双写与单向回填都需 `dual_write=true`+shadow 生效，`_upsert_backfill_versioned` 依赖 `resolve_dual_write().active`）；
+- 修正 PG 读回**错列索引**（`vector_status` 是第 4 列，原误取 `vector_content_revision`）、S1 读回**真实观察动态版本残留**（primary 查询 `content_revision`，SDK 把 `$meta` 展开到顶层，残留即非空）并**双侧读回**（primary 剥版本 + shadow 带版本）；
+- 异常**进入失败证据**（外层 try 捕获记 FAIL）、归档 backfill **manifest**、证据落盘后**独立复验合同**（RUN_ID 一致 + JSON 可解析 + meta 覆盖写）。
+
+**扫描规则侧（`check_migration_cleanup_guards.py`）**：真实 disposable 的共享端口判据改为 **AST 扫描**（`_shared_port_findings`），堵住三类漏洞——拼接地址（查端口常量 `XXX_PORT = 5434`）、远程共享端口（匹配 `0.0.0.0`/IPv4/`host.docker.internal`/`localhost`/`::1`）、注释豁免（AST 只扫代码，注释里的端口说明不判红）；自证补 `concat_shared_port` / `remote_shared_port` 负向与注释豁免正向。
+
+回归（实跑）：统一门禁 `total=23 failed=0`；契约矩阵 `77/0`、护栏自检 `12/0`、B0 全绿不变。
+连接范围不变：零真实服务连接，未 push；M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
