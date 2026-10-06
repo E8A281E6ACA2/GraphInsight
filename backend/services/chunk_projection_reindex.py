@@ -350,6 +350,25 @@ def _existing_milvus_fields(kb_id: str, chunk_ids: List[str]) -> Dict[str, Dict[
     return merged
 
 
+def _vector_failure_state(exc: Exception) -> str:
+    """契约异常 → 逐 chunk 状态。
+
+    版本无处可靠承载（§8.5：primary 缺字段且无生效 shadow）→ 保持 `pending`（不是失败）；
+    其它契约违约（范围/归属/读回/删除范围等）→ `write_failed`。
+    """
+    from services.vector_store import (
+        REASON_SHADOW_FIELD_MISSING,
+        REASON_SHADOW_NOT_ACTIVE,
+        VectorStoreSchemaError,
+    )
+
+    reason = str(getattr(exc, "reason", "") or "")
+    version_carrier_missing = reason in (
+        REASON_SHADOW_NOT_ACTIVE, REASON_SHADOW_FIELD_MISSING,
+    ) or (not reason and isinstance(exc, VectorStoreSchemaError))
+    return OUTCOME_REVISION_FIELD_ABSENT if version_carrier_missing else OUTCOME_WRITE_FAILED
+
+
 def _write_milvus_projection(
     kb_id: str,
     items: List[Dict[str, Any]],
@@ -391,9 +410,6 @@ def _write_milvus_projection(
             for item in batch:
                 outcome[item["chunk_id"]] = OUTCOME_WRITE_FAILED
             continue
-        # ensure_collection creates the vector index and loads a newly migrated
-        # collection before the readback query below.
-        vector_store.ensure_collection(dimension=len(vectors[0]) if vectors else None)
         existing = _existing_milvus_fields(kb_id, [item["chunk_id"] for item in batch])
         chunks = []
         for item, vector in zip(batch, vectors):
@@ -414,19 +430,32 @@ def _write_milvus_projection(
                     content_revision=item["target_revision"],
                 )
             )
+        # P1 修复（守卫必须早于副作用）：范围校验在**建集合之前**完成。
+        # 此前顺序是 ensure_collection → upsert_chunks（守卫在 upsert 内部），非授权 KB 最终虽被拒，
+        # 但目标集合已经被创建——"拒绝"仍然留下了副作用。
+        try:
+            vector_store.assert_write_allowed(chunks, "reindex_chunks")
+        except Exception as exc:  # noqa: BLE001 - 与 upsert 内部守卫同一实现，逐 chunk 如实记态
+            state = _vector_failure_state(exc)
+            logger.warning(
+                "reindex_chunks 写前范围校验拒绝（零副作用）",
+                context={"kb_id": kb_id, "state": state,
+                         "reason": str(getattr(exc, "reason", "") or type(exc).__name__)},
+            )
+            for item in batch:
+                outcome[item["chunk_id"]] = state
+            continue
+        # ensure_collection creates the vector index and loads a newly migrated
+        # collection before the readback query below.
+        vector_store.ensure_collection(dimension=len(vectors[0]) if vectors else None)
         try:
             written = vector_store.upsert_chunks(chunks, vectors)
         except Exception as exc:  # noqa: BLE001 - 契约拒绝/落库异常都必须逐 chunk 如实记态
-            # 版本无处可靠承载（§8.5：primary 缺字段且无生效 shadow）→ 保持 pending，不是失败；
-            # 其它契约违约（范围/归属/读回等）→ write_failed。
-            reason = str(getattr(exc, "reason", "") or "")
-            version_carrier_missing = reason in (
-                REASON_SHADOW_NOT_ACTIVE, REASON_SHADOW_FIELD_MISSING,
-            ) or (not reason and isinstance(exc, VectorStoreSchemaError))
-            state = OUTCOME_REVISION_FIELD_ABSENT if version_carrier_missing else OUTCOME_WRITE_FAILED
+            state = _vector_failure_state(exc)
             logger.warning(
                 "reindex_chunks Milvus upsert 被拒/失败",
-                context={"kb_id": kb_id, "state": state, "reason": reason or type(exc).__name__},
+                context={"kb_id": kb_id, "state": state,
+                         "reason": str(getattr(exc, "reason", "") or type(exc).__name__)},
             )
             for item in batch:
                 outcome[item["chunk_id"]] = state

@@ -36,12 +36,21 @@ REASON_SHADOW_NOT_ACTIVE = "SHADOW_NOT_ACTIVE"
 REASON_SHADOW_FIELD_MISSING = "SHADOW_FIELD_MISSING"
 REASON_PRIMARY_VECTOR_MISSING = "PRIMARY_VECTOR_MISSING"
 REASON_PRIMARY_UNREADABLE = "PRIMARY_UNREADABLE"
+# 读源同名行**归属不符**（外域同名 chunk）或缺少向量证据：读源不变量不成立，写前拒绝（§16.1）
+REASON_PRIMARY_SCOPE_MISMATCH = "PRIMARY_SCOPE_MISMATCH"
+REASON_PRIMARY_VECTOR_UNREADABLE = "PRIMARY_VECTOR_UNREADABLE"
 REASON_VERIFY_MISMATCH = "VERIFY_MISMATCH"
 REASON_VERIFY_UNAVAILABLE = "VERIFY_UNAVAILABLE"
 REASON_KB_NOT_ALLOWED = "KB_NOT_ALLOWED"
 REASON_SCOPE_MISMATCH = "SCOPE_MISMATCH"
 REASON_SCOPE_CONFIG_INVALID = "SCOPE_CONFIG_INVALID"
 REASON_COLLECTION_NOT_WRITABLE = "COLLECTION_NOT_WRITABLE"
+# 配置了 tenant/project 但目标 collection 缺这些字段，删除无法安全限定 → 拒绝（不得退化为"只按 KB 删"）
+REASON_DELETE_SCOPE_UNSUPPORTED = "DELETE_SCOPE_UNSUPPORTED"
+
+# 读源作用域四件套：读源行的归属必须与本次 chunk 完全一致，否则"同名即存在"不成立
+SCOPE_IDENTITY_FIELDS = ("kb_id", "tenant_id", "project_id", "doc_id")
+VECTOR_FIELD = "vector"
 
 
 class VectorWriteContractError(VectorStoreSchemaError):
@@ -372,6 +381,52 @@ class MilvusVectorStore:
                     reason=REASON_SCOPE_MISMATCH,
                 )
 
+    def assert_write_allowed(self, chunks: List[VectorChunk], operation: str,
+                             collection: Optional[str] = None) -> None:
+        """写前范围校验的**公开入口**（只读、零副作用、不建集合）。
+
+        P1 修复：worker 原先在调用统一入口**之前**就 `ensure_collection`，导致非授权 KB 虽然最终
+        被拒，但集合已经被创建（守卫晚于副作用）。调用方必须在任何建集合/建索引/mutation **之前**
+        调用本方法；它与 `upsert_chunks` 内部守卫是**同一份实现**，不另立口径。
+        """
+        dw = self.resolve_dual_write()
+        target = str(collection or dw.get("primary") or "")
+        self._guard_write_scope(chunks, target, operation)
+
+    def _scoped_delete_conditions(self, collection: str, operation: str) -> List[str]:
+        """删除过滤要追加的 tenant/project 条件（按**实际 schema** 校验可用性）。
+
+        P1 修复：此前 `delete_doc`/`clear` 只按 `kb_id` 过滤——即便配置了 tenant/project，也会删掉
+        同 KB 下外域同名的行。现在把已配置的 tenant/project 纳入过滤；若目标 collection 的实际字段
+        里没有这些列（无法安全限定）→ **拒绝执行**，绝不放宽成"只按 KB 删"。
+        """
+        scope = self.resolve_write_scope()
+        if scope["invalid"]:
+            raise VectorWriteContractError(
+                f"write_scope.kb_ids 已配置但解析为空（配置非法），拒绝执行 {operation}（零删除）",
+                reason=REASON_SCOPE_CONFIG_INVALID,
+            )
+        wanted = [(field, scope[field]) for field in ("tenant_id", "project_id") if scope[field]]
+        if not wanted:
+            return []
+        names = self.collection_field_names(collection)
+        if names is None:
+            raise VectorWriteContractError(
+                f"已配置 {'/'.join(field for field, _ in wanted)} 限定，但无法读取 {collection} 的 schema，"
+                f"不能确认删除可安全限定，拒绝执行 {operation}（零删除）",
+                reason=REASON_DELETE_SCOPE_UNSUPPORTED,
+            )
+        if not names:
+            return []  # collection 不存在 → 无可删
+        missing = [field for field, _ in wanted if field not in names]
+        if missing:
+            raise VectorWriteContractError(
+                f"已配置 {'/'.join(missing)} 限定，但 {collection} 缺少这些字段，删除无法安全限定；"
+                f"拒绝执行 {operation}（零删除，绝不放宽成只按 KB 删）",
+                reason=REASON_DELETE_SCOPE_UNSUPPORTED,
+            )
+        return [f'{field} == "{self._escape_filter_value(value)}"' for field, value in wanted]
+
     def _guard_kb_write_scope(self, kb_ids: List[str], operation: str) -> None:
         """按 KB 名单校验的轻量版本（delete/clear 等没有 chunk 对象的路径）。
 
@@ -530,41 +585,116 @@ class MilvusVectorStore:
         result = client.upsert(collection_name=collection, data=rows)
         return require_upsert_count(result, len(rows))
 
-    def verify_versioned_rows(self, collection: str, expected: Dict[str, Dict[str, Any]]) -> Optional[bool]:
-        """写入后读回校验（统一实现，worker 与 backfill 共用）。
+    def _query_rows(self, collection: str, chunk_ids: List[str], fields: List[str]) -> Dict[str, Any]:
+        """按 output_fields 查询，并**区分"字段不存在"（结构化事实）与"无法查询"（不可校验）**。
 
-        expected: `{chunk_id: {"content_revision": int|None, "text": str|None}}`
-        返回三态：`True` 全部一致 / `False` 明确不一致 / `None` **无法校验**（取不到 client、
-        client 不支持 query、查询抛错）。**绝不把 None 当 True**——调用方必须显式处理 None
-        （回填契约把 None 视为"不可标 indexed"，宁可 pending）。
+        P1 修复：此前读回只发 `output_fields=["chunk_id","text","content_revision"]`，靠宽松夹具
+        （忽略 output_fields 的假 client）放行——真实 legacy collection 上该字段不存在、查询会报错。
+        现在把"字段缺失"作为一等状态返回，调用方据此走"结构化不存在"分支。
         """
-        if not expected:
-            return True
+        ids = sorted({str(cid) for cid in chunk_ids})
+        if not ids:
+            return {"status": "ok", "rows": []}
         try:
             client = self._get_client()
         except Exception:  # noqa: BLE001 - 取不到 client 属于"无法校验"
-            return None
+            return {"status": "unavailable", "rows": []}
         query = getattr(client, "query", None)
         if not callable(query):
-            return None
+            return {"status": "unavailable", "rows": []}
         expr = "chunk_id in [" + ", ".join(
-            f'"{self._escape_filter_value(str(cid))}"' for cid in sorted(expected)
+            f'"{self._escape_filter_value(cid)}"' for cid in ids
         ) + "]"
         try:
             rows = list(query(collection_name=collection, filter=expr,
-                              output_fields=["chunk_id", "text", "content_revision"],
-                              limit=len(expected)) or [])
-        except Exception:  # noqa: BLE001 - 读回失败 = 无法校验（不冒充已验证）
+                              output_fields=list(fields), limit=len(ids)) or [])
+        except Exception as exc:  # noqa: BLE001
+            missing = self._missing_field_from_error(exc, fields)
+            if missing is not None:
+                return {"status": "field_missing", "rows": [], "missing_field": missing}
+            return {"status": "unavailable", "rows": [], "missing_field": None}
+        return {"status": "ok", "rows": [row for row in rows if isinstance(row, dict)],
+                "missing_field": None}
+
+    @staticmethod
+    def _missing_field_from_error(exc: Exception, fields: List[str]) -> Optional[str]:
+        """从异常里解析出**具体缺失的字段名**；解析不出（或未指向请求字段）返回 None。
+
+        必须精确到字段：只把"缺失 content_revision"当作"版本键结构化不存在"。若缺的是别的字段
+        （例如 schema 与代码预期不一致而缺 `text`），那就是不可校验，**不能**顺带当成版本缺失放行。
+        """
+        text = str(exc).lower()
+        hinted = any(
+            hint in text
+            for hint in ("not exist", "not found", "cannot find", "unknown", "undefined",
+                         "invalid", "not supported", "does not exist")
+        )
+        if not hinted:
             return None
-        got = {str(row.get("chunk_id") or ""): row for row in rows if isinstance(row, dict)}
+        for field in fields:
+            name = str(field)
+            if name.lower() in text:
+                return name
+        return None
+
+    def collection_field_names(self, collection: str) -> Optional[set]:
+        """collection 的实际字段名集合（按 schema，而不是按配置/缓存推断）。
+
+        - collection 不存在 → 空集合（无字段）；
+        - 探测能力缺失或报错 → `None`（调用方必须 fail-closed，不得当成"没有该字段"）。
+        """
+        try:
+            client = self._get_client()
+            if not client.has_collection(collection):
+                return set()
+            describe = getattr(client, "describe_collection", None)
+            if not callable(describe):
+                return None
+            description = describe(collection)
+        except Exception:  # noqa: BLE001
+            return None
+        fields = description.get("fields") if isinstance(description, dict) else None
+        if not isinstance(fields, list):
+            return None
+        names = {str(field.get("name") or "") for field in fields if isinstance(field, dict)}
+        return {name for name in names if name}
+
+    def verify_versioned_rows(self, collection: str, expected: Dict[str, Dict[str, Any]]) -> Optional[bool]:
+        """写入后读回校验（统一实现，worker 与 backfill 共用）。
+
+        `expected`: `{chunk_id: {"content_revision": int|None, "text": str|None,
+        "require_absent": bool}}`。三态语义：`True` 全部一致 / `False` 明确不一致 /
+        `None` **无法校验**（绝不把 None 当 True）。
+
+        版本合同的**两种明确形态**（P1 修复——此前把"不比较"当成"已满足"）：
+        - `content_revision` 为整数 → 必须相等；
+        - `require_absent=True` → 该行**必须不带可用版本键**（legacy primary 的"剥版本"）。
+          只有真的观察到该键且值非空才算违约；若 collection 的 schema 里没有该字段
+          （`field_missing` 降级路径），"键不存在"是结构化事实，不构成违约。
+        """
+        if not expected:
+            return True
+        probe = self._query_rows(collection, list(expected), ["chunk_id", "text", "content_revision"])
+        version_observable = probe["status"] == "ok"
+        if probe["status"] == "field_missing":
+            # 只有"缺的确实是 content_revision"才是"版本键结构化不存在"；缺别的字段 = 不可校验
+            # （不能顺带把版本缺失当已满足——这正是宽松夹具会掩盖的形态）。
+            if probe.get("missing_field") != "content_revision":
+                return None
+            probe = self._query_rows(collection, list(expected), ["chunk_id", "text"])
+        if probe["status"] != "ok":
+            return None
+        got = {str(row.get("chunk_id") or ""): row for row in probe["rows"]}
         for chunk_id, want in expected.items():
             row = got.get(str(chunk_id))
             if row is None:
                 return False
-            rev = want.get("content_revision")
-            if rev is not None:
+            if want.get("require_absent"):
+                if version_observable and row.get("content_revision") not in (None, ""):
+                    return False
+            elif want.get("content_revision") is not None:
                 try:
-                    if int(row.get("content_revision")) != int(rev):
+                    if int(row.get("content_revision")) != int(want["content_revision"]):
                         return False
                 except (TypeError, ValueError):
                     return False
@@ -573,46 +703,77 @@ class MilvusVectorStore:
                 return False
         return True
 
-    def _query_present_ids(self, collection: str, chunk_ids: List[str]) -> Optional[set]:
-        """只读探测 collection 里已存在的 chunk_id 集合；无法读取返回 None（调用方须 fail-closed）。"""
+    @staticmethod
+    def _has_vector_evidence(value: Any) -> bool:
+        """向量证据：非空序列（Milvus 回读为 list；其它序列类型按 len 判定）。"""
+        if value is None:
+            return False
         try:
-            client = self._get_client()
-        except Exception:  # noqa: BLE001
-            return None
-        if not client.has_collection(collection):
-            return set()
-        query = getattr(client, "query", None)
-        if not callable(query):
-            return None
-        expr = "chunk_id in [" + ", ".join(
-            f'"{self._escape_filter_value(str(cid))}"' for cid in sorted(set(chunk_ids))
-        ) + "]"
-        try:
-            rows = list(query(collection_name=collection, filter=expr,
-                              output_fields=["chunk_id"], limit=len(set(chunk_ids))) or [])
-        except Exception:  # noqa: BLE001
-            return None
-        return {str(row.get("chunk_id") or "") for row in rows if isinstance(row, dict)}
+            return len(value) > 0
+        except TypeError:
+            return False
+
+    def _query_primary_rows(self, collection: str, chunks: List[VectorChunk]) -> Dict[str, Any]:
+        """读源不变量（§16.1）的**归属核验**：primary 必须持有这些 chunk，且归属与向量证据齐备。
+
+        P1 修复：此前 `_query_present_ids` 只证明"同名 ID 存在"——primary 里的同名行属于
+        `kb-b`，以 `kb-a` 回填照样放行并把版本写进 shadow。现在逐行核对
+        `kb_id/tenant_id/project_id/doc_id` 四件套与向量证据，任一不符即拒绝（写前、shadow 零写入）。
+
+        返回 `{"status", "rows", "reason"}`，status ∈
+        `ok | missing | scope_mismatch | vector_unreadable | unreadable`。
+        """
+        probe = self._query_rows(
+            collection,
+            [c.chunk_id for c in chunks],
+            ["chunk_id", *SCOPE_IDENTITY_FIELDS, VECTOR_FIELD],
+        )
+        if probe["status"] == "field_missing":
+            # 连归属字段/向量字段都取不到 → 无法核验，按"向量证据不可读"拒绝，不冒充"存在"
+            return {"status": "vector_unreadable", "rows": {},
+                    "reason": REASON_PRIMARY_VECTOR_UNREADABLE}
+        if probe["status"] != "ok":
+            return {"status": "unreadable", "rows": {}, "reason": REASON_PRIMARY_UNREADABLE}
+        rows = {str(row.get("chunk_id") or ""): row for row in probe["rows"]}
+        for chunk in chunks:
+            row = rows.get(str(chunk.chunk_id))
+            if row is None:
+                return {"status": "missing", "rows": rows, "reason": REASON_PRIMARY_VECTOR_MISSING}
+            for field in SCOPE_IDENTITY_FIELDS:
+                expected_value = str(getattr(chunk, field, "") or "")
+                actual_value = str(row.get(field) or "")
+                # 本次 chunk 自身缺归属，或读源行归属不符 → 同名不等于同一实体，一律拒绝
+                if not expected_value or actual_value != expected_value:
+                    return {"status": "scope_mismatch", "rows": rows,
+                            "reason": REASON_PRIMARY_SCOPE_MISMATCH}
+            if not self._has_vector_evidence(row.get(VECTOR_FIELD)):
+                return {"status": "vector_unreadable", "rows": rows,
+                        "reason": REASON_PRIMARY_VECTOR_UNREADABLE}
+        return {"status": "ok", "rows": rows, "reason": ""}
 
     def write_targets(self, intent: str = WRITE_INTENT_ONLINE) -> List[Dict[str, Any]]:
         """本次意图的**写入目标清单**（写后读回的统一依据）。
 
-        每个目标：`{"collection": 名, "carries_version": bool}`
-        - 在线 S1：primary 恒在（legacy v2 无显式字段时 `carries_version=False`，即"剥版本写"）；
-          shadow 仅在 dual_write 生效且配置了 shadow 时加入（`carries_version=True`）。
-        - 历史回填：只有 shadow（`carries_version=True`）。
+        每个目标：`{"collection": 名, "version_contract": "equal" | "absent"}`
+        - `"equal"`：该目标承载版本 → 读回必须逐 chunk 版本相等（取不到版本即不可校验）；
+        - `"absent"`：该目标**必须不带可用版本键**（legacy primary 的"剥版本"合同）——
+          注意这不是"不比较版本"，读回会主动观察该键，出现非空值即违约。
 
-        读回必须覆盖**全部**目标——任一目标不可读或不一致都不得标 indexed（P1-2 修复：
-        此前只读回 primary，注入"primary 新、shadow 陈旧/异常"仍被判 indexed）。
+        构成：在线 S1 恒含 primary（legacy 无显式字段 → `"absent"`），dual_write 生效时再加
+        shadow（`"equal"`）；历史回填只有 shadow（`"equal"`）。读回必须覆盖**全部**目标
+        （任一 `False`/`None` 都不得标 indexed）。
         """
         dw = self.resolve_dual_write()
         if intent == WRITE_INTENT_BACKFILL:
             shadow = str(dw.get("shadow") or "")
-            return [{"collection": shadow, "carries_version": True}] if shadow else []
+            return [{"collection": shadow, "version_contract": "equal"}] if shadow else []
         primary = str(dw.get("primary") or "")
-        targets = [{"collection": primary, "carries_version": self.has_content_revision_field(primary)}]
+        targets = [{
+            "collection": primary,
+            "version_contract": "equal" if self.has_content_revision_field(primary) else "absent",
+        }]
         if dw.get("active") and str(dw.get("shadow") or ""):
-            targets.append({"collection": str(dw["shadow"]), "carries_version": True})
+            targets.append({"collection": str(dw["shadow"]), "version_contract": "equal"})
         return targets
 
     def verify_write_targets(
@@ -623,8 +784,8 @@ class MilvusVectorStore:
         """对**全部**写入目标做写后读回，返回逐目标三态汇总。
 
         `expected`: `{chunk_id: {"text": str, "content_revision": int|None}}`（逐 chunk 自带版本，
-        因为同一批可能包含不同 target_revision）。版本期望按目标决定：`carries_version` 的目标
-        期望逐 chunk 版本号（**取不到版本即视为不可校验**），剥版本的目标（legacy v2）期望该键不存在。
+        因为同一批可能包含不同 target_revision）。版本期望按各目标的**合同**决定：
+        `"equal"` 期望逐 chunk 版本号（取不到版本即视为不可校验）；`"absent"` 要求版本键不存在。
 
         返回 `{"ok": bool, "results": {collection: True|False|None}, "reason": str}`；
         **任一目标 False（不一致）或 None（不可读/无法校验）→ ok=False**，调用方不得标 indexed。
@@ -635,16 +796,19 @@ class MilvusVectorStore:
             if not collection:
                 results[""] = False
                 continue
+            contract = str(target.get("version_contract") or "equal")
             want: Dict[str, Dict[str, Any]] = {}
             for chunk_id, item in expected.items():
                 revision = item.get("content_revision")
-                if target.get("carries_version") and revision is None:
+                if contract == "equal" and revision is None:
                     # 版本承载侧必须有版本可比对；取不到版本 → 该目标不可校验（ok=False 口径）
                     want[str(chunk_id)] = {"content_revision": None, "text": item.get("text")}
                     results[collection] = None
                     break
                 want[str(chunk_id)] = {
-                    "content_revision": int(revision) if target.get("carries_version") else None,
+                    "content_revision": int(revision) if contract == "equal" else None,
+                    # "absent" 是**明确合同**：要求版本键不存在，而不是"不比较"
+                    "require_absent": contract == "absent",
                     "text": item.get("text"),
                 }
             if collection not in results:
@@ -681,19 +845,33 @@ class MilvusVectorStore:
                 "（写进去只会进 dynamic metadata）。请先按 §8.5 建带显式 INT64 字段的 v3 集合。",
                 reason=REASON_SHADOW_FIELD_MISSING,
             )
-        present = self._query_present_ids(str(dw.get("primary") or ""), [c.chunk_id for c in chunks])
-        if present is None:
+        verdict = self._query_primary_rows(str(dw.get("primary") or ""), chunks)
+        if verdict["status"] == "unreadable":
             raise VectorWriteContractError(
                 f"无法读取 primary {dw.get('primary')} 的现有 chunk，不能证明读源不丢数据（§16.1），"
                 "拒绝只写 shadow。",
                 reason=REASON_PRIMARY_UNREADABLE,
             )
-        missing = [c.chunk_id for c in chunks if c.chunk_id not in present]
-        if missing:
+        if verdict["status"] == "missing":
+            present = set(verdict["rows"])
+            missing = [c.chunk_id for c in chunks if c.chunk_id not in present]
             raise VectorWriteContractError(
                 f"primary {dw.get('primary')} 尚无 {len(missing)} 个 chunk（示例 {missing[:5]}）："
                 "只写 shadow 会让读源丢数据（§16.1 禁止 v3 写 + v2 读），拒绝回填。",
                 reason=REASON_PRIMARY_VECTOR_MISSING,
+            )
+        if verdict["status"] == "scope_mismatch":
+            raise VectorWriteContractError(
+                f"primary {dw.get('primary')} 中的同名 chunk 归属与本次作用域不一致"
+                "（kb/tenant/project/doc 任一不符）：同名不等于同一实体，读源不变量不成立（§16.1），"
+                "拒绝回填（shadow 零写入）。",
+                reason=REASON_PRIMARY_SCOPE_MISMATCH,
+            )
+        if verdict["status"] == "vector_unreadable":
+            raise VectorWriteContractError(
+                f"primary {dw.get('primary')} 的行缺少可核验的向量证据（向量字段读不到或为空），"
+                "不能证明读源可用（§16.1），拒绝回填（shadow 零写入）。",
+                reason=REASON_PRIMARY_VECTOR_UNREADABLE,
             )
         written = self._upsert_to(shadow, chunks, vectors, dimension)
         expected = {
@@ -851,15 +1029,22 @@ class MilvusVectorStore:
         client = self._get_client()
         if not client.has_collection(collection):
             return
-        filter_expr = (
-            f'{milvus_kb_filter([clean_kb])} '
-            f'and doc_id == "{self._escape_filter_value(str(doc_id))}"'
-        )
+        # 作用域条件必须在**任何删除之前**算好：primary 与 shadow 各自按实际 schema 校验，
+        # 任一无法安全限定就整批拒绝（零删除）。
+        primary_conditions = self._scoped_delete_conditions(collection, "delete_doc")
+        shadow_conditions: List[str] = []
+        if dw["active"]:
+            shadow_conditions = self._scoped_delete_conditions(str(dw.get("shadow") or ""), "delete_doc")
+        doc_condition = f'doc_id == "{self._escape_filter_value(str(doc_id))}"'
+        filter_expr = " and ".join([milvus_kb_filter([clean_kb]), doc_condition, *primary_conditions])
         self._delete_from(collection, filter_expr)
         # 影子侧同步删除：v2 删了而 v3 没删会让 §6 的 chunk_id 集合"v3 多"，对账必红。
         if dw["active"]:
+            shadow_expr = " and ".join(
+                [milvus_kb_filter([clean_kb]), doc_condition, *shadow_conditions]
+            )
             try:
-                self._delete_from(dw["shadow"], filter_expr)
+                self._delete_from(dw["shadow"], shadow_expr)
             except Exception as exc:  # noqa: BLE001 - 影子删除失败必须可定位并保持未收敛
                 logger.error(
                     "双写影子删除失败：主库已删、影子未收敛",
@@ -886,10 +1071,19 @@ class MilvusVectorStore:
             return
         # 写入范围守卫（canary 保护）：非授权 KB 在**任何清空之前**拒绝，零写入。
         self._guard_kb_write_scope(list(kb_ids), "clear")
-        self._delete_from(dw["primary"], filter_expr)
+        # 作用域条件必须在**任何删除之前**算好（primary/shadow 各自按实际 schema 校验）。
+        primary_conditions = self._scoped_delete_conditions(str(dw["primary"]), "clear")
+        shadow_conditions: List[str] = []
         if dw["active"]:
+            shadow_conditions = self._scoped_delete_conditions(str(dw.get("shadow") or ""), "clear")
+        primary_expr = " and ".join([filter_expr, *primary_conditions]) if primary_conditions else filter_expr
+        self._delete_from(dw["primary"], primary_expr)
+        if dw["active"]:
+            shadow_expr = (
+                " and ".join([filter_expr, *shadow_conditions]) if shadow_conditions else filter_expr
+            )
             try:
-                self._delete_from(dw["shadow"], filter_expr)
+                self._delete_from(dw["shadow"], shadow_expr)
             except Exception as exc:  # noqa: BLE001 - 影子删除失败必须可定位并保持未收敛
                 logger.error(
                     "双写影子 clear 失败：主库已删、影子未收敛",
