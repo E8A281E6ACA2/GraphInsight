@@ -786,6 +786,87 @@ blocker = `DATA_UNKNOWN` + `VECTOR_CAPABILITY_OFF` + `COLLECTIONS_UNKNOWN` + `BA
 **当前状态**：预检 BLOCKED（上述 1/3/5 未满足，PG/Milvus 读数未知）；真实单 KB canary **未执行**；
 共享生产 Gate 继续 **OPEN**；M5-B1 继续冻结。
 
+---
+
+### 9.13 复核问题整改（2026-10-06 · 四条 P1 + 两条 P2，只改代码/测试/文档）
+
+复核方以"注入故障"方式发现四条 P1 与两条 P2，逐条整改如下（本节只记代码与测试事实，
+门禁判定不变：真实 v3 迁移仍关闭、`MILVUS_DUAL_WRITE` 默认 false、未连任何真实服务）。
+
+#### 9.13.1 P1-1 worker 未接通 legacy v2 的 S1 路径
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | `chunk_projection_reindex.py` 在调用统一入口**之前**用 `has_content_revision_field()`（只看 primary）拦截，legacy v2 永远走不到契约，S1 路径不可达 |
+| 整改 | 删除该前置拦截，判据统一交给 `vector_store.upsert_chunks`（唯一写入契约）。逐 chunk 结果映射：`SHADOW_NOT_ACTIVE`/`SHADOW_FIELD_MISSING`（或裸 `VectorStoreSchemaError`）→ `revision_field_absent`（保持 pending）；终态 `INDEX_UNAVAILABLE`（`ValidationException`，不自动重试）改由**契约结果派生**（`if OUTCOME_REVISION_FIELD_ABSENT in vector_outcome.values()`），而不是前置检查 |
+| 验证 | `check_b0_reindex_chunks.py` E4：走**真实** `_write_milvus_projection` + 真实 `upsert_chunks`（假 client），断言 v2 收到写入且**不含** `content_revision`、v3 带显式版本=1、PG 收敛 `vector_status=indexed` + `vector_content_revision=1`、计数 `vector_indexed=1` |
+| 既有场景迁移 | `b0` 驱动 `revision_field_absent` 与 `m5_wave3_handoff` 的 §8.5 场景原先打桩**假向量写入器**（测的正是被删掉的前置路径），已改为真实契约路径：契约在写之前拒绝 → 零 upsert（Wave3 新增 `real_upserts == {}` 断言） |
+
+#### 9.13.2 P1-2 写后未验证仍可 indexed（且只验 primary）
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | worker 读回只在 `verify_versioned_rows` 返回 `False` 时降级，`None`（不可读/无法校验）**保持 indexed**；且只读回 primary —— 注入"primary 新、shadow=999"仍判 indexed |
+| 整改 | store 新增 `write_targets(intent)` 与 `verify_write_targets(expected)`：**对本次意图涉及的全部写入目标**（primary + 生效 shadow）统一读回；`carries_version` 的目标逐 chunk 比对版本，剥版本的目标期望该键不存在；**任一目标 `False` 或 `None` → `ok=False`** → worker 记 `write_failed`。已退役的本地单目标读回函数删除（只留一份实现） |
+| 验证 | E4 两条负向：`readback_shadow_mismatch`（仅 shadow 版本不符）与 `readback_unavailable`（client 无 `query`）→ 均断言 PG `vector_status=failed`、版本 NULL、`vector_failed=1`、`vector_indexed=0` |
+
+#### 9.13.3 P1-3 "剥版本"可被 metadata 绕过
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | `_build_rows` 里 `**(chunk.metadata or {})` 展开在显式字段之前，metadata 里的 `content_revision=99` 能覆盖"剥版本"结果，甚至覆盖 `chunk_id`/`vector`/`kb_id` |
+| 整改 | 新增 `RESERVED_ROW_FIELDS`（身份/作用域/内容/向量/版本共 13 键）：metadata 中的保留键**丢弃并告警**；显式字段在 metadata 之后覆盖；`content_revision is None` 时**彻底 `pop` 该键**（剥版本 = 键不存在，不是空值） |
+| 验证 | 契约矩阵 C15（显式 2 + metadata 99 → 落库 2）、C16（剥版本后 v2 行**不含**该键、影子仍带 1）、C17（metadata 不能覆盖 `chunk_id`/`vector`/`kb_id`） |
+
+#### 9.13.4 P1-4 范围守卫放行漏洞
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | `_guard_write_scope` 在 KB 名单为空时直接 `return`，**tenant/project 限制被一并跳过**；且 `MILVUS_WRITE_SCOPE_KB_IDS=","` 解析为空后被当成"无限制" |
+| 整改 | 各条件**独立生效**：① collection 白名单；② 名单"配置过但解析为空" → `SCOPE_CONFIG_INVALID`（非法**不得**退化为无限制）；③ 名单非空 → 逐 chunk 命中；④ tenant/project 只要配置就校验（**与 KB 名单是否为空无关**）。配置层保留原始字符串（`milvus_write_scope_kb_ids_raw`）并经 runtime_config 透出 `kb_ids_configured`。同一守卫覆盖 `upsert_chunks`（两意图）、`delete_doc`、`clear`，任一不合规**整批拒绝、零 mutation** |
+| 验证 | C18（非法配置 → `SCOPE_CONFIG_INVALID` 且零写入）、C19（kb_ids 未配置但 tenant 不符 → 仍拒）、C20（`delete_doc`/`clear` 名单与非法配置均拒且零 mutation） |
+
+#### 9.13.5 P2-1 预检收紧
+
+`phase7b-precheck/run_phase7b_canary_precheck.py`：① Milvus 查询**返回空结果**不再折算为 0，记
+`empty_query_result`（未知）；② 解析产物改为**逐行 `json.loads` + 校验 `chunk_id`**，输出
+`parsed_stats{files,valid,invalid_json,missing_chunk_id}`，目录在但无有效 chunk 记未知；
+③ 异常原因只用**脱敏类别**（`connect_failed`/`timeout`/`auth_failed`/`not_configured`/`invalid_data`/`unknown`）
++ 异常类型名，**不保存异常原文**（已核验证据文件中无主机/端口/原文残留）。
+本轮实跑：`neo4j_chunks=0`（ok）、`parsed_chunks=2`（ok，2 文件 2 有效 0 坏行）、`pg_current_revisions` 与
+`milvus_rows`、集合清单均为 `category=connect_failed` 的未知；VERDICT=BLOCKED（exit 2）。
+
+#### 9.13.6 P2-2 统一门禁必须真正隔离网络（本轮边界披露）
+
+**复核方复跑时的边界偏差**：`total=22 failed=0` 当时**不等于**"全程离线"——`docqa_internal` 与
+`nl2cypher_internal` 子项导入 `main:app` 时经 `services.neo4j_service._connect()` **真连 Neo4j**
+（观测到 `::1:7687` 鉴权失败），连接失败被容错吞掉后子项仍报绿。整改：
+
+| 项 | 内容 |
+|---|---|
+| 网络护栏 | 新增 `backend/tests/netguard/sitecustomize.py`（runner 注入 `PYTHONPATH` 自动加载）：**禁一切非回环连接** + **禁真实服务端口**（5432/5434/6379/7474/7687/9003/19530/19531/29530/29531/9200/11434），放行其余回环（Windows `asyncio` ProactorEventLoop 依赖 `socket.socketpair()` 的回环临时端口，无差别封禁会连测试框架一起打掉）。命中抛 `NEUTRALIZED_NETWORK:<host>:<port>` |
+| 判红机制 | runner 检测到该标记 → **该子项直接判失败**（即使退出码为 0） |
+| 服务替身 | 新增 `backend/tests/_offline_services.py`：导入 app **之前**安装 Neo4j 驱动替身（不建连接；替身被真正使用即抛 `OfflineServiceUsedError`，不静默返回空结果）；DocQA/NL2Cypher 两子项已接入 |
+| 负向对照 | 实测：`127.0.0.1:7687` → 拦截；`1.1.1.1:443` → 拦截；普通回环高位端口 → 放行（非护栏误伤） |
+| 结果 | 在**真实护栏**下 `run_unified_boundary_guards.py` → `SUMMARY total=22 failed=0`（此时"全离线"是被强制保证的，而非"恰好没连"） |
+
+#### 9.13.7 回归结果（本轮实跑）
+
+| 命令 | 结果 |
+|---|---|
+| `run_unified_boundary_guards.py`（含真实网络护栏） | `SUMMARY total=22 failed=0`，EXIT=0 |
+| `check_vector_write_contract.py` | `RESULT: 44 passed, 0 failed`，EXIT=0（原 30 + C15–C20 共 14） |
+| `check_b0_reindex_chunks.py` | `✓ all M5-B0 reindex_chunks checks passed`，EXIT=0（含 E4） |
+| `check_m5_wave3_handoff.py` | `RESULT: PASS`，EXIT=0 |
+| `check_m5_dual_write.py` | `M5_DUAL_WRITE_SUMMARY passed=23 failed=0`，EXIT=0 |
+| `check_m5a_revision_backfill.py` | `✓ all M5-A acceptance checks passed`，EXIT=0 |
+| `check_backfill_manifest.py` | `✓ all backfill run-manifest checks passed`，EXIT=0 |
+| 预检 v2（只读） | VERDICT=BLOCKED，exit 2（fail-closed） |
+
+**连接范围披露**：本轮代码与测试**零真实服务连接**（进程内假体 + 临时隔离库）；预检为只读，实际连接受阻
+（PG/Milvus `connect_failed`、Neo4j 读到 0）；未写入任何生产或共享 v2/v3、未建 v3、未跑共享 backfill、
+未改受控配置、未重启共享服务、未 push；M5-B1 继续冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
