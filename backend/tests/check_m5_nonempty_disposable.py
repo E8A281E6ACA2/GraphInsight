@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -76,6 +77,8 @@ AUTHORIZE_TOKEN = "NONEMPTY-DISPOSABLE-AUTHORIZED"
 FAILURES: List[str] = []
 CHECKS: List[Tuple[str, bool]] = []
 STEPS: List[Dict[str, Any]] = []
+# 是否已创建一次性容器/网络（决定 cleanup 是否销毁；预检拒绝时不得误删他人同名对象）。
+CREATED_RESOURCES = False
 
 
 def say(line: str = "") -> None:
@@ -123,10 +126,10 @@ def print_plan() -> None:
 # ---------------------------------------------------------------------------
 # docker 辅助
 # ---------------------------------------------------------------------------
-def _run(cmd: List[str], *, timeout: int = 300, label: str = "") -> Tuple[int, str]:
+def _run(cmd: List[str], *, timeout: int = 300, label: str = "", cwd: Optional[str] = None) -> Tuple[int, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout)
+                              errors="replace", timeout=timeout, cwd=cwd or str(BACKEND))
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except subprocess.TimeoutExpired:
         return 124, f"timeout>{timeout}s ({label})"
@@ -137,33 +140,57 @@ def _run(cmd: List[str], *, timeout: int = 300, label: str = "") -> Tuple[int, s
 def _docker_names(*, all: bool = False) -> set:  # noqa: A002
     flag = "-a" if all else ""
     code, out = _run(["docker", "ps", flag, "--format", "{{.Names}}"], timeout=60)
-    return set((out or "").split()) if code == 0 else set()
+    if code != 0:
+        raise RuntimeError(f"docker ps 枚举失败（exit={code}）: {out[-200:]}")
+    return set((out or "").split())
 
 
 def _docker_networks() -> set:
     code, out = _run(["docker", "network", "ls", "--format", "{{.Name}}"], timeout=60)
-    return set((out or "").split()) if code == 0 else set()
+    if code != 0:
+        raise RuntimeError(f"docker network ls 枚举失败（exit={code}）: {out[-200:]}")
+    return set((out or "").split())
 
 
 def _docker_volumes() -> set:
     code, out = _run(["docker", "volume", "ls", "--format", "{{.Name}}"], timeout=60)
-    return set((out or "").split()) if code == 0 else set()
+    if code != 0:
+        raise RuntimeError(f"docker volume ls 枚举失败（exit={code}）: {out[-200:]}")
+    return set((out or "").split())
 
 
 # ---------------------------------------------------------------------------
 # 环境与连接
 # ---------------------------------------------------------------------------
+# 受控 env：清除宿主 env 里会污染的关键变量，只让 env file（GRAPHINSIGHT_BACKEND_ENV_FILE）
+# 决定这些值，避免宿主已设的共享库连接串/双写开关泄漏进一次性子进程。
+_CONTROLLED_ENV_KEYS = (
+    "GRAPHINSIGHT_BACKEND_ENV_FILE",
+    "ADMIN_DATABASE_URL",
+    "NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "NEO4J_DATABASE", "NEO4J_CONFIG_SOURCE",
+    "MILVUS_URI", "MILVUS_TOKEN", "MILVUS_DB_NAME", "MILVUS_COLLECTION",
+    "MILVUS_DUAL_WRITE", "MILVUS_SHADOW_COLLECTION",
+    "MILVUS_WRITE_SCOPE_KB_IDS", "MILVUS_WRITE_SCOPE_TENANT", "MILVUS_WRITE_SCOPE_PROJECT",
+    "MILVUS_METRIC_TYPE", "MILVUS_INDEX_TYPE", "MILVUS_SEARCH_NPROBE",
+    "VECTOR_STORE_ENABLED", "VECTOR_STORE_PROVIDER",
+    "LLM_ENABLED", "EMBEDDING_ENABLED", "EMBEDDING_API_KEY", "EMBEDDING_PROVIDER", "EMBEDDING_BASE_URL",
+    "AI_SERVICE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    "PARSED_DOCUMENT_STORAGE_PATH", "BACKFILL_MANIFEST_DIR",
+)
+
+
 def base_env(tmp: Path, *, neo4j_uri: str = NEO4J_URI, milvus_uri: str = MILVUS_URI,
-             dual_write: bool = False) -> Dict[str, str]:
+             dual_write: bool = True) -> Dict[str, str]:
     env_file = tmp / "nonempty.env"
     lines = [
         f"ADMIN_DATABASE_URL={PG_URL}",
         f"NEO4J_URI={neo4j_uri}",
         f"NEO4J_USER={NEO4J_USER}",
         f"NEO4J_PASSWORD={NEO4J_PASSWORD}",
-        "LLM_ENABLED=true",
-        "EMBEDDING_ENABLED=false",   # embedding 用确定性本地向量，不请求外部模型
-        "VECTOR_STORE_ENABLED=true",
+        "LLM_ENABLED=true",                       # graph 能力开启
+        "EMBEDDING_ENABLED=true",                 # vector 能力：embedding 已配置
+        "EMBEDDING_API_KEY=nonempty-disposable-local",  # 能力判定要求非空 api_key（确定性本地向量，不外发）
+        "VECTOR_STORE_ENABLED=true",              # vector 能力：vector_store 开启
         f"MILVUS_URI={milvus_uri}",
         f"MILVUS_COLLECTION={PRIMARY_COLLECTION}",
         f"MILVUS_DUAL_WRITE={'true' if dual_write else 'false'}",
@@ -173,6 +200,8 @@ def base_env(tmp: Path, *, neo4j_uri: str = NEO4J_URI, milvus_uri: str = MILVUS_
     ]
     env_file.write_text("\n".join(lines), encoding="utf-8")
     env = dict(os.environ)
+    for key in _CONTROLLED_ENV_KEYS:
+        env.pop(key, None)  # 清除宿主污染，只受 env file 控制
     env["GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(env_file)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -181,10 +210,10 @@ def base_env(tmp: Path, *, neo4j_uri: str = NEO4J_URI, milvus_uri: str = MILVUS_
 
 
 def run_py(tmp: Path, script: str, args: List[str], *, neo4j_uri: str = NEO4J_URI,
-           milvus_uri: str = MILVUS_URI, dual_write: bool = False) -> Tuple[int, str]:
+           milvus_uri: str = MILVUS_URI, dual_write: bool = True) -> Tuple[int, str]:
     cmd = [sys.executable, script] + list(args)
     env = base_env(tmp, neo4j_uri=neo4j_uri, milvus_uri=milvus_uri, dual_write=dual_write)
-    return _run(cmd, timeout=300, label=script)
+    return _run(cmd, timeout=300, label=script, cwd=str(BACKEND))
 
 
 def pg_connect():
@@ -213,28 +242,38 @@ def table_exists(conn, name: str) -> bool:
 # 编排步骤
 # ---------------------------------------------------------------------------
 def ensure_containers() -> None:
+    global CREATED_RESOURCES
+    CREATED_RESOURCES = True
     net = _docker_networks()
     if NET not in net:
-        _run(["docker", "network", "create", NET], timeout=60)
+        code, out = _run(["docker", "network", "create", NET], timeout=60)
+        if code != 0:
+            raise RuntimeError(f"docker network create {NET} 失败（exit={code}）: {out[-200:]}")
     names = _docker_names(all=True)
     if PG not in names:
-        _run(["docker", "run", "-d", "--name", PG, "--network", NET,
-              "-p", f"127.0.0.1:{PG_PORT}:5432",
-              "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_DB=gi_nonempty",
-              "-e", "POSTGRES_USER=gi", "-v", f"{VOLUMES[0]}:/var/lib/postgresql/data",
-              PG_IMAGE], timeout=180)
+        code, out = _run(["docker", "run", "-d", "--name", PG, "--network", NET,
+                          "-p", f"127.0.0.1:{PG_PORT}:5432",
+                          "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_DB=gi_nonempty",
+                          "-e", "POSTGRES_USER=gi", "-v", f"{VOLUMES[0]}:/var/lib/postgresql/data",
+                          PG_IMAGE], timeout=180)
+        if code != 0:
+            raise RuntimeError(f"docker run {PG} 失败（exit={code}）: {out[-200:]}")
     if NEO4J not in names:
-        _run(["docker", "run", "-d", "--name", NEO4J, "--network", NET,
-              "-p", f"127.0.0.1:{NEO4J_BOLT_PORT}:7687",
-              "-e", "NEO4J_AUTH=none", "-v", f"{VOLUMES[1]}:/data", NEO4J_IMAGE], timeout=180)
+        code, out = _run(["docker", "run", "-d", "--name", NEO4J, "--network", NET,
+                          "-p", f"127.0.0.1:{NEO4J_BOLT_PORT}:7687",
+                          "-e", "NEO4J_AUTH=none", "-v", f"{VOLUMES[1]}:/data", NEO4J_IMAGE], timeout=180)
+        if code != 0:
+            raise RuntimeError(f"docker run {NEO4J} 失败（exit={code}）: {out[-200:]}")
     if MILVUS not in names:
         # 与项目 compose 栈同款启动方式（milvus run standalone + 内嵌 etcd + local storage）。
         # 已知约束：内嵌 etcd 在本机可能 panic 起不来，起不来由下方就绪轮询判 FAIL（fail-closed）。
-        _run(["docker", "run", "-d", "--name", MILVUS, "--network", NET,
-              "-p", f"127.0.0.1:{MILVUS_PORT}:19530",
-              "-e", "ETCD_USE_EMBED=true", "-e", "ETCD_DATA_DIR=/var/lib/milvus/etcd",
-              "-e", "COMMON_STORAGETYPE=local", "-v", f"{VOLUMES[2]}:/var/lib/milvus",
-              MILVUS_IMAGE, "milvus", "run", "standalone"], timeout=180)
+        code, out = _run(["docker", "run", "-d", "--name", MILVUS, "--network", NET,
+                          "-p", f"127.0.0.1:{MILVUS_PORT}:19530",
+                          "-e", "ETCD_USE_EMBED=true", "-e", "ETCD_DATA_DIR=/var/lib/milvus/etcd",
+                          "-e", "COMMON_STORAGETYPE=local", "-v", f"{VOLUMES[2]}:/var/lib/milvus",
+                          MILVUS_IMAGE, "milvus", "run", "standalone"], timeout=180)
+        if code != 0:
+            raise RuntimeError(f"docker run {MILVUS} 失败（exit={code}）: {out[-200:]}")
 
     deadline = time.time() + 300
     pg_ready = neo_ready = mil_ready = False
@@ -303,7 +342,7 @@ def seed_nonempty(tmp: Path, kb: str, docs: Dict[str, List[str]]) -> None:
         (d / "chunks.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     add_step("解析产物落盘（真实文件）", all((parsed_root / kb / d / "chunks.jsonl").exists() for d in docs))
 
-    # PG：KB 登记 + current 行
+    # PG：KB 登记 + chunk_revisions current 行播种（revision=1，投影双侧 pending）
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
@@ -312,10 +351,22 @@ def seed_nonempty(tmp: Path, kb: str, docs: Dict[str, List[str]]) -> None:
                     "VALUES (%s,%s,%s,%s,%s,'active',%s) ON CONFLICT (id) DO NOTHING",
                     (kb, "t-nonempty", "p-nonempty", "nonempty-disposable", "nonempty-disposable", kb),
                 )
+                for doc_id, chunk_ids in docs.items():
+                    for c in chunk_ids:
+                        content = f"非空全链路内容-{c}"
+                        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                        cur.execute(
+                            "INSERT INTO chunk_revisions (kb_id, tenant_id, project_id, doc_id, chunk_id, "
+                            "source_content, source_content_hash, content, content_hash, content_revision, "
+                            "revision_status, graph_status, vector_status, revision_source, reason, trace_id) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,1,'current','pending','pending',"
+                            "'system_initial','nonempty_disposable','nonempty-disposable')",
+                            (kb, "t-nonempty", "p-nonempty", doc_id, c, content, digest, content, digest),
+                        )
             conn.commit()
-        add_step("KB 作用域登记落库（真实 PG）", True)
+        add_step("KB 登记 + chunk_revisions current 行播种（真实 PG）", True)
     except Exception as exc:  # noqa: BLE001
-        add_step("KB 作用域登记落库（真实 PG）", False, f"{type(exc).__name__}: {exc}")
+        add_step("KB 登记 + chunk_revisions current 行播种（真实 PG）", False, f"{type(exc).__name__}: {exc}")
 
     # Neo4j：Chunk 节点
     try:
@@ -374,10 +425,14 @@ S1_DRIVER = (
     "def _q(name, fields):\n"
     "    c.load_collection(collection_name=name)\n"
     "    return list(c.query(collection_name=name, filter='kb_id == \"'+kb+'\"', output_fields=fields, limit=10) or [])\n"
-    "p=_q(primary, ['chunk_id','text','kb_id'])\n"
+    "# 双侧读回：primary（legacy v2 剥版本）+ shadow（v3 显式版本）。\n"
+    "# 真实观察动态残留：primary 查询 content_revision，SDK 会把 $meta 展开到顶层，残留即非空。\n"
+    "p=_q(primary, ['chunk_id','text','kb_id','content_revision'])\n"
     "s=_q(shadow, ['chunk_id','text','kb_id','content_revision'])\n"
-    "print('S1_PRIMARY_ROWS=' + str(len(p)) + ' S1_PRIMARY_HAS_REV=' + str(any('content_revision' in r for r in p)))\n"
-    "print('S1_SHADOW_ROWS=' + str(len(s)) + ' S1_SHADOW_REV=' + str([r.get('content_revision') for r in s]))\n"
+    "p_residual=[r.get('content_revision') for r in p if r.get('content_revision') not in (None, '')]\n"
+    "s_rev=[r.get('content_revision') for r in s if r.get('content_revision') not in (None, '')]\n"
+    "print('S1_PRIMARY_ROWS=' + str(len(p)) + ' S1_PRIMARY_RESIDUAL=' + str(p_residual))\n"
+    "print('S1_SHADOW_ROWS=' + str(len(s)) + ' S1_SHADOW_REV=' + str(s_rev))\n"
 )
 
 
@@ -390,20 +445,24 @@ def verify_s1_dual_write(tmp: Path, kb: str, doc: str, chunk: str) -> None:
     )
     add_step("S1 双写：execute_job 退出 0", code == 0, out[-400:])
     add_step("S1 双写：execution_status=completed", "S1_EXEC_STATUS=completed" in out, out[-400:])
-    add_step("S1 双写：primary 收到 1 行且**无** content_revision（剥版本）",
-             "S1_PRIMARY_ROWS=1" in out and "S1_PRIMARY_HAS_REV=False" in out, out[-400:])
+    add_step("S1 双写：primary 收到 1 行且动态残留为空（剥版本成立）",
+             "S1_PRIMARY_ROWS=1" in out and "S1_PRIMARY_RESIDUAL=[]" in out, out[-400:])
     add_step("S1 双写：shadow 收到 1 行且 content_revision=1（带版本）",
              "S1_SHADOW_ROWS=1" in out and "S1_SHADOW_REV=[1]" in out, out[-400:])
 
 
 def verify_backfill(tmp: Path, kb: str) -> None:
+    # 单向回填（backfill_versioned）：也需要 dual_write/shadow 生效（_upsert_backfill_versioned 依赖
+    # resolve_dual_write().active 判 shadow 生效），否则版本无处承载、chunk 记 revision_field_absent。
     code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
-                       ["--kb", kb, "--manifest-dir", str(tmp / "mf")])
+                       ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
     add_step("单向回填：backfill 退出 0", code == 0, out[-400:])
     add_step("单向回填：rows_new=2（非空数据两条 chunk）", "rows_new=2" in out, out[-400:])
 
 
 def verify_readback(tmp: Path, kb: str, all_chunks: List[str]) -> None:
+    # 列序（与 SELECT 一致）：0 chunk_id / 1 content_revision / 2 graph_status / 3 vector_status /
+    # 4 graph_content_revision / 5 vector_content_revision
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -414,8 +473,8 @@ def verify_readback(tmp: Path, kb: str, all_chunks: List[str]) -> None:
             rows = cur.fetchall()
     pg_map = {r[0]: r for r in rows}
     add_step("PG 读回 current 行数=2", len(rows) == len(all_chunks), f"rows={len(rows)}")
-    add_step("PG 读回 revision=1 且 vector 腿 indexed（单向回填已补 shadow）",
-             all(pg_map.get(c) and pg_map[c][1] == 1 and pg_map[c][5] == "indexed" for c in all_chunks),
+    add_step("PG 读回 revision=1 且 vector_status=indexed（单向回填已补 shadow）",
+             all(pg_map.get(c) and pg_map[c][1] == 1 and pg_map[c][3] == "indexed" for c in all_chunks),
              str(pg_map))
 
 
@@ -492,14 +551,18 @@ def cleanup(tmp: Path, kb: str, keep_containers: bool) -> None:
         add_step("临时目录已删除", not tmp.exists())
     except Exception as exc:  # noqa: BLE001
         add_step("临时目录已删除", False, str(exc))
-    if not keep_containers:
+    if not keep_containers and CREATED_RESOURCES:
         for name in CONTAINERS:
             _run(["docker", "rm", "-f", name], timeout=60)
         _run(["docker", "network", "rm", NET], timeout=60)
         for vol in VOLUMES:
             _run(["docker", "volume", "rm", "-f", vol], timeout=60)
-        left = [n for n in CONTAINERS if n in _docker_names(all=True)]
-        add_step("disposable 容器已销毁（含验证）", not left, f"left={left}")
+        left_containers = [n for n in CONTAINERS if n in _docker_names(all=True)]
+        left_nets = [NET] if NET in _docker_networks() else []
+        left_vols = [v for v in VOLUMES if v in _docker_volumes()]
+        add_step("disposable 容器/网络/卷已销毁（复查三者零残留）",
+                 not (left_containers or left_nets or left_vols),
+                 f"containers={left_containers} nets={left_nets} vols={left_vols}")
 
 
 def write_evidence(base: Path, run_id: str, exec_time: str) -> None:
@@ -536,6 +599,36 @@ def write_evidence(base: Path, run_id: str, exec_time: str) -> None:
     (base / "nonempty_meta.txt").write_text("\n".join(meta) + "\n", encoding="utf-8")
     add_step("证据落盘（meta 覆盖写 + 步骤 JSON 可解析）",
              (base / "nonempty_meta.txt").exists() and (base / "nonempty_steps.json").exists())
+    # 独立复验证据合同：读回 JSON 与 meta，校验 RUN_ID 一致、JSON 可解析、step 数自洽。
+    try:
+        read_back = json.loads((base / "nonempty_steps.json").read_text(encoding="utf-8"))
+        meta_text = (base / "nonempty_meta.txt").read_text(encoding="utf-8")
+        contract_ok = (
+            read_back.get("run_id") == run_id
+            and f"RUN_ID={run_id}" in meta_text
+            and isinstance(read_back.get("steps"), list)
+            and len(read_back.get("steps")) == len(STEPS)
+        )
+        add_step("证据合同独立复验（RUN_ID 一致 + JSON 可解析 + meta 覆盖写）", contract_ok,
+                 f"run_id_ok={read_back.get('run_id') == run_id}")
+    except Exception as exc:  # noqa: BLE001
+        add_step("证据合同独立复验（RUN_ID 一致 + JSON 可解析 + meta 覆盖写）", False,
+                 f"{type(exc).__name__}: {exc}")
+
+
+def archive_manifests(base: Path, tmp: Path) -> None:
+    """归档 backfill 运行清单到证据目录（cleanup 删除 tmp 前必须归档，否则审计产物丢失）。"""
+    mf_dir = tmp / "mf"
+    if not mf_dir.exists():
+        add_step("归档 backfill manifest", False, "manifest 目录不存在")
+        return
+    dest = base / "manifests"
+    dest.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for p in sorted(mf_dir.glob("*.json")):
+        shutil.copy2(p, dest / p.name)
+        count += 1
+    add_step("归档 backfill manifest", count >= 1, f"files={count}")
 
 
 def main() -> int:
@@ -550,17 +643,6 @@ def main() -> int:
     if args.authorize != AUTHORIZE_TOKEN:
         print_plan()
         return 3
-
-    # 预检：同名对象必须不存在
-    names = _docker_names(all=True)
-    nets = _docker_networks()
-    vols = _docker_volumes()
-    occupied = ([n for n in CONTAINERS if n in names]
-                + ([NET] if NET in nets else [])
-                + [v for v in VOLUMES if v in vols])
-    if occupied:
-        say(f"✗ 预检拒绝：发现同名一次性对象 {occupied}，绝不覆盖；请先清理或换名。")
-        return 2
 
     base = Path(args.evidence_dir)
     now = datetime.now()
@@ -579,21 +661,37 @@ def main() -> int:
     exit_code = 0
     try:
         say(f"[RUN] {run_id} 开始（真实三引擎 disposable）")
-        ensure_containers()
-        migrate_tables(tmp)
-        seed_nonempty(tmp, kb, docs)
-        verify_s1_dual_write(tmp, kb, doc, chunks[0])
-        verify_backfill(tmp, kb)
-        verify_readback(tmp, kb, chunks)
+        # 预检：同名对象必须不存在（枚举失败抛异常 → except 记入失败证据）
+        names = _docker_names(all=True)
+        nets = _docker_networks()
+        vols = _docker_volumes()
+        occupied = ([n for n in CONTAINERS if n in names]
+                    + ([NET] if NET in nets else [])
+                    + [v for v in VOLUMES if v in vols])
+        if occupied:
+            add_step("预检：同名一次性对象不存在（拒绝执行）", False, str(occupied))
+            exit_code = 2
+        else:
+            add_step("预检：同名一次性对象不存在", True)
+            ensure_containers()
+            migrate_tables(tmp)
+            seed_nonempty(tmp, kb, docs)
+            verify_s1_dual_write(tmp, kb, doc, chunks[0])
+            verify_backfill(tmp, kb)
+            verify_readback(tmp, kb, chunks)
 
-        with pg_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT count(*) FROM chunk_revisions WHERE kb_id=%s", (kb,))
-                before = cur.fetchone()[0]
-        inject_failure(tmp, kb, before)
-        verify_idempotent(tmp, kb, before)
-        verify_rollback(tmp, kb)
+            with pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT count(*) FROM chunk_revisions WHERE kb_id=%s", (kb,))
+                    before = cur.fetchone()[0]
+            inject_failure(tmp, kb, before)
+            verify_idempotent(tmp, kb, before)
+            verify_rollback(tmp, kb)
+    except Exception as exc:  # noqa: BLE001 - 异常必须进入失败证据，不得静默吞掉
+        add_step("执行异常（进入失败证据）", False, f"{type(exc).__name__}: {exc}")
+        exit_code = 2
     finally:
+        archive_manifests(base, tmp)
         cleanup(tmp, kb, args.keep_containers)
         write_evidence(base, run_id, exec_time)
 
