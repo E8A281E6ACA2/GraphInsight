@@ -336,24 +336,11 @@ def migrate_tables(tmp: Path) -> None:
     add_step("migrate targets_hash", code == 0, out[-200:])
 
 
-def seed_nonempty(tmp: Path, kb: str, docs: Dict[str, List[str]]) -> None:
-    # 解析产物（真实文件）
-    parsed_root = tmp / "parsed_documents"
-    for doc_id, chunk_ids in docs.items():
-        d = parsed_root / kb / doc_id
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "manifest.json").write_text(
-            json.dumps({"parser_version": "nonempty", "content_hash": "h-" + doc_id}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        lines = [
-            json.dumps({"chunk_id": c, "doc_id": doc_id, "text": f"非空全链路内容-{c}"}, ensure_ascii=False)
-            for c in chunk_ids
-        ]
-        (d / "chunks.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    add_step("解析产物落盘（真实文件）", all((parsed_root / kb / d / "chunks.jsonl").exists() for d in docs))
+def seed_s1(tmp: Path, kb: str, s1_chunk: str, doc: str) -> None:
+    """S1 数据组：KB 登记 + chunk_revisions current 行（revision=1，双侧 pending）+ Neo4j 节点。
 
-    # PG：KB 登记 + chunk_revisions current 行播种（revision=1，投影双侧 pending）
+    S1 组 chunk（s1_chunk）有 current revision，走 online_s1（worker 消费 reindex_chunks → 双侧写）。
+    """
     try:
         with pg_connect() as conn:
             with conn.cursor() as cur:
@@ -362,41 +349,75 @@ def seed_nonempty(tmp: Path, kb: str, docs: Dict[str, List[str]]) -> None:
                     "VALUES (%s,%s,%s,%s,%s,'active',%s) ON CONFLICT (id) DO NOTHING",
                     (kb, "t-nonempty", "p-nonempty", "nonempty-disposable", "nonempty-disposable", kb),
                 )
-                for doc_id, chunk_ids in docs.items():
-                    for c in chunk_ids:
-                        content = f"非空全链路内容-{c}"
-                        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                        cur.execute(
-                            "INSERT INTO chunk_revisions (kb_id, tenant_id, project_id, doc_id, chunk_id, "
-                            "source_content, source_content_hash, content, content_hash, content_revision, "
-                            "revision_status, graph_status, vector_status, revision_source, reason, trace_id) "
-                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,1,'current','pending','pending',"
-                            "'system_initial','nonempty_disposable','nonempty-disposable')",
-                            (kb, "t-nonempty", "p-nonempty", doc_id, c, content, digest, content, digest),
-                        )
+                content = f"非空全链路内容-{s1_chunk}"
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                cur.execute(
+                    "INSERT INTO chunk_revisions (kb_id, tenant_id, project_id, doc_id, chunk_id, "
+                    "source_content, source_content_hash, content, content_hash, content_revision, "
+                    "revision_status, graph_status, vector_status, revision_source, reason, trace_id) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,1,'current','pending','pending',"
+                    "'system_initial','nonempty_disposable','nonempty-disposable')",
+                    (kb, "t-nonempty", "p-nonempty", doc, s1_chunk, content, digest, content, digest),
+                )
             conn.commit()
-        add_step("KB 登记 + chunk_revisions current 行播种（真实 PG）", True)
+        add_step("S1 组：KB 登记 + current 行播种（真实 PG）", True)
     except Exception as exc:  # noqa: BLE001
-        add_step("KB 登记 + chunk_revisions current 行播种（真实 PG）", False, f"{type(exc).__name__}: {exc}")
+        add_step("S1 组：KB 登记 + current 行播种（真实 PG）", False, f"{type(exc).__name__}: {exc}")
 
-    # Neo4j：Chunk 节点
     try:
         driver = neo4j_driver()
         with driver.session() as s:
-            for doc_id, chunk_ids in docs.items():
-                for c in chunk_ids:
-                    s.run(
-                        "MERGE (c:Chunk {chunk_id: $cid}) SET c.kb_id=$kb, c.doc_id=$doc, c.text=$text, "
-                        "c.tenant_id=$t, c.project_id=$p",
-                        {"cid": c, "kb": kb, "doc": doc_id, "text": f"非空全链路内容-{c}",
-                         "t": "t-nonempty", "p": "p-nonempty"},
-                    )
+            s.run(
+                "MERGE (c:Chunk {chunk_id: $cid}) SET c.kb_id=$kb, c.doc_id=$doc, c.text=$text, "
+                "c.tenant_id=$t, c.project_id=$p",
+                {"cid": s1_chunk, "kb": kb, "doc": doc, "text": f"非空全链路内容-{s1_chunk}",
+                 "t": "t-nonempty", "p": "p-nonempty"},
+            )
         driver.close()
         global SEEDED
         SEEDED = True  # Neo4j + PG 已播种，cleanup 才允许连 Neo4j/Milvus 清理
-        add_step("Neo4j Chunk 节点播种（真实图库）", True)
+        add_step("S1 组：Neo4j 节点播种（真实图库）", True)
     except Exception as exc:  # noqa: BLE001
-        add_step("Neo4j Chunk 节点播种（真实图库）", False, f"{type(exc).__name__}: {exc}")
+        add_step("S1 组：Neo4j 节点播种（真实图库）", False, f"{type(exc).__name__}: {exc}")
+
+
+# backfill 组：向 primary(v2) 预写向量（读源不变量 §16.1：primary 必须已持有该 chunk）
+SEED_BF_DRIVER = (
+    "from pymilvus import MilvusClient\n"
+    "uri={uri!r}; primary={primary!r}; kb={kb!r}; chunk={chunk!r}; doc={doc!r}\n"
+    "c=MilvusClient(uri=uri)\n"
+    "rows=[{{'chunk_id': chunk, 'kb_id': kb, 'tenant_id': 't-nonempty', 'project_id': 'p-nonempty', "
+    "'doc_id': doc, 'text': '非空全链路内容-'+chunk, 'vector': [0.9,0.8,0.7,0.6]}}]\n"
+    "c.upsert(collection_name=primary, data=rows)\n"
+    "print('SEED_BF_PRIMARY_OK')\n"
+)
+
+
+def seed_backfill(tmp: Path, kb: str, bf_chunk: str, doc: str) -> None:
+    """backfill 数据组：解析产物（可恢复证据）+ primary(v2) 预写向量，PG 无 current revision。
+
+    backfill 组 chunk（bf_chunk）与 S1 组（s1_chunk）不同：PG 开始没有 current revision，
+    primary(v2) 预先存在该 chunk 的向量，shadow(v3) 开始没有该 chunk。执行 backfill_versioned 后
+    应 rows_new=1、primary 不变、shadow 新增显式 content_revision。
+    """
+    parsed_root = tmp / "parsed_documents"
+    d = parsed_root / kb / doc
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "manifest.json").write_text(
+        json.dumps({"parser_version": "nonempty", "content_hash": "h-" + doc}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (d / "chunks.jsonl").write_text(
+        json.dumps({"chunk_id": bf_chunk, "doc_id": doc, "text": f"非空全链路内容-{bf_chunk}"}, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    add_step("backfill 组：解析产物落盘（可恢复证据）", (d / "chunks.jsonl").exists())
+
+    code, out = run_py(tmp, "-c", [SEED_BF_DRIVER.format(uri=MILVUS_URI, primary=PRIMARY_COLLECTION,
+                                                         kb=kb, chunk=bf_chunk, doc=doc)],
+                       dual_write=True)
+    add_step("backfill 组：primary(v2) 预写向量", code == 0 and "SEED_BF_PRIMARY_OK" in out, out[-400:])
 
 
 # S1 双写：内联 driver 消费 reindex_chunks，真实写 primary+shadow（monkeypatch 确定性向量）
@@ -464,16 +485,17 @@ def verify_s1_dual_write(tmp: Path, kb: str, doc: str, chunk: str) -> None:
              "S1_SHADOW_ROWS=1" in out and "S1_SHADOW_REV=[1]" in out, out[-400:])
 
 
-def verify_backfill(tmp: Path, kb: str) -> None:
-    # 单向回填（backfill_versioned）：也需要 dual_write/shadow 生效（_upsert_backfill_versioned 依赖
-    # resolve_dual_write().active 判 shadow 生效），否则版本无处承载、chunk 记 revision_field_absent。
+def verify_backfill(tmp: Path, kb: str, bf_chunk: str) -> None:
+    # 单向回填（backfill_versioned）：backfill 组 chunk（bf_chunk）→ rows_new=1。
+    # 需要 dual_write/shadow 生效（_upsert_backfill_versioned 依赖 resolve_dual_write().active）。
     code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
     add_step("单向回填：backfill 退出 0", code == 0, out[-400:])
-    add_step("单向回填：rows_new=2（非空数据两条 chunk）", "rows_new=2" in out, out[-400:])
+    add_step("单向回填：rows_new=1（backfill 组 bf_chunk）", "rows_new=1" in out, out[-400:])
 
 
-def verify_readback(tmp: Path, kb: str, all_chunks: List[str]) -> None:
+def verify_readback(tmp: Path, kb: str, s1_chunk: str, bf_chunk: str) -> None:
+    """读回验证：PG current 行（S1 组 + backfill 组各 1 行），revision=1 且 vector_status=indexed。"""
     # 列序（与 SELECT 一致）：0 chunk_id / 1 content_revision / 2 graph_status / 3 vector_status /
     # 4 graph_content_revision / 5 vector_content_revision
     with pg_connect() as conn:
@@ -485,9 +507,11 @@ def verify_readback(tmp: Path, kb: str, all_chunks: List[str]) -> None:
             )
             rows = cur.fetchall()
     pg_map = {r[0]: r for r in rows}
-    add_step("PG 读回 current 行数=2", len(rows) == len(all_chunks), f"rows={len(rows)}")
-    add_step("PG 读回 revision=1 且 vector_status=indexed（单向回填已补 shadow）",
-             all(pg_map.get(c) and pg_map[c][1] == 1 and pg_map[c][3] == "indexed" for c in all_chunks),
+    expected = {s1_chunk, bf_chunk}
+    add_step("PG 读回 current 行数=2（S1 组 + backfill 组）",
+             len(rows) == 2 and set(pg_map) == expected, f"rows={sorted(pg_map)}")
+    add_step("PG 读回 revision=1 且 vector_status=indexed（两组）",
+             all(pg_map.get(c) and pg_map[c][1] == 1 and pg_map[c][3] == "indexed" for c in expected),
              str(pg_map))
 
 
@@ -581,29 +605,79 @@ def cleanup(tmp: Path, kb: str, keep_containers: bool) -> None:
                  f"containers={left_containers} nets={left_nets} vols={left_vols}")
 
 
-def write_evidence(base: Path, run_id: str, exec_time: str) -> None:
-    base.mkdir(parents=True, exist_ok=True)
-    # 快照：落盘后不再往 JSON 追加步骤（避免"写完 JSON 又 add_step"导致复验必然失败）。
-    steps_snapshot = list(STEPS)
-    steps_doc = {
-        "schema": "gate0-nonempty-disposable-steps-v1",
-        "run_id": run_id,
-        "exec_time": exec_time,
-        "target_kind": "disposable-docker",
-        "engines": {
-            "postgres": f"{PG}@127.0.0.1:{PG_PORT}",
-            "neo4j": f"{NEO4J}@127.0.0.1:{NEO4J_BOLT_PORT}",
-            "milvus": f"{MILVUS}@127.0.0.1:{MILVUS_PORT}",
-        },
-        "write_paths": {"s1_dual_write": "online_s1(primary+shadow)", "backfill": "backfill_versioned(shadow-only)"},
-        "steps": steps_snapshot,
-    }
-    steps_path = base / "nonempty_steps.json"
-    steps_path.write_text(
-        json.dumps(steps_doc, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
-    )
+def _write_emergency_evidence(base: Path, run_id: str, exec_time: str, reason: str) -> None:
+    """写盘失败时的紧急证据（fail-closed：至少一个标记文件说明失败，ROUND_EXIT=2）。"""
+    try:
+        (base / "nonempty_emergency.txt").write_text(
+            "EVIDENCE_WRITE_FAILED\n"
+            f"RUN_ID={run_id}\n"
+            f"EXEC_TIME={exec_time}\n"
+            f"REASON={reason}\n"
+            "ROUND_EXIT=2\n",
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 - 连紧急证据都写不了，只能返回失败
+        pass
 
-    # 独立复验 JSON：读回与快照自洽（RUN_ID 一致 + JSON 可解析 + 步骤数 == 快照数）。
+
+def write_evidence(base: Path, run_id: str, exec_time: str) -> int:
+    """证据落盘（fail-closed）：先完成全部检查，再一次性生成 JSON/meta。返回退出码（0/2）。
+
+    JSON/meta/最终退出码共用同一份 finalized_failed：
+    1. 写 steps JSON（当前 STEPS 快照）；
+    2. 复验 JSON（读回：RUN_ID 一致 + 可解析 + 步骤数）；
+    3. add_step 记录 JSON 复验（计入 CHECKS/STEPS）；
+    4. 写 meta（用当前 CHECKS/finalized_failed）；
+    5. 复验 meta（读回：RUN_ID 落盘可读）；
+    6. add_step 记录 meta 复验；
+    7. 用最终 STEPS/CHECKS 一次性重写 JSON + meta（CHECKS_TOTAL=最终步骤数、
+       CHECKS_FAILED=最终失败数、ROUND_EXIT=2 iff 有失败）。
+
+    不允许"先写 ROUND_EXIT=0 再追加复验步骤"。任一步写盘失败 → 紧急证据 + 返回 2。
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    steps_path = base / "nonempty_steps.json"
+    meta_path = base / "nonempty_meta.txt"
+
+    def _dump_steps(snapshot: list) -> None:
+        doc = {
+            "schema": "gate0-nonempty-disposable-steps-v1",
+            "run_id": run_id,
+            "exec_time": exec_time,
+            "target_kind": "disposable-docker",
+            "engines": {
+                "postgres": f"{PG}@127.0.0.1:{PG_PORT}",
+                "neo4j": f"{NEO4J}@127.0.0.1:{NEO4J_BOLT_PORT}",
+                "milvus": f"{MILVUS}@127.0.0.1:{MILVUS_PORT}",
+            },
+            "write_paths": {"s1_dual_write": "online_s1(primary+shadow)", "backfill": "backfill_versioned(shadow-only)"},
+            "steps": snapshot,
+        }
+        steps_path.write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+
+    def _dump_meta(finalized_failed: list) -> None:
+        meta = [
+            "GATE NONEMPTY-DISPOSABLE ROUND METADATA (single round, overwritten each round)",
+            "RUN_ID=" + run_id,
+            "EXEC_TIME=" + exec_time,
+            "TARGET_KIND=disposable-docker",
+            f"ENGINES=postgres({PG_PORT})+neo4j({NEO4J_BOLT_PORT})+milvus({MILVUS_PORT})",
+            f"CHECKS_TOTAL={len(CHECKS)}",
+            f"CHECKS_FAILED={len(finalized_failed)}",
+            "ROUND_EXIT=%d" % (2 if finalized_failed else 0),
+            "NOTE: real engines are disposable docker containers; no shared dev, no shared Milvus, no push.",
+        ]
+        meta_path.write_text("\n".join(meta) + "\n", encoding="utf-8")
+
+    # 阶段 1：写 steps JSON（当前 STEPS 快照）
+    steps_snapshot = list(STEPS)
+    try:
+        _dump_steps(steps_snapshot)
+    except Exception as exc:  # noqa: BLE001 - 写盘失败 fail-closed
+        _write_emergency_evidence(base, run_id, exec_time, f"steps_json_write_failed:{type(exc).__name__}")
+        return 2
+
+    # 阶段 2：复验 steps JSON（读回：RUN_ID 一致 + 可解析 + 步骤数）
     try:
         read_back = json.loads(steps_path.read_text(encoding="utf-8"))
         json_ok = (
@@ -611,35 +685,36 @@ def write_evidence(base: Path, run_id: str, exec_time: str) -> None:
             and isinstance(read_back.get("steps"), list)
             and len(read_back.get("steps")) == len(steps_snapshot)
         )
-        detail = f"run_id_ok={read_back.get('run_id') == run_id} steps_ok={len(read_back.get('steps')) == len(steps_snapshot)}"
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - JSON 解析失败
         json_ok = False
-        detail = f"{type(exc).__name__}: {exc}"
+    add_step("证据合同复验（JSON：RUN_ID 一致 + 可解析 + 步骤数）", json_ok)
 
-    failed = [n for n, ok in CHECKS if not ok]
-    round_exit = 0 if (not failed and json_ok) else 2
-    meta = [
-        "GATE NONEMPTY-DISPOSABLE ROUND METADATA (single round, overwritten each round)",
-        "RUN_ID=" + run_id,
-        "EXEC_TIME=" + exec_time,
-        "TARGET_KIND=disposable-docker",
-        f"ENGINES=postgres({PG_PORT})+neo4j({NEO4J_BOLT_PORT})+milvus({MILVUS_PORT})",
-        f"CHECKS_TOTAL={len(CHECKS)}",
-        f"CHECKS_FAILED={len(failed)}",
-        "ROUND_EXIT=%d" % round_exit,
-        "NOTE: real engines are disposable docker containers; no shared dev, no shared Milvus, no push.",
-    ]
-    meta_path = base / "nonempty_meta.txt"
-    meta_path.write_text("\n".join(meta) + "\n", encoding="utf-8")
+    # 阶段 3：写 meta（用当前 CHECKS/finalized_failed）
+    finalized_failed = [n for n, ok in CHECKS if not ok]
+    try:
+        _dump_meta(finalized_failed)
+    except Exception as exc:  # noqa: BLE001
+        _write_emergency_evidence(base, run_id, exec_time, f"meta_write_failed:{type(exc).__name__}")
+        return 2
 
-    # 复验 meta（RUN_ID 落盘可读）
+    # 阶段 4：复验 meta（读回：RUN_ID 落盘可读）
     try:
         meta_ok = f"RUN_ID={run_id}" in meta_path.read_text(encoding="utf-8")
     except Exception:  # noqa: BLE001
         meta_ok = False
+    add_step("证据合同复验（meta：RUN_ID 落盘可读）", meta_ok)
 
-    # 复验结果进失败证据（在 JSON/meta 落盘之后，add_step 不影响已写内容）
-    add_step("证据合同独立复验（RUN_ID 一致 + JSON 可解析 + 步骤数自洽）", json_ok and meta_ok, detail)
+    # 阶段 5：用最终 STEPS/CHECKS 一次性重写 JSON + meta（最终一致性）
+    final_snapshot = list(STEPS)
+    finalized_failed = [n for n, ok in CHECKS if not ok]
+    try:
+        _dump_steps(final_snapshot)
+        _dump_meta(finalized_failed)
+    except Exception as exc:  # noqa: BLE001
+        _write_emergency_evidence(base, run_id, exec_time, f"finalize_write_failed:{type(exc).__name__}")
+        return 2
+
+    return 2 if finalized_failed else 0
 
 
 def archive_manifests(base: Path, tmp: Path) -> None:
@@ -681,8 +756,9 @@ def main() -> int:
 
     kb = "kb-nonempty-" + uuid.uuid4().hex[:8]
     doc = "d1"
-    chunks = ["n1c1", "n1c2"]
-    docs = {doc: chunks}
+    # 两组独立数据：S1 组（s1_chunk，有 current revision）+ backfill 组（bf_chunk，无 current revision）。
+    s1_chunk = "s1c1"
+    bf_chunk = "bfc1"
 
     exit_code = 0
     try:
@@ -701,10 +777,13 @@ def main() -> int:
             add_step("预检：同名一次性对象不存在", True)
             ensure_containers()
             migrate_tables(tmp)
-            seed_nonempty(tmp, kb, docs)
-            verify_s1_dual_write(tmp, kb, doc, chunks[0])
-            verify_backfill(tmp, kb)
-            verify_readback(tmp, kb, chunks)
+            # S1 组：s1_chunk（有 current revision）→ online_s1 双写
+            seed_s1(tmp, kb, s1_chunk, doc)
+            verify_s1_dual_write(tmp, kb, doc, s1_chunk)
+            # backfill 组：bf_chunk（无 current revision，primary 预置向量）→ backfill_versioned
+            seed_backfill(tmp, kb, bf_chunk, doc)
+            verify_backfill(tmp, kb, bf_chunk)
+            verify_readback(tmp, kb, s1_chunk, bf_chunk)
 
             with pg_connect() as conn:
                 with conn.cursor() as cur:
@@ -717,9 +796,22 @@ def main() -> int:
         add_step("执行异常（进入失败证据）", False, f"{type(exc).__name__}: {exc}")
         exit_code = 2
     finally:
-        archive_manifests(base, tmp)
-        cleanup(tmp, kb, args.keep_containers)
-        write_evidence(base, run_id, exec_time)
+        # 独立保护结构：任一步失败都记录失败、继续后续步骤，异常不覆盖最终失败证据。
+        try:
+            archive_manifests(base, tmp)
+        except Exception as exc:  # noqa: BLE001
+            add_step("归档 backfill manifest（异常）", False, f"{type(exc).__name__}: {exc}")
+        try:
+            cleanup(tmp, kb, args.keep_containers)
+        except Exception as exc:  # noqa: BLE001
+            add_step("清理（异常）", False, f"{type(exc).__name__}: {exc}")
+        try:
+            evidence_exit = write_evidence(base, run_id, exec_time)
+            if evidence_exit:
+                exit_code = 2
+        except Exception as exc:  # noqa: BLE001
+            add_step("证据落盘（异常）", False, f"{type(exc).__name__}: {exc}")
+            exit_code = 2
 
     failed = [n for n, ok in CHECKS if not ok]
     say("=" * 72)
