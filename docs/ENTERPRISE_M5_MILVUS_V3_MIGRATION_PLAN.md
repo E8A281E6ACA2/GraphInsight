@@ -705,6 +705,87 @@ backfill 仍未开始；共享生产 Gate 继续 OPEN，M5-B1 继续冻结。
 就绪档案已同步更新（P0 非空前置、P1b 能力、B-A/B-B 两条结构性阻塞，含 blocker id 映射），并由
 `check_phase6_readiness_consistency.py` 守住档案↔证据一致性（全绿）。
 
+---
+
+### 9.12 迁移写入契约修复（2026-10-05 · 工单 1–5，只改代码/测试/文档）
+
+授权方复核 §9.11 后纠正了上一轮授权的互斥表述，并给出代码工单：**不申请扩大共享写入**，先修写入契约。
+本轮**未连接共享服务做任何写入**、未改受控配置、未重启共享服务、未建共享 v3、未跑共享 backfill、未 push。
+
+#### 9.12.1 写入契约（工单 1：在线 S1 双写与历史回填**分开定义**）
+
+统一入口仍是 `MilvusVectorStore.upsert_chunks`（**唯一**扇出实现），新增 `intent` 维度：
+
+| 意图 | 目标 | 语义 |
+|---|---|---|
+| `online_s1`（默认） | primary + shadow | primary 先写、shadow 扇出；影子失败 `DualWriteShadowError`（可定位、可重放收敛）。**legacy v2（无显式字段）**：primary **剥版本写**（不写 metadata、不改 v2 schema），版本由 shadow 完整承载；此时 shadow 必须已有显式 INT64 字段，否则写前 fail-closed；**无影子时拒写**（§8.5） |
+| `backfill_versioned` | **仅 shadow** | 只补版本承载侧；不写 primary、不覆写既有 v2 行。写前判定：shadow 生效 + 显式 INT64 字段 + **primary 已持有这些 chunk**（§16.1 读源不变量，读不到 primary 亦拒）；写后必须**读回一致**才返回 |
+
+机读拒绝原因（`VectorWriteContractError.reason`）：`SHADOW_NOT_ACTIVE` / `SHADOW_FIELD_MISSING` /
+`PRIMARY_VECTOR_MISSING` / `PRIMARY_UNREADABLE` / `VERIFY_MISMATCH` / `VERIFY_UNAVAILABLE` /
+`KB_NOT_ALLOWED` / `SCOPE_MISMATCH` / `COLLECTION_NOT_WRITABLE`。
+
+回填的逐 chunk 结果映射（`admin/backfill_chunk_revisions.py`）：`SHADOW_*` → `revision_field_absent`（pending）；
+`PRIMARY_*` → **`primary_vector_missing`**（pending，新计数 `milvus_primary_missing` 进 manifest）；
+`VERIFY_*`/其它 → `failed`。**写后读回不一致或无法校验一律不标 indexed**（宁可 pending）。
+
+统一化的另一处：worker 的写后读回改为调用 store 的 `verify_versioned_rows`（**只剩一份比较实现**）。
+
+#### 9.12.2 目标 KB 写入范围限制（工单 2）
+
+新增配置（AGENTS.md 规范 9：默认值/环境变量/后台可见）：
+
+| 键 | 环境变量 | 语义 |
+|---|---|---|
+| `write_scope.kb_ids` | `MILVUS_WRITE_SCOPE_KB_IDS`（逗号分隔） | **非空**时，任何不在名单内的 KB 在**任何 mutation 之前**被拒（`KB_NOT_ALLOWED`，零写入）；**留空 = 不限制**（保持历史行为） |
+| `write_scope.tenant_id` / `project_id` | `MILVUS_WRITE_SCOPE_TENANT/PROJECT` | 可选；非空则逐 chunk 校验（`SCOPE_MISMATCH`） |
+| 可写集合 | —（由 `resolve_dual_write` 决定） | 目标集合只能是本次解析出的 primary/shadow，否则 `COLLECTION_NOT_WRITABLE` |
+
+守卫落在 `upsert_chunks`（两种意图）、`delete_doc`、`clear` 三处 mutation 入口；**因为 S1 是进程全局配置**，
+该 KB 限制是把全局开关收敛回授权范围的**可执行**手段（工单 2 的口径修正）。
+
+#### 9.12.3 回归矩阵（工单 3）
+
+新增 `backend/tests/check_vector_write_contract.py`（进程内假体，**30 断言全绿**）并注册统一门禁
+（`vector_write_contract`，套件 `SUMMARY total=22 failed=0`）。覆盖：C1 legacy v2 无字段→primary 剥版本/影子带版本、
+C2 primary 有 INT64→两侧带版本、C3 无影子拒写、C4 影子缺字段写前拒（primary 也零写）、C5 primary 失败→影子零写、
+C6 影子失败→`DualWriteShadowError`（含两侧集合名）、C7 部分 upsert（确认数不一致）→抛错、
+C8 回填只写影子（v2 零写）、C9 primary 缺 chunk→拒写、C10 shadow 未生效→拒写、
+C11 写后读回不一致→拒标 indexed、C12 **revision 2/3 原样保留（绝不重置为 1）**+同批重跑幂等、
+C13 范围守卫（非目标 KB 拒/目标放行）、C14 tenant 不一致→拒。
+CAS 失败场景沿用 `check_b0_reindex_chunks.py`（worker 层 `direct_cas_failure`），不重复实现。
+
+#### 9.12.4 预检修正（工单 4）
+
+`E:/projects/gate0-evidence/2026-10-05/phase7b-precheck/run_phase7b_canary_precheck.py`（v2；v1 保留为历史）：
+四个来源**分别统计且都以目标 KB 为 scope**（PG current revision / Neo4j Chunk / Milvus 按 kb 过滤 /
+**解析产物 chunks.jsonl**）；每来源 value/ok/reason 三态，**读取失败记"未知"，绝不折成 0**。
+blocker 由**配置 + 代码合同 + 授权范围**推导（`DATA_UNKNOWN` / `EMPTY_KB`（要求四来源全部可读且全 0）/
+`VECTOR_CAPABILITY_OFF` / `COLLECTIONS_UNKNOWN` / `V3_ABSENT` / `BACKFILL_LEG_NOT_READY` / `WRITE_SCOPE_UNSET`），
+不再硬编码 `AUTHORIZATION_CONFLICT`、`BACKFILL_BYPASSES_FANOUT`。
+
+**v2 实跑结果（`RUN-20261006T082303-phase7b-precheck`，只读、exit 2）**：`neo4j_chunks=0`（ok）、
+**`parsed_chunks=2`（ok）**、`pg_current_revisions=UNKNOWN`、`milvus_rows=UNKNOWN`、集合清单 `UNKNOWN`；
+blocker = `DATA_UNKNOWN` + `VECTOR_CAPABILITY_OFF` + `COLLECTIONS_UNKNOWN` + `BACKFILL_LEG_NOT_READY` + `WRITE_SCOPE_UNSET`。
+**这直接纠正了 §9.11 的表述**：该 KB 并非"全部来源为空"（解析产物有 2 条），且 PG/Milvus 读数失败属"未知"。
+环境事实：共享 dev 栈在本轮期间被**重启**（`graphinsight-*` Up ~9 分钟，`graphinsight-go-gateway` Exited 255），
+重启后 PG(127.0.0.1:5434) 与 Milvus(127.0.0.1:19531) 从宿主不可达（本机只读探针实测）；**本轮未改任何共享配置**。
+
+#### 9.12.5 文档与验收口径修正（工单 5）
+
+`ready canary` 条件修正为**必要条件集合**（C3 为零只是其中之一）：
+
+1. **非空且可验证**：四来源（PG current / Neo4j / Milvus / 解析产物）以目标 KB scope 统计，
+   **全部可读**且至少一处 > 0（任一未知 → 不得宣称非空，也不得宣称空）；
+2. C3 五类为 0（必要条件，非充分条件）；
+3. **vector 能力就绪**（`vector_store.enabled`、embedding 配置）且 shadow 集合具备显式 INT64 字段；
+4. **合法写目标**（v3 集合存在或经授权创建，且不在生产集合名黑名单内被误写）；
+5. **KB 范围限制已配置**（`write_scope.kb_ids` 非空，使全局 S1 收敛回目标 KB）；
+6. **可执行回滚方案**（§16.1 五步在目标环境可执行：写冻结能力、v3→v2 回放、权威清单对账、读源切回、解冻）。
+
+**当前状态**：预检 BLOCKED（上述 1/3/5 未满足，PG/Milvus 读数未知）；真实单 KB canary **未执行**；
+共享生产 Gate 继续 **OPEN**；M5-B1 继续冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
