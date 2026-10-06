@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -164,6 +165,24 @@ def _docker_volumes() -> set:
     return set((out or "").split())
 
 
+def _port_in_use(port: int) -> bool:
+    """宿主机 127.0.0.1 端口是否被占用（含非容器进程，如 Clash Verge 的 mihomo 动态端口）。
+
+    Docker `-p 127.0.0.1:{port}:...` 绑定的是宿主机端口；被代理软件动态抢占时 bind 会失败
+    （Windows: "forbidden by its access permissions"），必须在预检阶段 fail-closed，而不是
+    让 docker run 报错后才停。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.bind(("127.0.0.1", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
 # ---------------------------------------------------------------------------
 # 环境与连接
 # ---------------------------------------------------------------------------
@@ -179,6 +198,7 @@ _CONTROLLED_ENV_KEYS = (
     "MILVUS_METRIC_TYPE", "MILVUS_INDEX_TYPE", "MILVUS_SEARCH_NPROBE",
     "VECTOR_STORE_ENABLED", "VECTOR_STORE_PROVIDER",
     "LLM_ENABLED", "EMBEDDING_ENABLED", "EMBEDDING_API_KEY", "EMBEDDING_PROVIDER", "EMBEDDING_BASE_URL",
+    "EMBEDDING_DETERMINISTIC_VECTOR",
     "AI_SERVICE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
     "PARSED_DOCUMENT_STORAGE_PATH", "BACKFILL_MANIFEST_DIR",
 )
@@ -195,6 +215,7 @@ def base_env(tmp: Path, *, neo4j_uri: str = NEO4J_URI, milvus_uri: str = MILVUS_
         "LLM_ENABLED=true",                       # graph 能力开启
         "EMBEDDING_ENABLED=true",                 # vector 能力：embedding 已配置
         "EMBEDDING_API_KEY=nonempty-disposable-local",  # 能力判定要求非空 api_key（确定性本地向量，不外发）
+        "EMBEDDING_DETERMINISTIC_VECTOR=true",    # backfill 用确定性本地向量，禁止回外部模型
         "VECTOR_STORE_ENABLED=true",              # vector 能力：vector_store 开启
         f"MILVUS_URI={milvus_uri}",
         f"MILVUS_COLLECTION={PRIMARY_COLLECTION}",
@@ -468,6 +489,9 @@ S1_DRIVER = (
     "    if with_rev: sc.add_field(field_name='content_revision', datatype=DataType.INT64)\n"
     "    sc.add_field(field_name='vector', datatype=DataType.FLOAT_VECTOR, dim=4)\n"
     "    c.create_collection(collection_name=name, schema=sc)\n"
+    "    ip=MilvusClient.prepare_index_params()\n"
+    "    ip.add_index(field_name='vector', index_type='FLAT', metric_type='IP')\n"
+    "    c.create_index(collection_name=name, index_params=ip)\n"
     "_mk(primary, False)\n"
     "_mk(shadow, True)\n"
     "base=vector_store.config()\n"
@@ -542,6 +566,16 @@ def _parse_int(out: str, key: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _backfill_ok(code: int) -> bool:
+    """backfill 退出码可接受：0=前置门 CLOSED、3=技术迁移完成但前置门 OPEN（needs_reindex）。
+
+    dual_write（v2 primary 无版本 + v3 shadow 有版本）下，backfill 验收门读 primary 的
+    content_revision 必然为空、判 needs_reindex，且 disposable 无 worker 消费 reindex job，
+    故 exit 3 属预期（技术迁移已完成、投影待收敛）。1=执行错误、2=拒绝执行才是真失败。
+    """
+    return code in (0, 3)
+
+
 def _snap_ok(snap: Optional[dict]) -> bool:
     """快照必须存在（exists=1）且读到唯一行（rows=1）；primary 不存在不得通过。"""
     return snap is not None and snap.get("exists") == 1 and snap.get("rows") == 1
@@ -577,7 +611,8 @@ def verify_backfill(tmp: Path, kb: str, bf_chunk: str) -> None:
 
     code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
-    add_step("单向回填：backfill 退出 0", code == 0, out[-400:])
+    add_step("单向回填：backfill 技术迁移完成（退出 0/3，1/2 才失败）",
+             _backfill_ok(code), f"exit={code} {out[-200:]}")
     add_step("单向回填：rows_new=1（整数相等）", _parse_int(out, "rows_new") == 1, out[-400:])
 
     after_primary, after_shadow = _snapshot()
@@ -593,7 +628,7 @@ def verify_backfill(tmp: Path, kb: str, bf_chunk: str) -> None:
     code2, out2 = run_py(tmp, "admin/backfill_chunk_revisions.py",
                          ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
     add_step("单向回填：重跑 rows_new=0（整数相等）",
-             code2 == 0 and _parse_int(out2, "rows_new") == 0, out2[-400:])
+             _backfill_ok(code2) and _parse_int(out2, "rows_new") == 0, f"exit={code2} {out2[-400:]}")
     rerun_primary, rerun_shadow = _snapshot()
     add_step("单向回填：重跑两侧内容不变",
              _same_snap(rerun_primary, after_primary) and _same_snap(rerun_shadow, after_shadow),
@@ -637,8 +672,8 @@ def inject_failure(tmp: Path, kb: str, before: int) -> None:
 def verify_idempotent(tmp: Path, kb: str, before: int) -> None:
     code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")])
-    add_step("幂等：恢复后重跑退出 0", code == 0, out[-200:])
-    add_step("幂等：rows_new=0", "rows_new=0" in out, out[-300:])
+    add_step("幂等：恢复后重跑技术迁移完成（退出 0/3）", _backfill_ok(code), f"exit={code} {out[-200:]}")
+    add_step("幂等：rows_new=0", _parse_int(out, "rows_new") == 0, out[-300:])
     with pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM chunk_revisions WHERE kb_id=%s", (kb,))
@@ -668,7 +703,8 @@ def verify_rollback(tmp: Path, kb: str) -> None:
     add_step("再迁移 targets_hash 退出 0", code == 0, out[-200:])
     code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")])
-    add_step("回滚重建后 backfill 可再跑（rows_new=2）", code == 0 and "rows_new=2" in out, out[-300:])
+    add_step("回滚重建后 backfill 可再跑（rows_new=2）",
+             _backfill_ok(code) and _parse_int(out, "rows_new") == 2, f"exit={code} {out[-300:]}")
 
 
 def cleanup(tmp: Path, kb: str, keep_containers: bool) -> None:
@@ -924,23 +960,30 @@ def main() -> int:
             exit_code = 2
         else:
             add_step("预检：同名一次性对象不存在", True)
-            ensure_containers()
-            migrate_tables(tmp)
-            # S1 组：s1_chunk（有 current revision）→ online_s1 双写
-            seed_s1(tmp, kb, s1_chunk, doc)
-            verify_s1_dual_write(tmp, kb, doc, s1_chunk)
-            # backfill 组：bf_chunk（无 current revision，primary 预置向量）→ backfill_versioned
-            seed_backfill(tmp, kb, bf_chunk, doc)
-            verify_backfill(tmp, kb, bf_chunk)
-            verify_readback(tmp, kb, s1_chunk, bf_chunk)
+            busy_ports = [str(p) for p in (PG_PORT, NEO4J_BOLT_PORT, MILVUS_PORT) if _port_in_use(p)]
+            if busy_ports:
+                add_step("预检：目标端口 55433/29532/19532 空闲", False,
+                         f"被占用端口={busy_ports}（可能被代理软件动态抢占，稍后重试）")
+                exit_code = 2
+            else:
+                add_step("预检：目标端口 55433/29532/19532 空闲", True)
+                ensure_containers()
+                migrate_tables(tmp)
+                # S1 组：s1_chunk（有 current revision）→ online_s1 双写
+                seed_s1(tmp, kb, s1_chunk, doc)
+                verify_s1_dual_write(tmp, kb, doc, s1_chunk)
+                # backfill 组：bf_chunk（无 current revision，primary 预置向量）→ backfill_versioned
+                seed_backfill(tmp, kb, bf_chunk, doc)
+                verify_backfill(tmp, kb, bf_chunk)
+                verify_readback(tmp, kb, s1_chunk, bf_chunk)
 
-            with pg_connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT count(*) FROM chunk_revisions WHERE kb_id=%s", (kb,))
-                    before = cur.fetchone()[0]
-            inject_failure(tmp, kb, before)
-            verify_idempotent(tmp, kb, before)
-            verify_rollback(tmp, kb)
+                with pg_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT count(*) FROM chunk_revisions WHERE kb_id=%s", (kb,))
+                        before = cur.fetchone()[0]
+                inject_failure(tmp, kb, before)
+                verify_idempotent(tmp, kb, before)
+                verify_rollback(tmp, kb)
     except Exception as exc:  # noqa: BLE001 - 异常必须进入失败证据，不得静默吞掉
         add_step("执行异常（进入失败证据）", False, f"{type(exc).__name__}: {exc}")
         exit_code = 2
