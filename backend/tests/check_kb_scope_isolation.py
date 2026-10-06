@@ -1,6 +1,10 @@
 """
 知识库作用域隔离测试（M3 验收，纯单元；不依赖 Neo4j / Milvus / PostgreSQL / fastapi）
 
+数据库隔离：脚本自己把 ADMIN_DATABASE_URL 钉到临时 SQLite（GRAPHINSIGHT_BACKEND_ENV_FILE），
+并在入口断言方言必须是 sqlite——scenario [g] 跑的是真实 build_graph，Wave 2 起会写
+chunk_revisions，隔离失效就会污染开发库（exit 9 而不是静默写入）。
+
 覆盖范围（docs/KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md §2 / §4 M3）：
 [a] build_graph 空/缺 doc_ids 或缺 kb_id -> KB_SCOPE_REQUIRED，且不触发任何注册表/Neo4j 访问
 [b] clear_document_graph / delete_document_graph 缺 kb_id -> KB_SCOPE_REQUIRED，不触 DB
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import sys
 import tempfile
@@ -27,8 +32,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
+
+# 隔离铁律：本文件是纯单测，任何 backend 模块导入之前先把 ADMIN_DATABASE_URL 钉到临时
+# SQLite。config/admin.database 用 load_dotenv(override=True)，只有 GRAPHINSIGHT_BACKEND_ENV_FILE
+# 能盖过 backend/.env；否则 scenario [g] 的真实 build_graph 会把 revision 行写进开发库。
+_ISO_TMP = tempfile.mkdtemp(prefix="kb-scope-iso-")
+_ISO_DB = Path(_ISO_TMP) / "kb_scope_iso.db"
+_ISO_ENV = Path(_ISO_TMP) / "kb_scope_iso.env"
+_ISO_ENV.write_text(f"ADMIN_DATABASE_URL=sqlite:///{_ISO_DB.as_posix()}\n", encoding="utf-8")
+os.environ["GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(_ISO_ENV)
 
 import services.document_graph_service as dgs  # noqa: E402
 import services.document_registry as registry  # noqa: E402
@@ -39,6 +57,20 @@ from services.vector_store import require_scope_filter, vector_store  # noqa: E4
 
 PASS: list = []
 FAIL: list = []
+
+
+def _require_sqlite_isolation() -> None:
+    """方言不是 sqlite 说明隔离失效（会写开发库），立即退出而不是继续跑。"""
+    from admin.database import engine
+
+    if engine.dialect.name != "sqlite":
+        print(f"FATAL: ADMIN_DATABASE_URL 方言是 {engine.dialect.name}，本单测只允许 sqlite")
+        raise SystemExit(9)
+    from admin.migrate_chunk_revisions import _SQLITE_DDL
+
+    with engine.begin() as conn:
+        for statement in _SQLITE_DDL:
+            conn.exec_driver_sql(statement)
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -454,10 +486,30 @@ def test_registry_path_safety() -> None:
     )
 
 
+def _check_revision_rows_stayed_local() -> None:
+    """scenario [g] 的真实 build_graph 会把 revision 写进 ADMIN_DATABASE_URL。
+
+    这里复核那些行确实落在临时 SQLite：证明隔离生效、开发库没有被单测污染。
+    """
+    from admin.database import engine
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT kb_id, doc_id, chunk_id, content_revision FROM chunk_revisions ORDER BY revision_id")
+        ).fetchall()
+    check(
+        "build_graph 的 revision 行只落在临时 SQLite（kb-a/doc-a）",
+        bool(rows) and {str(row[0]) for row in rows} == {"kb-a"},
+        f"(got {len(rows)} 行: {[(str(r[0]), str(r[1])) for r in rows[:4]]})",
+    )
+
+
 def main() -> int:
     print("=" * 60)
     print("GraphInsight KB scope isolation tests (M3, pure-unit)")
     print("=" * 60)
+    _require_sqlite_isolation()
     test_build_graph_requires_scope()
     test_delete_clear_require_kb()
     test_job_payload_scope_required()
@@ -466,6 +518,7 @@ def main() -> int:
     test_static_cypher_scope()
     test_registry_scoped_build_and_cross_scope_skip()
     test_registry_path_safety()
+    _check_revision_rows_stayed_local()
     print("-" * 60)
     print(f"passed={len(PASS)} failed={len(FAIL)}")
     if FAIL:

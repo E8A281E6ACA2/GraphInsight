@@ -29,6 +29,27 @@ var supportedJobTypes = map[string]struct{}{
 	"reindex":     {},
 }
 
+// jobColumns 是 JobItem 读取投影的唯一真相源：顺序必须与 scanJobItem 的 Scan 目标一一对应。
+// 加列只改一边不会报错，位置扫描会静默错位，因此两处必须同批修改。
+const jobColumns = `id,
+	job_type,
+	status,
+	tenant_id,
+	project_id,
+	kb_id,
+	payload,
+	result,
+	error_message,
+	retry_count,
+	max_retries,
+	requested_by,
+	trace_id,
+	started_at,
+	finished_at,
+	created_at,
+	updated_at,
+	targets_hash`
+
 type JobItem struct {
 	ID           int                    `json:"id"`
 	JobType      string                 `json:"job_type"`
@@ -47,6 +68,7 @@ type JobItem struct {
 	FinishedAt   *time.Time             `json:"finished_at,omitempty"`
 	CreatedAt    time.Time              `json:"created_at"`
 	UpdatedAt    *time.Time             `json:"updated_at,omitempty"`
+	TargetsHash  *string                `json:"targets_hash,omitempty"`
 }
 
 type JobLogItem struct {
@@ -143,23 +165,7 @@ func (c *Client) CreateJob(ctx context.Context, req JobCreateRequest) (JobItem, 
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $9)
 		RETURNING
-			id,
-			job_type,
-			status,
-			tenant_id,
-			project_id,
-			kb_id,
-			payload,
-			result,
-			error_message,
-			retry_count,
-			max_retries,
-			requested_by,
-			trace_id,
-			started_at,
-			finished_at,
-			created_at,
-			updated_at
+			`+jobColumns+`
 	`, req.JobType, JobStatusPending, req.TenantID, req.ProjectID, req.KBID, payloadText, req.MaxRetries, req.RequestedBy, req.TraceID)
 	item, err := scanJobItem(row)
 	if err != nil {
@@ -219,23 +225,7 @@ func (c *Client) RetryJob(ctx context.Context, req JobRetryRequest) (JobItem, er
 			updated_at = NOW()
 		WHERE id = $1
 		RETURNING
-			id,
-			job_type,
-			status,
-			tenant_id,
-			project_id,
-			kb_id,
-			payload,
-			result,
-			error_message,
-			retry_count,
-			max_retries,
-			requested_by,
-			trace_id,
-			started_at,
-			finished_at,
-			created_at,
-			updated_at
+			`+jobColumns+`
 	`, req.JobID, JobStatusPending, req.OperatorID, req.TraceID)
 	item, err := scanJobItem(row)
 	if err != nil {
@@ -288,23 +278,7 @@ func (c *Client) CancelJob(ctx context.Context, req JobCancelRequest) (JobItem, 
 			updated_at = NOW()
 		WHERE id = $1
 		RETURNING
-			id,
-			job_type,
-			status,
-			tenant_id,
-			project_id,
-			kb_id,
-			payload,
-			result,
-			error_message,
-			retry_count,
-			max_retries,
-			requested_by,
-			trace_id,
-			started_at,
-			finished_at,
-			created_at,
-			updated_at
+			`+jobColumns+`
 	`, req.JobID, JobStatusCancelled, req.TraceID)
 	item, err := scanJobItem(row)
 	if err != nil {
@@ -342,23 +316,7 @@ func (c *Client) ListJobs(ctx context.Context, query JobListQuery) (JobListResul
 	listArgs = append(listArgs, pageSize, (page-1)*pageSize)
 	rows, err := c.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
-			id,
-			job_type,
-			status,
-			tenant_id,
-			project_id,
-			kb_id,
-			payload,
-			result,
-			error_message,
-			retry_count,
-			max_retries,
-			requested_by,
-			trace_id,
-			started_at,
-			finished_at,
-			created_at,
-			updated_at
+			`+jobColumns+`
 		FROM admin_jobs j
 		%s
 		ORDER BY created_at DESC
@@ -392,23 +350,7 @@ func (c *Client) GetJob(ctx context.Context, jobID int) (JobItem, error) {
 	}
 	row := c.db.QueryRowContext(ctx, `
 		SELECT
-			id,
-			job_type,
-			status,
-			tenant_id,
-			project_id,
-			kb_id,
-			payload,
-			result,
-			error_message,
-			retry_count,
-			max_retries,
-			requested_by,
-			trace_id,
-			started_at,
-			finished_at,
-			created_at,
-			updated_at
+			`+jobColumns+`
 		FROM admin_jobs
 		WHERE id = $1
 		LIMIT 1
@@ -498,6 +440,7 @@ func scanJobItem(scanner jobRowScanner) (JobItem, error) {
 	var startedAt sql.NullTime
 	var finishedAt sql.NullTime
 	var updatedAt sql.NullTime
+	var targetsHash sql.NullString
 	if err := scanner.Scan(
 		&item.ID,
 		&item.JobType,
@@ -516,6 +459,7 @@ func scanJobItem(scanner jobRowScanner) (JobItem, error) {
 		&finishedAt,
 		&item.CreatedAt,
 		&updatedAt,
+		&targetsHash,
 	); err != nil {
 		return JobItem{}, err
 	}
@@ -527,6 +471,7 @@ func scanJobItem(scanner jobRowScanner) (JobItem, error) {
 	item.ErrorMessage = stringPtrFromNull(errorMessage)
 	item.RequestedBy = intPtrFromNull(requestedBy)
 	item.TraceID = stringPtrFromNull(traceID)
+	item.TargetsHash = stringPtrFromNull(targetsHash)
 	if startedAt.Valid {
 		value := startedAt.Time
 		item.StartedAt = &value
@@ -673,23 +618,7 @@ func encodeJobObject(value map[string]interface{}) (string, error) {
 func getJobForUpdate(ctx context.Context, tx *sql.Tx, jobID int) (JobItem, error) {
 	row := tx.QueryRowContext(ctx, `
 		SELECT
-			id,
-			job_type,
-			status,
-			tenant_id,
-			project_id,
-			kb_id,
-			payload,
-			result,
-			error_message,
-			retry_count,
-			max_retries,
-			requested_by,
-			trace_id,
-			started_at,
-			finished_at,
-			created_at,
-			updated_at
+			`+jobColumns+`
 		FROM admin_jobs
 		WHERE id = $1
 		LIMIT 1
@@ -703,6 +632,13 @@ func getJobForUpdate(ctx context.Context, tx *sql.Tx, jobID int) (JobItem, error
 }
 
 func insertJobAuditLog(ctx context.Context, tx *sql.Tx, action string, job JobItem, operatorID *int, traceID *string, ipAddress *string, userAgent *string, details map[string]interface{}) error {
+	return insertJobAuditLogEntry(ctx, tx, action, job, operatorID, traceID, ipAddress, userAgent, details, "success", nil)
+}
+
+// insertJobAuditLogEntry 是 admin_logs 的唯一写入点。status / error_message 单独成参
+// 是因为 §16.3 的超限拒绝留痕必须是 failed（Python 侧 _write_job_log 同口径），
+// 而"成功留痕"是其余分支的默认。
+func insertJobAuditLogEntry(ctx context.Context, tx *sql.Tx, action string, job JobItem, operatorID *int, traceID *string, ipAddress *string, userAgent *string, details map[string]interface{}, status string, errorMessage *string) error {
 	encodedDetails, err := json.Marshal(details)
 	if err != nil {
 		return fmt.Errorf("encode job audit details failed: %w", err)
@@ -724,10 +660,11 @@ func insertJobAuditLog(ctx context.Context, tx *sql.Tx, action string, job JobIt
 			details,
 			ip_address,
 			user_agent,
-			status
+			status,
+			error_message
 		)
-		VALUES ($1, $1, $2, $3, $4, 'job', $5, $6, $7, $8, 'success')
-	`, userID, tenantID, traceIDOrJobTrace(traceID, job.TraceID), action, fmt.Sprintf("%d", job.ID), string(encodedDetails), ipAddress, userAgent); err != nil {
+		VALUES ($1, $1, $2, $3, $4, 'job', $5, $6, $7, $8, $9, $10)
+	`, userID, tenantID, traceIDOrJobTrace(traceID, job.TraceID), action, fmt.Sprintf("%d", job.ID), string(encodedDetails), ipAddress, userAgent, status, errorMessage); err != nil {
 		return fmt.Errorf("insert job audit log failed: %w", err)
 	}
 	return nil

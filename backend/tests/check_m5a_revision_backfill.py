@@ -135,28 +135,75 @@ def row_of(rows: list, kb: str, chunk: str) -> dict:
     return {}
 
 
+AUDIT_LOG_COLS = ["action", "resource", "resource_id", "kb_id", "trace_id", "details", "status"]
+
+
+def audit_logs(out: str) -> list:
+    """__AUDITLOGS__ 行 → dict（details 反序列化），§16.3 留痕的逐组口径只能在 details 里看。"""
+    result = []
+    for row in parse_marker(out, "__AUDITLOGS__"):
+        item = dict(zip(AUDIT_LOG_COLS, row))
+        try:
+            item["details"] = json.loads(item.get("details") or "{}")
+        except (TypeError, ValueError):
+            item["details"] = {}
+        result.append(item)
+    return result
+
+
 def bootstrap_admin_jobs(h: Harness) -> tuple:
+    """建出**迁移前**形状的 admin_jobs（没有 targets_hash）。
+
+    ORM 现在声明了 targets_hash（列结构与已迁移库对齐），`create_all` 于是会把列一并建出来，
+    本节要验的却是"老库升级"这条路径——列已存在时 migrate 只会打印 already exists，
+    "added column" 断言与 rollback（先删索引再删列）都失去取证对象。所以建表后把列剥掉，
+    顺带删掉可能挂在列上的索引：SQLite 的 DROP COLUMN 在列仍被索引引用时会直接报错。
+    """
     return h.run_python_code(
-        "from admin.database import Base, engine;"
-        "from admin.models import AdminJob;"
-        "Base.metadata.create_all(bind=engine, tables=[AdminJob.__table__]);"
-        "engine.dispose(); print('bootstrap ok')"
+        "from admin.database import Base, engine\n"
+        "from admin.models import AdminJob\n"
+        "from sqlalchemy import text\n"
+        "Base.metadata.create_all(bind=engine, tables=[AdminJob.__table__])\n"
+        "with engine.begin() as conn:\n"
+        "    conn.execute(text('DROP INDEX IF EXISTS ix_admin_jobs_targets_hash'))\n"
+        "    conn.execute(text('DROP INDEX IF EXISTS uq_admin_jobs_targets_hash'))\n"
+        "    cols = [r[1] for r in conn.execute(text('PRAGMA table_info(admin_jobs)'))]\n"
+        "    if 'targets_hash' in cols:\n"
+        "        conn.execute(text('ALTER TABLE admin_jobs DROP COLUMN targets_hash'))\n"
+        "    left = [r[1] for r in conn.execute(text('PRAGMA table_info(admin_jobs)'))]\n"
+        "engine.dispose()\n"
+        "print('bootstrap ok legacy_no_column=' + str('targets_hash' not in left))\n"
     )
 
 
-def prep_db(h: Harness, name: str) -> None:
-    """切到独立 SQLite 库并完成三件套建表：chunk_revisions / admin_jobs / targets_hash。
+def bootstrap_admin_logs(h: Harness) -> tuple:
+    """建 admin_logs：run() 的 §16.3 留痕落这张表，缺表时退出码必须是 4（不是 3）。"""
+    return h.run_python_code(
+        "from admin.database import Base, engine\n"
+        "from admin.models import AdminLog\n"
+        "Base.metadata.create_all(bind=engine, tables=[AdminLog.__table__])\n"
+        "engine.dispose()\n"
+        "print('bootstrap admin_logs ok')\n"
+    )
+
+
+def prep_db(h: Harness, name: str, *, with_admin_logs: bool = True) -> None:
+    """切到独立 SQLite 库并完成建表：chunk_revisions / admin_jobs / targets_hash / admin_logs。
 
     每个场景组必须有独立库：backfill 的 universe 现在包含该 kb 全部 current 行，
     共库会让前一场景的行被后续场景判为孤儿 revision，污染断言。
+    `with_admin_logs=False` 只在"留痕表缺失 → 退出码 4"那条守卫里用。
     """
     h.use_db(name)
     code, out = h.run(str(Path("admin") / "migrate_chunk_revisions.py"), ["--action", "migrate"])
     step(f"{name}：迁移 chunk_revisions", code == 0, f"exit={code} " + out[-300:])
     code, out = bootstrap_admin_jobs(h)
-    step(f"{name}：引导 admin_jobs", code == 0 and "bootstrap ok" in out, f"exit={code} " + out[-300:])
+    step(f"{name}：引导 admin_jobs", code == 0 and "bootstrap ok legacy_no_column=True" in out, f"exit={code} " + out[-300:])
     code, out = h.run(str(Path("admin") / "migrate_jobs_targets_hash.py"), ["--action", "migrate"])
     step(f"{name}：迁移 targets_hash", code == 0, f"exit={code} " + out[-300:])
+    if with_admin_logs:
+        code, out = bootstrap_admin_logs(h)
+        step(f"{name}：引导 admin_logs", code == 0 and "bootstrap admin_logs ok" in out, f"exit={code} " + out[-300:])
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +294,7 @@ def section_b(h: Harness) -> None:
     print("[B] migrate_jobs_targets_hash（幂等/部分唯一/回滚）")
     h.use_db("mig_b.db")
     code, out = bootstrap_admin_jobs(h)
-    step("admin_jobs 引导", code == 0 and "bootstrap ok" in out, out[-300:])
+    step("admin_jobs 引导", code == 0 and "bootstrap ok legacy_no_column=True" in out, out[-300:])
     script = str(Path("admin") / "migrate_jobs_targets_hash.py")
 
     code, out = h.run(script, ["--dry-run"])
@@ -356,20 +403,70 @@ def section_c(h: Harness) -> None:
         and dry.get("contract_version") == 1
         and dry.get("operation") == "backfill_chunk_revisions"
         and dry.get("writes") == 0
-        and dry.get("status") == "OPEN",
+        and dry.get("status") == "OPEN"
+        and audit_logs(out) == [],
         f"exit={code} jobs={len(jobs)} dry={dry}",
     )
     code, out = h.run(driver, ["--scenario", "nr_run"])
     jobs = parse_marker(out, "__JOBS__")
     step("needs_reindex 前置门 OPEN（exit 3）", code == 3 and "[gate] OPEN" in out, f"exit={code}")
     step("reindex job 入队（targets_hash 64 位、payload 含 current targets）", len(jobs) == 1 and jobs[0][3] and len(str(jobs[0][3])) == 64 and '"chunk_id": "x1"' in str(jobs[0][4]) and '"target_revision": 1' in str(jobs[0][4]), str(jobs))
+    first_logs = audit_logs(out)
+    step(
+        "缺口 1：run() 把逐组 §16.3 结果写进 admin_logs（1 行 job_created，不是只有 stdout 计数）",
+        len(first_logs) == 1
+        and first_logs[0]["action"] == "job_created"
+        and first_logs[0]["resource"] == "job"
+        and first_logs[0]["status"] == "success"
+        and first_logs[0]["kb_id"] == "kb-a"
+        and str(first_logs[0]["trace_id"] or "").startswith("backfill-kb-a-"),
+        f"logs={first_logs}",
+    )
+    fd = first_logs[0]["details"] if first_logs else {}
+    step(
+        "缺口 2：details 用 created/child_job_id/targets_hash 规范键名（旧名 enqueued/job_id 不得出现）",
+        fd.get("outcome") == "created"
+        and fd.get("child_job_id") is not None
+        and fd.get("targets_hash") == jobs[0][3]
+        and fd.get("job_type") == "reindex_chunks"
+        and fd.get("source") == "backfill_chunk_revisions"
+        and fd.get("created") == 1
+        and fd.get("reused") == 0
+        and first_logs[0]["resource_id"] == str(fd.get("child_job_id"))
+        and "enqueued" not in fd
+        and "job_id" not in fd,
+        f"details={fd} jobs={jobs}",
+    )
     code, out = h.run(driver, ["--scenario", "nr_run_again"])
     jobs = parse_marker(out, "__JOBS__")
     step("重跑 targets_hash 复用不新建", code == 3 and "jobs_reused=1" in out and len(jobs) == 1, f"exit={code} jobs={len(jobs)}")
+    again_logs = audit_logs(out)
+    step(
+        "缺口 1/2：复用轮追加 job_reused 行并回读同一 child_job_id（留痕到实例，不只聚合数）",
+        len(again_logs) == 2
+        and again_logs[1]["action"] == "job_reused"
+        and again_logs[1]["details"].get("outcome") == "reused"
+        and again_logs[1]["details"].get("child_job_id") == fd.get("child_job_id")
+        and again_logs[1]["details"].get("reused") == 1
+        and again_logs[1]["details"].get("created") == 0,
+        f"logs={again_logs}",
+    )
     code, _ = h.run(driver, ["--scenario", "nr_finish"])
     step("模拟 reindex 完成", code == 0, f"exit={code}")
     code, out = h.run(driver, ["--scenario", "nr_converged"])
     step("收敛后前置门 CLOSED（exit 0）", code == 0 and "gate] CLOSED" in out, f"exit={code}")
+
+    # 留痕表缺失必须让退出码变 4：admin_logs 不存在时若仍返回 3，"留痕已落盘"就又被
+    # 降级成一句 stdout，§16.3 实例级取证重新不可复查（P5 缺口 1 的反面守卫）。
+    prep_db(h, "bf_audit_missing.db", with_admin_logs=False)
+    code, out = h.run(driver, ["--scenario", "nr_setup"])
+    step("留痕缺失场景：needs_reindex 播种", code == 0, out[-300:])
+    code, out = h.run(driver, ["--scenario", "nr_run"])
+    step(
+        "守卫：admin_logs 表缺失 → 退出码 4 且显式报 REINDEX_AUDIT_WRITE_FAILED（不静默、不返 3）",
+        code == 4 and "REINDEX_AUDIT_WRITE_FAILED" in out and "admin_logs 表不存在" in out,
+        f"exit={code} " + out[-400:],
+    )
 
     prep_db(h, "bf_blocked.db")
     code, out = h.run(driver, ["--scenario", "blocked_gate"])
@@ -407,7 +504,7 @@ def section_c(h: Harness) -> None:
     rfa_jobs = parse_marker(out, "__JOBS__")
     step(
         "同一轮必须为未收敛的新 chunk 排队（禁止报告 needs_reindex 却零 job）",
-        "jobs_enqueued=1" in out and "targets_total=1" in out and len(rfa_jobs) == 1 and "f1" in str(rfa_jobs),
+        "jobs_created=1" in out and "targets_total=1" in out and len(rfa_jobs) == 1 and "f1" in str(rfa_jobs),
         f"jobs={rfa_jobs}",
     )
     code, out = h.run(driver, ["--scenario", "rfa_rerun"])

@@ -161,7 +161,7 @@ class AdminJob(Base):
     __tablename__ = "admin_jobs"
 
     id = Column(Integer, primary_key=True, index=True)
-    job_type = Column(String(50), nullable=False, index=True)  # build_graph/clear_kb/reindex
+    job_type = Column(String(50), nullable=False, index=True)  # build_graph/clear_kb/reindex/reindex_chunks
     status = Column(String(20), nullable=False, default="pending", index=True)
     tenant_id = Column(String(100), nullable=True, index=True)
     project_id = Column(String(100), nullable=True, index=True)
@@ -169,6 +169,13 @@ class AdminJob(Base):
     payload = Column(Text)
     result = Column(Text)
     error_message = Column(Text)
+    # §16.3 幂等去重键（admin/migrate_jobs_targets_hash.py 建的列 + 部分唯一索引
+    # uq_admin_jobs_targets_hash）。这里补的是 ORM 与已迁移库结构的对齐，不是新增迁移：
+    # 缺这一列时 ORM 读出的行没有 targets_hash，任务中心无法判断"同批 targets 已在排队"。
+    # 不写 index=True：§16.3 唯一的索引是那条部分唯一索引（迁移脚本用原生 SQL 建），
+    # ORM 再声明单列索引会让 create_all 出的库多出一个已迁移库没有的 ix_admin_jobs_targets_hash，
+    # 而 SQLite 的 ALTER TABLE ... DROP COLUMN 在列仍被索引引用时直接报错，把迁移回滚堵死。
+    targets_hash = Column(String(64), nullable=True)
     retry_count = Column(Integer, nullable=False, default=0)
     max_retries = Column(Integer, nullable=False, default=3)
     requested_by = Column(Integer, ForeignKey("admin_users.id"), nullable=True, index=True)

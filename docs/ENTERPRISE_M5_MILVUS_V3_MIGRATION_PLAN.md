@@ -10,11 +10,12 @@
 
 ## 0. 一句话结论
 
-真实 v3 迁移被一个**当前代码不存在的能力**阻塞：`dual_write`。§16.1 的 S1（同一生产写
-同时落 v2+v3）在代码里没有实现路径，因此**在 `dual_write` 实现并验证之前，禁止进入 S1、
-禁止对任何真实 KB 执行 v3 迁移、禁止宣称 canary 闭环**。本方案只把"现在能做的"（隔离的
-单目标 schema 建集合验证）与"必须先补代码才能做的"（双写/切换）分开摆明，并给出各自的
-验收判据与门禁。
+真实 v3 迁移曾以 `dual_write`（§16.1 S1：同一生产写同时落 v2+v3）为代码级阻塞项。**该能力已在
+后端实现并带自动化验证（默认关闭，见文末"实现落地记录"）**，S0→S1 不再缺代码。但**实现 ≠ 迁移**：
+真实 v3 迁移仍禁止在未授权下推进——开启双写是需单独批准的迁移动作，且 §5.1 合成 schema canary
+runner 仍未实现、§7 C3 per-KB 处置清单与 §9 其余门禁尚未满足。在此之前，禁止对任何真实 KB
+执行 v3 迁移、禁止宣称 canary 闭环。本方案把"现在能做的"（隔离的单目标 schema 建集合验证）与
+"必须授权 + 补齐其余前置才能做的"（双写开启/切换）分开摆明，并给出各自的验收判据与门禁。
 
 ---
 
@@ -29,7 +30,7 @@
 | `has_content_revision_field()` | `vector_store.py:283` | 运行期探测某 collection 是否有显式 §8.5 字段（结果按名缓存，探测失败按"不支持"→拒写）。 |
 | legacy 名归一化 `graphinsight_chunks → _v2` | `vector_store.py:134-140` | 配置为空或旧名一律落到 `graphinsight_chunks_v2`，即当前默认读/写目标是 v2。 |
 | 写保护：有版本意图但缺显式字段 → 拒写 | `vector_store.py:249-257`（`VectorStoreSchemaError`，文案"…graphinsight_chunks_v3 后重建向量"） | §8.5 冻结：宁可拒写也不把 revision 降级进 dynamic metadata。 |
-| **`dual_write` / `dualwrite` / `dual-write`** | **全 `backend/` 非文档零命中** | **§16.1 S1 双写在代码中不存在。`milvus.dual_write=true` 目前只是设计要求，不是可用能力。** |
+| `dual_write` / `dualwrite` / `dual-write` | **已在后端实现（默认关闭）** | §16.1 S1 双写能力已落地：`MilvusVectorStore.resolve_dual_write` 生效判据 + `upsert_chunks`/`delete_doc`/`clear` 扇出主库与影子（`backend/services/vector_store.py`）。开关默认关，`milvus.dual_write=true` 现对应真实代码；但**开启 = 需单独授权的迁移动作**，且仍受 §5/§9 其余门禁约束。见文末"实现落地记录"。 |
 
 结论性判定：**v3 集合的"建立 + 单目标写入 + 字段判据"当前代码即可支撑；"同一写扇出到
 v2 与 v3 两个 collection"当前代码完全不支持。**
@@ -43,7 +44,7 @@ v2 与 v3 两个 collection"当前代码完全不支持。**
 
 - 若直接切配置到 v3：v3 里没有存量向量 → 检索大面积空命中（数据丢失假象）。
 - 若先逐 KB 重建 v3 再切：重建窗口内该 KB 读 v2 写 v3 = 违反读写同源不变量。
-- 若边写 v2 边补 v3：这正是 `dual_write`，而它未实现。
+- 若边写 v2 边补 v3：这正是 `dual_write`，现已实现（默认关闭，见文末落地记录）。
 
 所以 S1→S2→S3 这条主线**以 `dual_write` 为前置**。§15.4 的 A/B/C/D 已被 §16.1 状态机
 覆盖，本方案一律以 §16.1 为准。
@@ -72,7 +73,7 @@ v2 与 v3 两个 collection"当前代码完全不支持。**
 
 ```
 S0  现状：读写皆 v2（默认，安全）           —— 无需授权，已是当前态
-S1  双写：写扇出 v2+v3，读仍 v2（v3 影子）   —— GATED，阻塞项：dual_write 未实现
+S1  双写：写扇出 v2+v3，读仍 v2（v3 影子）   —— GATED；代码已实现(默认关闭)，开启需授权+补齐其余前置
 S2  切换：原子把读源 v2→v3 + 重启           —— GATED，前置 S1 稳定且校验通过
 S3  稳态：读写皆 v3，v2 只读留存备回滚       —— GATED
 ```
@@ -80,6 +81,10 @@ S3  稳态：读写皆 v3，v2 只读留存备回滚       —— GATED
 - **S0→S1 的前置不是配置开关，而是代码**。必须先实现 `dual_write`：在一次 upsert 内
   同时写 v2 与 v3，且任一失败要能定位并保持投影未收敛（与 §8.5 拒写语义一致）。在
   `dual_write` 存在且有自动化验证之前，**本步不存在，不得尝试用配置绕过**。
+  **现状更新**：该代码前置已满足——`MilvusVectorStore.resolve_dual_write` + `upsert_chunks`
+  /`delete_doc`/`clear` 扇出、影子失败抛 `DualWriteShadowError`（可定位、令投影判未收敛、按主键
+  幂等重放收敛）已由 `backend/tests/check_m5_dual_write.py` 自动化验证；开关默认关闭。开启仍需
+  §9 其余门禁 + 单独授权，不得仅因"代码有了"就设 `milvus.dual_write=true`。
 - **S2 切换**要求 v3 与 v2 的 per-KB 计数与抽样 revision 校验通过（见 §6）。
 - **S2 之后回滚 = 五步**（§16.1，覆盖 §15.4）：
   1. 写冻结（对受影响 KB 返回 `503 INDEX_UNAVAILABLE`，停止新写）；
@@ -119,8 +124,9 @@ upsert→直接读回 revision 正确、幂等重跑不翻倍。
 
 ### 5.2 双写 / 切换 canary（被阻塞，禁止宣称闭环）
 目的：证明 S1 双写一致性与 S2 切换后检索无损。
-- **依赖 `dual_write`，当前不存在。** 在实现并验证前，5.2 无法运行，也**不得**以任何形式
-  宣称"canary 已闭环/迁移可回滚"。
+- **依赖 `dual_write`——代码已实现（默认关闭），但 5.2 仍不可执行**：5.2 要真跑必须
+  ①有授权、②存在真实 v3 目标 collection 且 §5.1 schema canary 已过、③§7 C3 处置清单归零。
+  三者齐备前，5.2 **不得**以任何形式宣称"canary 已闭环/迁移可回滚"。
 - 5.1 通过也**不能**外推为 5.2 通过——两者证明的不变量不同。
 
 ---
@@ -176,23 +182,190 @@ orphan_revisions / unrecoverable / scope_unresolved / scope_mismatches / 迁移�
 
 ## 8. 明确不做（本方案与本轮的边界）
 
-- 不实现 `dual_write`、不写任何 v3/生产数据、不切配置、不跑 canary。
+- 不写任何 v3/生产数据、不切配置、不跑 canary。（`dual_write` 的**代码实现**已由后续轮次落地并默认关闭，见文末落地记录；本轮及该后续轮均不产生真实 v3 数据。）
+- 不推荐"现在就设 `milvus.dual_write=true`"——代码虽有，但真实开启仍是迁移动作，须先满足
+  §9 全部前置（§5.1 canary runner 落地、§7 C3 处置归零、真实 v3 collection、单独授权）；
+  未达前置就开启 = 把脏/未校验投影写入 v3，属危险操作。
 - 不开 M5-B1，不共享 v3 写入。
-- 不推荐"现在就设 `milvus.dual_write=true`"——该配置无对应代码，设了也是空开关，属
-  §0/§2 所述危险操作。
-- 不 push、不动 main；本文件的提交只落 `audit/m5-gate0-coverage` 分支。
+- 不 push、不动 main；本文件后续修订落在 `m5/dual-write` 分支（原审计轮 §8 表述针对
+  `audit/m5-gate0-coverage`，此处按当前分支更新）。
 
 ---
 
 ## 9. 进入执行前必须先满足的条件（阻塞清单）
 
-1. `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）。
+1. ✅ `dual_write` 在后端实现并带自动化验证（S1 前置，责任：后端）——**已满足**：见文末
+   "实现落地记录"。仅解锁"代码前置"，不等于可开启真实双写；开启仍受 2/3/4 与授权约束。
 2. 授权运行 §5.1 合成 schema canary（写 Milvus，需单独批准）。
 3. C3 处置清单（§7）中所有待迁 KB 的 blocked/orphan/unrecoverable/scope_* 归零或有批准
    的例外。
 4. 双写一致性 + 切换 + 回滚五步的验收脚本就绪（§6 判据落到可执行断言）。
 
 以上任一未满足，真实 v3 迁移保持关闭，M5 gate 不宣布通过。
+
+---
+
+## 9.1 实现落地记录（2026-10-04 · dual_write 代码轮，分支 `m5/dual-write`）
+
+本节只记录**代码事实**（均可 `git`/文件复查），不改变 §4–§9 的任何门禁判定：真实 v3 迁移仍关闭。
+
+落地的能力（`MilvusVectorStore`，默认全部关闭 = S0 现网安全态）：
+
+- 配置入口：`config.py` 增 `milvus_dual_write`（env `MILVUS_DUAL_WRITE`，默认 false）、
+  `milvus_shadow_collection`（env `MILVUS_SHADOW_COLLECTION`，默认空）；
+  `services/runtime_config.py:get_vector_store_runtime_config` 输出 `dual_write` +
+  `shadow_collection`，配置中心优先压过 env/settings。
+- 生效判据：`services/vector_store.py:MilvusVectorStore.resolve_dual_write` —— active 需同时满足
+  开关开、store 已启用、shadow 非空、且 **shadow ≠ 主 collection**（同名退化为同集合重复写，拒绝）。
+- 扇出写：`upsert_chunks` → `_upsert_to`/`_build_rows`，`ensure_collection` 支持按 collection 名。
+  **主库（读源）先写**，主库失败直接抛出且影子零调用；影子（v3）写失败（主库已成）→ `logger.error`
+  + 抛 `DualWriteShadowError`（携带 primary/shadow 集合名），令投影判未收敛、调用方按主键幂等重放收敛，
+  绝不静默吸收（§4/§6/§8.5）；影子确认数≠主库同样判未收敛。影子 collection 缺显式
+  `content_revision` 字段 → 复用 §8.5 门拒写并包成影子错误。
+- 扇出删除：`delete_doc`/`clear` 同步删影子，避免 §6 "chunk_id 集合 v3 多"；影子删除失败上抛。
+- 读源不变：双写生效时 `config().collection` 仍为主库，`search` 路径不受影响。
+- `DualWriteShadowError` 为 `VectorStoreUpsertError` 子类，调用方原有 catch 仍能捕获"影子未收敛"。
+
+自动化验证：`backend/tests/check_m5_dual_write.py`（假 client，无 pytest / 不连真实 Milvus），
+16 条断言覆盖上述全部不变量；已注册进 `tests/run_unified_boundary_guards.py`（guard 名
+`m5_dual_write`）。**未做**：真实建集合、真实 v3 写入、切读源、跑 §5.1/§5.2 canary——这些仍需
+单独授权，且 §5.1 canary runner 本身仍未实现（NOT-IMPLEMENTED）。
+
+---
+
+### 9.2 实现落地记录（2026-10-05 · revision 生命周期轮，分支 `m5/dual-write`）
+
+本节同样只记录**代码事实**（可 `git`/文件复查），不改变 §4–§9 的任何门禁判定：真实 v3 迁移仍关闭。
+它解决的是 §6 对账判据"`v3.content_revision == current_revision`"此前**无源**的问题——
+S1 双写要落显式 INT64 revision，前提是本仓建图路径自己能建立权威 revision。
+
+- 新增 `backend/services/chunk_revision_lifecycle.py:write_revisions_for_build_graph`：单事务内
+  为每个 chunk 建立/推进权威 current revision。无 current → `rev=1`；`content_hash` 与既有
+  current 相同 → 保持不动（幂等重试）；内容变化 → 老行 `UPDATE … WHERE revision_id=? AND
+  revision_status='current'` 转 superseded（rowcount≠1 即 `RuntimeError` 整体回滚），再 INSERT
+  `rev=max+1` 的 current。`content_hash = sha256(text)`，与 §9 backfill
+  （`admin/backfill_chunk_revisions._sha256`）同源。**不新增迁移**：复用 `chunk_revisions` 既有
+  `UNIQUE (kb_id, chunk_id, content_revision)` 与部分唯一索引 `uq_chunk_revisions_current`。
+- `build_graph` 接线（`services/document_graph_service.py`）：revision 在"文档确有变更"分支之后、
+  **任何 Neo4j 投影写入之前**建立；返回的 revision map 逐 chunk 注入 `chunk_payload`，Chunk MERGE
+  写 `ch.content_revision = coalesce(c.content_revision, ch.content_revision)`，同一 map 传给
+  `retrieval_orchestrator.index_chunks(content_revisions=…)` → `VectorChunk.content_revision`，
+  §8.5 影子 collection 的显式 INT64 字段自此有源。
+- 投影回写：每个 doc 建图后按 CAS 回写 `chunk_revisions` 投影状态（graph 落 indexed+版本；
+  `index_chunks` 有失败则 vector 保持 pending 且版本置 NULL），并在 `build_graph` 末尾按 §6.2
+  优先级重算文档级 `graph_status/vector_status`，结果以 `document_states` 返回。
+- 自动化验证：`backend/tests/check_m5_build_graph_revision.py`（临时 SQLite + 假 Milvus client，
+  不连真实 Neo4j/Milvus，22 条断言）。除单元口径外含**真实 build_graph 端到端取证**：revision 行
+  先于 Document/Chunk MERGE 存在、Chunk 参数带 `content_revision`、`content_revisions` 传到
+  `index_chunks`、CAS 回写 indexed、§6.2 聚合更新 `knowledge_base_documents`、`force=False`
+  未变更跳过且不再建 revision、内容变更推进到 rev=2。已注册为统一门禁
+  `m5_build_graph_revision`；本轮门禁全量 `SUMMARY total=19 failed=0`。
+- 测试隔离修复（如实认账）：`backend/tests/check_kb_scope_isolation.py` 自称"纯单元"，但其
+  scenario [g] 跑真实 `build_graph`，Wave 2 接线后曾把 1 条 revision 行写进**共享开发库**。
+  现该脚本在任何 backend 模块导入前把 `ADMIN_DATABASE_URL` 钉到临时 SQLite
+  （`GRAPHINSIGHT_BACKEND_ENV_FILE`，唯一能盖过 `backend/.env` 的入口），入口断言方言必须为
+  sqlite（否则 exit 9），并新增"revision 行只落临时库"复核（passed=55 failed=0）。
+  泄漏发生时开发库的完整行内容已留档：`revision_id=17, kb_id='kb-a', doc_id='doc-a',
+  chunk_id='doc-a-000', content_revision=1, revision_status=current, graph_status=indexed,
+  vector_status=indexed, reason='build_graph_m5_wave2'`。经授权后该行已于 2026-10-05 删除
+  （`DELETE 1`，删后 `SELECT count(*) FROM chunk_revisions` = 0；`knowledge_base_documents`
+  无 doc-a/doc-b 残留、`admin_jobs` 无该 reason 残留），删除前整表数据备份在
+  `artifacts/dev_db_backups/chunk_revisions_stray_row_2026-10-05.sql`（gitignored，含
+  `setval` 序列位）。
+- **未做**：真实 Neo4j/Milvus 侧的 revision 写入验证、v3 建集合、切读源、§5.1/§5.2 canary——
+  这些仍需单独授权；影子失败持久转交与连续场景在 Wave 3（见 §9.3）。
+
+---
+
+### 9.3 实现落地记录（2026-10-05 · Wave 3 影子失败持久转交与连续场景，分支 `m5/dual-write`）
+
+同样只记录**代码事实 + 隔离取证**，门禁判定不变：真实 v3 迁移仍关闭、`dual_write` 仍为 false、
+未进入 S2，本节不构成"真实投影闭环"或"方向 B 通过"的任何证据。
+
+四项落地（口径均已在 §16.3 / §15.5 / §8.5 冻结，实现只落既有契约，**不新增迁移**）：
+
+1. **入队唯一实现** `backend/services/reindex_queue.py`：`canonical_targets_hash`(:60) 规范化算法与
+   M5-A backfill 逐字一致；`enqueue_on_connection`(:220) 落 §16.3 全分支表——pending/running/succeeded
+   → `reused`，failed 且额度未用尽 → 原地 `retry_count+1` 的 `retried`，额度用尽 → `rejected`
+   （`reason='retry_exhausted'`，禁止无限自动重试），cancelled → `retry_count=0` 的 `reset`；
+   Postgres 冲突回读走 `SELECT … FOR UPDATE`(:84)，SQLite 靠唯一索引 + 单写者事务。
+   `enqueue_reindex_jobs`(:343) 自带 `engine.begin()`，`targets_from_payload`(:184) 让提交路径与
+   终态回写共用同一份 payload 判据。三处调用方全部改走本模块：backfill
+   （`admin/backfill_chunk_revisions.py:803-812`）、build_graph 转交
+   （`services/document_graph_service.py:895-900`，`source="build_graph_m5_wave3"`）、任务中心提交
+   （`admin/services/job_service.py:248`）。
+2. **影子失败持久转交**：`index_chunks` 逐 chunk 结构化失败 → `chunk_revisions` 只把**未收敛那条腿**
+   置 `vector_status='failed'` 且版本置 NULL（graph 侧不受 vector 失败影响），随后自动入队
+   `reindex_chunks`；§16.1"影子脏写不得被静默吸收"在此闭环为"落库 + 可重放任务 + 审计"。
+3. **`reindex_chunks` 类型补齐**（提交 aae175a）：JobType 字面量、`JobItem.targets_hash`、
+   `AdminJob.targets_hash` ORM 列。ORM 列**不带 `index=True`**——§16.3 唯一索引是迁移脚本用原生 SQL
+   建的部分唯一索引 `uq_admin_jobs_targets_hash`，ORM 再声明单列索引会让 `create_all` 出的库多出一个
+   已迁移库没有的 `ix_admin_jobs_targets_hash`，而 SQLite 的 `ALTER TABLE … DROP COLUMN` 在列仍被索引
+   引用时直接报错，把迁移回滚堵死（`check_m5a_revision_backfill.py` [B] 三条断言因此转红，本轮修回）。
+   注意：Go 控制面仍不接受 `reindex_chunks`——白名单标识符是 `supportedJobTypes`
+   （`go-backend/internal/adminstore/jobs.go:26-30`，仅 build_graph/clear_kb/reindex），
+   `validateJobCreateRequest`（`jobs.go:647-650`）在 INSERT 之前返回 `ErrJobValidation`，
+   映射为 HTTP 400 `INVALID_BODY`（`go-backend/internal/httpserver/admin_jobs_native.go:758-761`）。
+   §7 reindex-chunks HTTP 端点整体 NOT-IMPLEMENTED；§16.3 文里的 HTTP 409 / `JOB_409` 映射在
+   Go 与 Python 两侧都不存在（NOT-IMPLEMENTED，Wave 4-2 实测核实）。
+4. **作业（父）终态 → 投影（子）回写**：`services/chunk_projection_state.py:132 write_back_job_failure`
+   两条腿各自用 `CASE WHEN < > 'indexed'` 只降级未收敛侧，已 indexed 的腿不回退；CAS 条件
+   `content_revision=target_revision AND revision_status='current'`，current 已被并发移动则计入
+   `current_moved` 不补写（§8.3）；`keep_vector_untouched=True`（§8.5 `INDEX_UNAVAILABLE`＝"没能力写"，
+   vector 保持 pending 等 v3）。触发点 `admin/services/job_service.py:841-842`：仅 `retry_scheduled` 为
+   假、仅 `reindex_chunks`，随后跑 `aggregate_document_states` 落 §6.2 文档态并写
+   `kb_chunk_reindex_failed` 审计。提交路径的超限拒绝用 3004 `OPERATION_NOT_ALLOWED` + 结构化 details
+   （job_id/targets_hash/retry_count/max_retries），并回滚入队事务不留孤儿 pending 行。
+
+自动化验证（全部临时 SQLite + 假 client，不连真实 Neo4j/Milvus/PG，`dual_write` 只在隔离 driver
+进程内打桩，真实配置未开启）：新增 `backend/tests/m5_wave3_handoff_driver.py`（5 个场景：
+continuity / terminal_exhausted / terminal_crash / retry_not_terminal / index_unavailable）+
+`backend/tests/check_m5_wave3_handoff.py`（**71 条断言，0 失败**），注册为统一门禁 `m5_wave3_handoff`；
+本轮回归 `SUMMARY total=20 failed=0`，另跑 `check_b0_reindex_chunks`（通过）、
+`check_kb_scope_isolation`（passed=55 failed=0）、`check_m5a_revision_backfill`（[A]–[D] 全绿）。
+反假绿设计：每个"0 条审计"断言都与同库的正向审计证据（`job_failed`/`job_retry_scheduled` 计数）配对，
+因为 `log_crud.create()` 在 `admin_logs` 缺失时会静默 no-op，故 bootstrap 显式建该表。
+
+- **未做**：真实 Neo4j/Milvus/PG 上的转交与回写验证（`check_m5a_live_execution.py --confirm` 会写真实库，
+  仍未获授权、未运行）、v3 建集合与切读源、§5.1/§5.2 canary、Go 侧 reindex-chunks 端点与 409 映射。
+
+---
+
+### 9.4 实现落地记录（2026-10-05 · Wave 4 验证轮，分支 `m5/dual-write`）
+
+用户指令边界：本轮**仅**总回归 + 前端/Go 任务中心验证 + 隔离 fail-closed 守卫 + 审计交付；
+不运行任何 `--confirm`、不连真实 Neo4j/Milvus、不 push、不 amend。交审后才裁方向 B 与 push。
+完整证据与复核命令见 `docs/ENTERPRISE_M5_WAVE4_AUDIT_PACKAGE_2026-10-05.md`（下称"Wave 4 审计包"）。
+
+- **总回归**（新鲜实跑，均 EXIT=0）：统一门禁两轮 `SUMMARY total=20 failed=0`；
+  `check_m5_wave3_handoff` 71 条断言 0 失败、`check_m5_dual_write passed=23 failed=0`、
+  `check_m5_build_graph_revision passed=22 failed=0`、`check_kb_scope_isolation passed=55 failed=0`、
+  `check_build_graph_shadow_retry` / `check_b0_reindex_chunks` / `check_m5a_revision_backfill`（[A]–[D]）通过。
+- **Go / 前端口径改正（本轮实核，覆盖 §9.3 的错误表述）**：白名单实名是
+  `supportedJobTypes`（`go-backend/internal/adminstore/jobs.go:26-30`），不是 `allowedJobTypes`；
+  不支持的类型由 `validateJobCreateRequest`（`jobs.go:647-650`）在 INSERT 前返回
+  `ErrJobValidation` → HTTP **400 `INVALID_BODY`**（`internal/httpserver/admin_jobs_native.go:758-761`）。
+  仓库内不存在 `JOB_409` / 409 作业映射（Go、Python 两侧均 NOT-IMPLEMENTED）。同口径已同步
+  `services/reindex_queue.py` 与 `admin/services/job_service.py` 的 docstring。
+- **任务中心处置事实**（只报不改）：写侧关门（Go 白名单 400）、读侧开门（`ListJobs`/`GetJob`/
+  `RetryJob`/`CancelJob` 无类型闸门）、`targets_hash` 对 Go DTO 与前端完全不可见、前端
+  `JobType`/`jobTypeOptions` 缺 `reindex_chunks`、Python `JobService.create_job` 无 HTTP 调用方、
+  白名单判定无 Go 单测。逐条 file:line 见 Wave 4 审计包 §4.1（W4-F1～F6）。
+- **Go 侧证据边界**：`go test ./internal/adminstore/` ok（含 3 个 Job 测试通过）；
+  `internal/httpserver` 在 Windows 宿主**构建失败**（`admin_monitor_native.go:896-899` 用 Unix-only
+  `syscall.Statfs`，该文件最后改动 `a053532`/2026-07-27，本轮提交集不含任何 `.go`）——既有平台限制，
+  非本轮回归；`GOOS=linux go vet ./internal/httpserver/` 与 `GOOS=linux go build ./...` 均 EXIT=0。
+- **隔离 fail-closed 静态守卫**（`backend/tests/check_migration_cleanup_guards.py`，既有
+  `migration_cleanup` 门禁项内扩展，不新增 case）：对所有 tracked 且含 `create_all(`/`create_engine(`
+  的 `backend/tests/*.py` 要求 ①禁裸 `DATABASE_URL` ②方言闸门 ③非 driver 必须钉
+  `GRAPHINSIGHT_BACKEND_ENV_FILE` + `ADMIN_DATABASE_URL` + `sqlite:///`；扫描面只用 `git ls-files`，
+  git 失败/追踪文件缺失/扫描面为空一律 raise。真树 findings=0；红证用**真实脚本源码**在内存里把
+  `ADMIN_DATABASE_URL` 退化成 `DATABASE_URL`（本轮事故形态）→ 必判红。见审计包 §5。
+- **事故记录（用户 2026-10-05 钦定口径，逐字）**：发生共享开发 PG 连接及 DDL 尝试，已检查范围内
+  未观察到持久化变化；因无事前全库快照，保留不可完全判定窗口。根因是探针脚本把注入变量写成
+  `DATABASE_URL`（正确名 `ADMIN_DATABASE_URL`）被 `admin/database.py` 静默忽略；"已检查范围"清单与
+  为何不做二次连库复核，见审计包 §6。本轮防再犯措施即上条静态守卫。
+
 
 ---
 

@@ -35,7 +35,7 @@ def _resolve_path(value: str, base_dir: Path) -> str:
 
 class Settings:
     """应用配置"""
-    
+
     def __init__(self):
         # Neo4j 配置
         self.neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -48,11 +48,11 @@ class Settings:
         )
         # env(默认): 仅使用 .env；admin: 仅使用配置中心；auto: 优先配置中心，缺失时回退 .env
         self.neo4j_config_source = os.getenv("NEO4J_CONFIG_SOURCE", "env").strip().lower()
-        
+
         # API 配置
         self.api_host = os.getenv("API_HOST", "0.0.0.0")
         self.api_port = int(os.getenv("API_PORT", "8000"))
-        
+
         # 媒体存储路径（统一解析为绝对路径）
         self.media_storage_path = _resolve_path(os.getenv("MEDIA_STORAGE_PATH", "./media"), _BASE_DIR)
 
@@ -74,7 +74,7 @@ class Settings:
         self.mineru_output_format = os.getenv("MINERU_OUTPUT_FORMAT", "markdown,json").strip() or "markdown,json"
         self.mineru_timeout_seconds = float(os.getenv("MINERU_TIMEOUT_SECONDS", "300"))
         self.mineru_parser_version = os.getenv("MINERU_PARSER_VERSION", "").strip()
-        
+
         # OpenAI 配置
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
@@ -133,6 +133,10 @@ class Settings:
         self.milvus_metric_type = os.getenv("MILVUS_METRIC_TYPE", "COSINE").strip().upper()
         self.milvus_index_type = os.getenv("MILVUS_INDEX_TYPE", "IVF_FLAT").strip().upper()
         self.milvus_search_nprobe = int(os.getenv("MILVUS_SEARCH_NPROBE", "16"))
+        # M5 §16.1 S1 双写（dual_write）：一次 upsert 同时扇出主库(v2)与影子(v3)，读源仍主库。
+        # 默认关闭 = S0 现网安全态；开启是需单独授权的迁移动作，且 shadow_collection 必须异于主库。
+        self.milvus_dual_write = os.getenv("MILVUS_DUAL_WRITE", "false").strip().lower() == "true"
+        self.milvus_shadow_collection = os.getenv("MILVUS_SHADOW_COLLECTION", "").strip()
 
         # HTTP client 配置
         self.http_client_trust_env = os.getenv("HTTP_CLIENT_TRUST_ENV", "false").lower() == "true"

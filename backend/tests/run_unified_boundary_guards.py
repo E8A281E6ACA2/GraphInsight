@@ -54,6 +54,31 @@ CASES: tuple[GuardCase, ...] = (
     GuardCase("admin_env_override", "check_admin_env_override_unit.py", 60, "unified runtime env override guard"),
     GuardCase("rate_limit_exempt", "check_rate_limit_exempt_unit.py", 60, "internal health probe rate limit exemption"),
     GuardCase("rbac_catalog_parity", "check_rbac_catalog_parity.py", 120, "Python/Go RBAC 权限目录精确对账"),
+    GuardCase("m5_dual_write", "check_m5_dual_write.py", 60, "M5 §16.1 S1 双写扇出与失败语义守卫"),
+    GuardCase(
+        "build_graph_shadow_retry",
+        "check_build_graph_shadow_retry.py",
+        90,
+        "M5 §16.1 S1 build_graph→dual_write 影子失败→作业重试调用链守卫",
+    ),
+    GuardCase(
+        "m5_build_graph_revision",
+        "check_m5_build_graph_revision.py",
+        120,
+        "M5 §16.1 S1 Wave 2 revision 生命周期（CAS + 先于投影写入 + VectorChunk content_revision）守卫",
+    ),
+    GuardCase(
+        "m5_wave3_handoff",
+        "check_m5_wave3_handoff.py",
+        300,
+        "M5 Wave 3 §16.3 连续场景（影子失败持久转交 / targets_hash 复用 / 终态父子回写 / §8.5 拒写）守卫",
+    ),
+    GuardCase(
+        "m5_targets_hash_vectors",
+        "check_m5_targets_hash_vectors.py",
+        60,
+        "M5 §16.3 跨语言 targets_hash 向量复算与边界变体覆盖守卫",
+    ),
     GuardCase(
         "secret_scanner_selftest",
         "check_artifact_secrets_selftest.py",

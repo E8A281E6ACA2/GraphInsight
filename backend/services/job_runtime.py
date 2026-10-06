@@ -146,6 +146,26 @@ def execute_build_graph(*, job_id: int, payload: Dict[str, Any]) -> Dict[str, An
     total = stats.get("total_documents", 0)
     skipped = stats.get("skipped_documents", 0)
 
+    # 向量腿（含 dual_write 影子）有任何失败都不虚报 completed：抛 RuntimeError 对齐
+    # reindex_chunks 约定，交由 job_service 按 max_retries 退避重试。重放安全：Milvus 按
+    # chunk_id 主键幂等、Neo4j 用 MERGE，重试即收敛；重试耗尽后由作业终态落 failed。
+    # Wave 3 判据收紧：以"逐 chunk 的 vector 失败清单"为准，不只看错误文本样例——
+    # 空 text 的 chunk 有失败清单但没有异常文本，只看 vector_failures 会误判 completed。
+    vector_failures = stats.get("vector_failures") or []
+    vector_failed_chunks = stats.get("vector_failed_chunks") or []
+    if vector_failures or vector_failed_chunks:
+        handoff = stats.get("reindex_handoff") or {}
+        handoff_note = (
+            f"，已转交 reindex job：created={handoff.get('created', 0)} reused={handoff.get('reused', 0)}"
+            if handoff
+            else ""
+        )
+        sample = str((vector_failures or vector_failed_chunks)[0])[:200]
+        raise RuntimeError(
+            f"build_graph 向量投影未收敛：{len(vector_failed_chunks)} 个 chunk 判失败"
+            f"（样例：{sample}）{handoff_note}，转作业重试"
+        )
+
     execution_status = "completed" if processed > 0 else "empty"
     if processed > 0:
         message = "构建完成"

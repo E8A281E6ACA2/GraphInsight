@@ -202,6 +202,18 @@ def _dump_state(calls: list = None) -> None:
     except Exception:  # noqa: BLE001
         docs = []
     print("__JOBS__" + json.dumps([list(j) for j in jobs], ensure_ascii=False))
+    logs = []
+    try:
+        with engine.begin() as conn:
+            logs = conn.execute(
+                text(
+                    "SELECT action, resource, resource_id, kb_id, trace_id, details, status "
+                    "FROM admin_logs ORDER BY id"
+                )
+            ).fetchall()
+    except Exception:  # noqa: BLE001 - 未建 admin_logs 的引导库视为空，缺表由退出码 4 取证
+        logs = []
+    print("__AUDITLOGS__" + json.dumps([list(x) for x in logs], ensure_ascii=False))
     print("__DOCS__" + json.dumps([list(d) for d in docs], ensure_ascii=False))
     if calls is not None:
         print("__CALLS__" + json.dumps(calls, ensure_ascii=False))

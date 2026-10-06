@@ -459,8 +459,40 @@ def section_e(h: Harness) -> None:
 
 
 # ---------------------------------------------------------------------------
-# F. 索引侧真实代码路径（非 mock）
+# E2. dual_write 影子失败调用链（reindex_chunks → shadow failure → retryable exception）
 # ---------------------------------------------------------------------------
+
+
+def section_e2(h: Harness) -> None:
+    print("[E2] dual_write 影子(v3)写失败 → 投影未收敛 → reindex_chunks 抛可重放 RuntimeError")
+    out = scenario(h, "dual_shadow_fail.db", "dual_write_shadow_failure")
+    exc = exception_of(out)
+    step(
+        "影子失败被判为可重放异常：reindex_chunks 抛 RuntimeError（非终态 ValidationException）",
+        exc.get("type") == "RuntimeError",
+        f"exc={exc}",
+    )
+    counts = counts_of(out)
+    step("向量腿记 write_failed（未收敛），计数=1", counts.get("vector_failed") == 1, f"counts={counts}")
+    step("Neo4j 主腿不受影子失败牵连，仍如实 indexed（失败隔离在影子）", counts.get("graph_indexed") == 1, f"counts={counts}")
+    step("整批判未收敛：failed_chunks=1 且 vector_indexed=0（不虚报收敛）", counts.get("failed_chunks") == 1 and counts.get("vector_indexed") == 0, f"counts={counts}")
+    evidence = obj_marker(out, "__DUAL_EVIDENCE__")
+    step(
+        "原始证据：主库(v2)已写、影子(v3)被尝试但未落地（非危险的反向）",
+        evidence.get("primary_written") is True and evidence.get("shadow_attempted") is True and evidence.get("shadow_written") is False,
+        f"evidence={evidence}",
+    )
+    revs = rev_map(out)
+    step(
+        "c-1 的 vector 投影如实记 failed（版本 NULL）：不虚报 indexed，等重放",
+        revs.get("c-1", {}).get("vector_status") == "failed"
+        and revs.get("c-1", {}).get("vector_content_revision") is None
+        and revs.get("c-1", {}).get("content_revision") == 1,
+        f"revs={revs}",
+    )
+
+
+
 
 
 def section_f(h: Harness) -> None:
@@ -497,7 +529,7 @@ def section_g(h: Harness) -> None:
     print("[G] 闭环验收（B0 必证：入队 → 消费 → 投影更新 → 复跑 CLOSED）")
     out = scenario(h, "closed_loop.db", "closed_loop")
     enqueue = obj_marker(out, "__ENQUEUE__")
-    step("backfill 入队 reindex_chunks 任务", enqueue.get("enqueued") == 1 and enqueue.get("has_job") is True, f"enqueue={enqueue}")
+    step("backfill 入队 reindex_chunks 任务", enqueue.get("created") == 1 and enqueue.get("has_job") is True, f"enqueue={enqueue}")
     consumed = obj_marker(out, "__CONSUMED__")
     step("worker 真实消费同一 payload 并两侧 indexed", consumed.get("graph_indexed") == 1 and consumed.get("vector_indexed") == 1, f"consumed={consumed}")
     step("Neo4j/Milvus 假投影库确实被更新", obj_marker(out, "__NEO4J__") != {} and obj_marker(out, "__MILVUS__") != {}, out[-300:])
@@ -506,7 +538,7 @@ def section_g(h: Harness) -> None:
     step("needs_reindex/blocked/unrecoverable 全部归零", gate.get("needs_reindex") == 0 and gate.get("blocked") == 0 and gate.get("unrecoverable") == 0, f"gate={gate}")
     step("未降级（两侧能力均配置，不是 CLOSED_DEGRADED）", gate.get("degraded_skipped") is False, f"gate={gate}")
     reenqueue = obj_marker(out, "__REENQUEUE__")
-    step("收敛后不再产生新任务", reenqueue.get("enqueued") == 0 and reenqueue.get("targets") == 0, f"reenqueue={reenqueue}")
+    step("收敛后不再产生新任务", reenqueue.get("created") == 0 and reenqueue.get("targets") == 0, f"reenqueue={reenqueue}")
     jobs = arr_marker(out, "__JOBS__")
     step("admin_jobs 只有一条 reindex_chunks 入队记录（targets_hash 去重）", len([j for j in jobs if j[0] == "reindex_chunks"]) == 1, f"jobs={jobs}")
     step("current 行终态 indexed/1 双侧一致", rev_map(out).get("c-1", {}).get("graph_status") == "indexed" and rev_map(out).get("c-1", {}).get("vector_content_revision") == 1, f"revs={rev_map(out)}")
@@ -527,6 +559,7 @@ def main() -> int:
         section_c(h)
         section_d(h)
         section_e(h)
+        section_e2(h)
         section_f(h)
         section_f2(h)
         section_g(h)

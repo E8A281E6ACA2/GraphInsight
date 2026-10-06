@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import ast
+import re
+import subprocess
 from pathlib import Path
 
 
@@ -509,6 +511,49 @@ def test_kb_scope_strict_mode_has_no_compat_toggle() -> None:
             raise AssertionError(f"{rel_path} must keep local interception when no KB is selected")
 
 
+def _tracked_backend_tests(pattern: str) -> list:
+    """返回 git 追踪的 `backend/tests/<pattern>` 文件 [(绝对路径, 源码)]。
+
+    只走 `git ls-files`，不用目录 glob：未追踪的嵌套 worktree/venv 里的同名脚本会污染
+    扫描面，产出"本地判红、CI 不复现"的假红（既有铁律）。git 退出码非 0、追踪文件在
+    磁盘缺失、或扫描面为空，一律 raise——扫描面塌成 0 个文件绝不能读成"全部干净"。
+    """
+    proc = subprocess.run(
+        ["git", "ls-files", "-z", "--", f"backend/tests/{pattern}"],
+        cwd=str(ROOT.parent),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"git ls-files 失败（{pattern}, exit={proc.returncode}）: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    files = []
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8")
+        path = ROOT.parent / rel
+        if not path.exists():
+            raise AssertionError(f"追踪文件在磁盘缺失，扫描面不可信：{rel}")
+        files.append((path, path.read_text(encoding="utf-8")))
+    if not files:
+        raise AssertionError(f"扫描面为空：backend/tests/{pattern} 没有任何追踪文件")
+    return sorted(files, key=lambda item: item[0].name)
+
+
+BLANK_ENV_OVERRIDE_MARKERS = (
+    'GRAPHINSIGHT_BACKEND_ENV_FILE"] = ""',
+    'GRAPHINSIGHT_BACKEND_ENV_FILE", "")',
+    "GRAPHINSIGHT_BACKEND_ENV_FILE'] = ''",
+)
+ENV_FILE_PIN_MARKERS = (
+    'GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(',
+    "GRAPHINSIGHT_BACKEND_ENV_FILE'] = str(",
+    'GRAPHINSIGHT_BACKEND_ENV_FILE"] = f"',
+)
+
+
 def test_sqlite_isolated_tests_use_env_file_not_blank_override() -> None:
     """DB 隔离铁律（任务 #55）：注入 sqlite 测试库的文件禁止把 env 覆盖变量置空。
 
@@ -518,33 +563,156 @@ def test_sqlite_isolated_tests_use_env_file_not_blank_override() -> None:
     地址覆盖注入的 sqlite 地址——迁移测试的 rollback（DROP TABLE/COLUMN）就会打到
     开发库。唯一合法写法是把该变量指向真实存在的临时 env 文件。
     """
-    tests_dir = ROOT / "tests"
-    blank_markers = (
-        'GRAPHINSIGHT_BACKEND_ENV_FILE"] = ""',
-        'GRAPHINSIGHT_BACKEND_ENV_FILE", "")',
-        "GRAPHINSIGHT_BACKEND_ENV_FILE'] = ''",
-    )
-    isolation_markers = (
-        'GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(',
-        "GRAPHINSIGHT_BACKEND_ENV_FILE'] = str(",
-        'GRAPHINSIGHT_BACKEND_ENV_FILE"] = f"',
-    )
     offenders = []
     self_name = Path(__file__).name
-    for path in sorted(tests_dir.glob("check_*.py")):
+    for path, source in _tracked_backend_tests("check_*.py"):
         if path.name == self_name:
             # 本守卫自身源码里就带着被禁字面量（用于构造匹配规则），不参与扫描
             continue
-        source = path.read_text(encoding="utf-8")
         if "sqlite:///" not in source:
             continue
-        for marker in blank_markers:
+        for marker in BLANK_ENV_OVERRIDE_MARKERS:
             if marker in source:
                 offenders.append(f"{path.name} 置空 env 覆盖变量（伪隔离）: {marker}")
-        if not any(marker in source for marker in isolation_markers):
+        if not any(marker in source for marker in ENV_FILE_PIN_MARKERS):
             offenders.append(f"{path.name} 未把 env 覆盖变量指向真实 env 文件")
     if offenders:
         raise AssertionError("sqlite-isolated tests must point GRAPHINSIGHT_BACKEND_ENV_FILE at an existing env file: "
+                             + "; ".join(offenders))
+
+
+ENGINE_BUILD_MARKERS = ("create_all(", "create_engine(")
+DRIVER_SUFFIX = "_driver.py"
+# `ADMIN_DATABASE_URL` 里的 DATABASE_URL 不算裸写：lookbehind 只放行真正的前缀边界。
+BARE_DATABASE_URL_RE = re.compile(r"(?<!ADMIN_)(?<![_A-Za-z0-9])DATABASE_URL\b")
+
+
+def _dialect_gate_present(source: str) -> bool:
+    """方言闸门两种合法形态：子进程内 `!= "sqlite"` 硬退出，或父进程探针回读 DIALECT。"""
+    if "dialect.name" not in source:
+        return False
+    return any(
+        token in source
+        for token in ('!= "sqlite"', "!= 'sqlite'", '"DIALECT"', "'DIALECT'")
+    )
+
+
+def _db_isolation_findings(files: list) -> list:
+    """对 [(path, source)] 执行共享开发库隔离判据，返回 findings（空 == 干净）。
+
+    判据只作用于"真的建引擎/建表"的脚本（含 create_all/create_engine），其余脚本不掺和，
+    避免把纯单元脚本读成假红。子进程 driver 的 env 由父进程钉好后再 spawn，因此只对它
+    要求方言闸门与"禁止裸 DATABASE_URL"。
+    """
+    findings = []
+    self_name = Path(__file__).name
+    for path, source in files:
+        if path.name == self_name:
+            # 本守卫源码里带着被禁字面量（构造匹配规则用），不参与扫描
+            continue
+        if not any(marker in source for marker in ENGINE_BUILD_MARKERS):
+            continue
+        if BARE_DATABASE_URL_RE.search(source):
+            findings.append(
+                f"{path.name} 写了裸 DATABASE_URL（admin/database.py 只认 ADMIN_DATABASE_URL，"
+                "未知变量被静默忽略 → 回落 backend/.env 的共享开发 PostgreSQL）"
+            )
+        if not _dialect_gate_present(source):
+            findings.append(
+                f"{path.name} 缺方言 fail-closed 闸门（必须校验 engine.dialect.name，"
+                '非 sqlite 时退出或断言，如 `!= "sqlite"` 或探针回读 `DIALECT`）'
+            )
+        if path.name.endswith(DRIVER_SUFFIX):
+            continue
+        if "GRAPHINSIGHT_BACKEND_ENV_FILE" not in source:
+            findings.append(f"{path.name} 未钉 GRAPHINSIGHT_BACKEND_ENV_FILE（env 覆盖入口）")
+        if "ADMIN_DATABASE_URL" not in source:
+            findings.append(f"{path.name} 未注入 ADMIN_DATABASE_URL（建引擎却用默认配置 = 连开发库）")
+        if "sqlite:///" not in source:
+            findings.append(f"{path.name} 未把测试库指向 sqlite:/// 临时文件")
+    return findings
+
+
+def test_engine_building_scripts_pin_env_url_and_dialect() -> None:
+    """共享开发库隔离铁律（Wave 4-3）：建引擎/建表的脚本必须同时满足钉 env、钉 ADMIN_DATABASE_URL、带方言闸门。
+
+    本轮事故取证：一次性探针脚本把注入变量写成 `DATABASE_URL`。`admin/database.py` 的隔离
+    分支只认 `ADMIN_DATABASE_URL`，未知变量被静默忽略，引擎于是回落到 `backend/.env` 里的
+    共享开发 PostgreSQL，并在该连接上发起 DDL 尝试。已检查范围内未观察到持久化变化；因无
+    事前全库快照，保留不可完全判定窗口。写错一个变量名 = 直连开发库，所以这条判据必须静态
+    常驻，不能只靠人记住。
+    """
+    offenders = list(_db_isolation_findings(_tracked_backend_tests("*.py")))
+
+    # 负向自证：四类缺陷各造一个合成样本，证明规则真在拦截而不是空转。
+    compliant_check = (
+        'os.environ["GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(env_path)\n'
+        'ADMIN_DATABASE_URL=sqlite:///tmp.db\n'
+        'if engine.dialect.name != "sqlite":\n    raise SystemExit(9)\n'
+        "Base.metadata.create_all(engine)\n"
+    )
+    cases = [
+        ("check_missing_env_pin.py", 'ADMIN_DATABASE_URL=sqlite:///t.db\n'
+                                     'if engine.dialect.name != "sqlite":\n    raise SystemExit(9)\n'
+                                     "Base.metadata.create_all(engine)\n",
+         "未钉 GRAPHINSIGHT_BACKEND_ENV_FILE"),
+        ("check_wrong_var_name.py", 'os.environ["GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(p)\n'
+                                    'os.environ["DATABASE_URL"] = "sqlite:///t.db"\n'
+                                    'if engine.dialect.name != "sqlite":\n    raise SystemExit(9)\n'
+                                    "conn = create_engine(url)\n",
+         "裸 DATABASE_URL"),
+        ("check_no_dialect_gate.py", 'os.environ["GRAPHINSIGHT_BACKEND_ENV_FILE"] = str(p)\n'
+                                     "ADMIN_DATABASE_URL=sqlite:///t.db\n"
+                                     "Base.metadata.create_all(engine)\n",
+         "缺方言 fail-closed 闸门"),
+        ("check_plain_unit.py", 'os.environ["DATABASE_URL"] = "postgres://x/y"\n'
+                                "assert compute(1) == 1\n",
+         None),  # 不建引擎 → 不在扫描面内
+    ]
+    for name, source, expect in cases:
+        found = _db_isolation_findings([(Path(name), source)])
+        if expect is None:
+            if found:
+                offenders.append(f"规则过宽：不建引擎的 {name} 被判违规 {found}")
+            continue
+        if not any(expect in item for item in found):
+            offenders.append(f"负向自证失败：{name} 应命中「{expect}」，实际 {found}")
+
+    for name, source in (("check_ok.py", compliant_check),
+                         ("m5_ok_driver.py", 'if engine.dialect.name != "sqlite":\n    raise SystemExit(9)\n'
+                                             "Base.metadata.create_all(engine)\n")):
+        found = _db_isolation_findings([(Path(name), source)])
+        if found:
+            offenders.append(f"合规样本被误报：{name} -> {found}")
+
+    # 真文件红证：把本轮事故形态（`ADMIN_DATABASE_URL` 写成 `DATABASE_URL`）注入真实脚本
+    # 源码（仅内存，不落盘），必须判红——证明规则对着真内容也在拦，而不是只对夹具生效。
+    engine_files = [
+        (path, source)
+        for path, source in _tracked_backend_tests("*.py")
+        if any(marker in source for marker in ENGINE_BUILD_MARKERS) and "ADMIN_DATABASE_URL" in source
+    ]
+    if not engine_files:
+        offenders.append("扫描面里没有任何『建引擎且钉库』的脚本，隔离守卫失去作用对象")
+    else:
+        probe_path, probe_source = engine_files[0]
+        incident = probe_source.replace("ADMIN_DATABASE_URL", "DATABASE_URL")
+        incident_findings = _db_isolation_findings([(probe_path, incident)])
+        if not any("裸 DATABASE_URL" in item for item in incident_findings):
+            offenders.append(
+                f"事故形态未被判红：{probe_path.name} 去掉 ADMIN_ 前缀后仍放行 {incident_findings}"
+            )
+
+    # fail-closed：扫描面塌成 0 个文件必须报错，不能读成"全部干净"。
+    try:
+        _tracked_backend_tests("no_such_pattern_*.py")
+    except AssertionError:
+        pass
+    else:
+        offenders.append("扫描面为空时 _tracked_backend_tests 未报错（假绿灯风险）")
+
+    if offenders:
+        raise AssertionError("engine-building scripts must pin env file + ADMIN_DATABASE_URL + dialect gate: "
                              + "; ".join(offenders))
 
 
@@ -637,6 +805,7 @@ def main() -> int:
     test_unified_dev_defaults_do_not_regress_to_remote_or_python_public()
     test_kb_scope_strict_mode_has_no_compat_toggle()
     test_sqlite_isolated_tests_use_env_file_not_blank_override()
+    test_engine_building_scripts_pin_env_url_and_dialect()
     test_windows_utf8_acceptance_chain_is_self_enforced()
     print("MIGRATION_CLEANUP_GUARDS_OK")
     return 0

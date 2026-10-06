@@ -371,6 +371,14 @@ class DocumentGraphService:
         relation_count = 0
         vector_indexed = 0
         vector_failures: List[str] = []
+        # Wave 3：失败必须逐 chunk 带身份（chunk_id + doc_id + 权威 revision），否则转交
+        # reindex job 时无 target_revision 可用，只能整篇重跑（§8.1 禁止隐式扩范围）。
+        vector_failure_details: List[Dict[str, Any]] = []
+        reindex_handoff_targets: List[Dict[str, Any]] = []
+        reindex_handoff_report: Dict[str, Any] = {}
+        # 失败但拿不到权威 revision 的 chunk：无法转交，必须显式报出而非静默丢弃。
+        reindex_handoff_untracked: List[str] = []
+        vector_failed_chunks: set[str] = set()
         skipped_documents = 0
         processed_doc_ids: List[str] = []
         doc_tenant_id = ""
@@ -568,6 +576,27 @@ class DocumentGraphService:
                         logger.info("文档未变更，跳过", context={"doc": doc.name, "kb_id": doc_kb_id})
                         continue
 
+                    # Wave 2 / §16.1 S1：权威 revision 必须先于任何投影写入建立（此处已确认
+                    # 文档内容确有变化）。放在 Neo4j 写入之前，建图失败时 revision 仍在，
+                    # chunk 以 pending 暴露给 reindex/backfill 收敛；反过来（先写投影后建
+                    # revision）会让 §8.5 的 shadow content_revision 缺源。
+                    from services.chunk_revision_lifecycle import write_revisions_for_build_graph
+
+                    revision_result = write_revisions_for_build_graph(
+                        kb_id=doc_kb_id,
+                        tenant_id=doc_tenant_id,
+                        project_id=doc_project_id,
+                        doc_id=doc_id,
+                        chunks=chunk_payload,
+                        parser_version=parsed.parser_version,
+                        reason="build_graph_m5_wave2",
+                    )
+                    authoritative_revisions: Dict[str, int] = dict(revision_result.get("revisions") or {})
+                    for item in chunk_payload:
+                        revision = authoritative_revisions.get(str(item.get("chunk_id") or ""))
+                        if revision is not None:
+                            item["content_revision"] = int(revision)
+
                     session.run(
                         """
                         MERGE (d:Document {doc_id: $doc_id, kb_id: $kb_id})
@@ -636,6 +665,7 @@ class DocumentGraphService:
                             UNWIND $chunks AS c
                             MERGE (ch:Chunk {chunk_id: c.chunk_id, kb_id: $kb_id})
                             SET ch.text = c.text,
+                                ch.content_revision = coalesce(c.content_revision, ch.content_revision),
                                 ch.index = c.index,
                                 ch.doc_id = $doc_id,
                                 ch.kb_id = $kb_id,
@@ -799,9 +829,49 @@ class DocumentGraphService:
                     kb_id=doc_kb_id,
                     tenant_id=doc_tenant_id,
                     project_id=doc_project_id,
+                    content_revisions=authoritative_revisions,
                 )
                 vector_indexed += int(vector_result.get("indexed") or 0)
                 vector_failures.extend([str(item) for item in (vector_result.get("failures") or [])])
+                failed_chunk_ids = {str(cid) for cid in (vector_result.get("failed_chunk_ids") or [])}
+                vector_failed_chunks.update(failed_chunk_ids)
+                for detail in vector_result.get("failure_details") or []:
+                    vector_failure_details.append(
+                        {
+                            "doc_id": doc_id,
+                            "chunk_ids": list(detail.get("chunk_ids") or []),
+                            "error_class": str(detail.get("error_class") or ""),
+                            "is_shadow": bool(detail.get("is_shadow")),
+                            "error": str(detail.get("error") or "")[:200],
+                        }
+                    )
+
+                # 建图后回写投影状态（CAS：期望 revision 就是本轮建立的 authoritative_revisions；
+                # 若并发建图抢先移动 current，update_projection_state rowcount=0 视作过期，
+                # 不宣布本轮 indexed）。Wave 3：vector 失败按 chunk 粒度落 'failed'，不再整批
+                # pending——pending 会被 §6.2 聚合成"待收敛"，而 failed 才是可审计的终态；
+                # 收敛由下面的 reindex_chunks 转交负责。
+                self._write_back_projection_state(
+                    kb_id=doc_kb_id,
+                    revisions=authoritative_revisions,
+                    chunk_payload=chunk_payload,
+                    failed_chunk_ids=failed_chunk_ids,
+                )
+                for chunk_id in sorted(failed_chunk_ids):
+                    revision = authoritative_revisions.get(chunk_id)
+                    if revision is None:
+                        reindex_handoff_untracked.append(chunk_id)
+                        continue
+                    reindex_handoff_targets.append(
+                        {
+                            "kb_id": doc_kb_id,
+                            "doc_id": doc_id,
+                            "chunk_id": chunk_id,
+                            "target_revision": int(revision),
+                            "tenant_id": doc_tenant_id,
+                            "project_id": doc_project_id,
+                        }
+                    )
 
                 doc_count += 1
                 processed_doc_ids.append(doc_id)
@@ -816,6 +886,30 @@ class DocumentGraphService:
                 continue
 
         entity_count = len(entity_names)
+
+        # Wave 3 影子失败持久转交：逐 chunk 的 vector 失败落成可审计的 reindex_chunks 任务，
+        # 而不是只活在日志里（chunk 侧已是 failed，靠 §15.5 的重试规则收敛）。入队本身失败
+        # 不该炸掉整轮建图——投影态已写完，作业边界仍会因 vector_failed_chunks 判未收敛重试；
+        # 但失败必须报出来，不能退化成"看起来转交了"。
+        if reindex_handoff_targets:
+            from services.reindex_queue import enqueue_reindex_jobs
+
+            try:
+                reindex_handoff_report = enqueue_reindex_jobs(
+                    reindex_handoff_targets,
+                    source="build_graph_m5_wave3",
+                    max_retries=3,
+                )
+            except Exception as exc:  # noqa: BLE001
+                reindex_handoff_report = {"created": 0, "targets": 0, "error": str(exc)}
+                logger.error("reindex 转交入队失败", context={"error": str(exc)})
+
+        # §6.2：chunk 投影状态回写后重算文档级 graph_status/vector_status，
+        # 否则 chunk 已是 failed/pending 而 knowledge_base_documents 仍显示上一轮的 indexed。
+        from services.chunk_projection_state import aggregate_document_states
+
+        document_states = aggregate_document_states(normalized_kb, sorted(set(processed_doc_ids)))
+
         return {
             "documents": doc_count,
             "chunks": chunk_count,
@@ -823,6 +917,11 @@ class DocumentGraphService:
             "relations": relation_count,
             "vector_indexed": vector_indexed,
             "vector_failures": vector_failures[:10],
+            "vector_failure_details": vector_failure_details[:20],
+            "vector_failed_chunks": sorted(vector_failed_chunks),
+            "reindex_handoff": reindex_handoff_report,
+            "reindex_handoff_targets": len(reindex_handoff_targets),
+            "reindex_handoff_untracked": sorted(reindex_handoff_untracked),
             "total_documents": total_documents,
             "skipped_documents": skipped_documents,
             "failures": failures,
@@ -834,10 +933,55 @@ class DocumentGraphService:
             "project_id": doc_project_id,
             "target_doc_ids": clean_doc_ids,
             "processed_doc_ids": processed_doc_ids,
+            "document_states": document_states,
             "reasoning_profile": reasoning_profile or "",
             "complex_extraction": complex_extraction,
             "parser_provider": parser_provider or "",
         }
+
+    def _write_back_projection_state(
+        self,
+        *,
+        kb_id: str,
+        revisions: Dict[str, int],
+        chunk_payload: List[Dict[str, Any]],
+        failed_chunk_ids: set[str],
+    ) -> None:
+        """建图后 CAS 回写 chunk_revisions 投影状态（Wave 2，Wave 3 收紧到逐 chunk）。
+
+        - graph：Neo4j Chunk/Entity/Relation 写已在上一步完成，因此本轮 indexed 目标
+          revision 的 chunk 一律 graph_status='indexed' + graph_content_revision=rev。
+        - vector：`failed_chunk_ids` 里的 chunk 落 'failed' + revision=NULL（§15.5 可重试
+          态，由调用方转交 reindex_chunks 收敛）；不在清单里的才落 'indexed' + 版本。
+          Wave 2 之前是"整批有失败就全置 pending"，会把已成功写向量的 chunk 一起拖成
+          pending，也会让 §6.2 文档聚合看不出到底哪几块没收敛。
+        - rowcount=0（current 被并发移动）跳过本 chunk，不重试也不虚报；调用方通过
+          aggregate_document_states 得到最终文档态。
+
+        不新增迁移：完全复用 services.chunk_projection_state.update_projection_state。
+        """
+        if not revisions:
+            return
+        from services.chunk_projection_state import update_projection_state
+
+        for chunk in chunk_payload:
+            chunk_id = str(chunk.get("chunk_id") or "").strip()
+            if not chunk_id:
+                continue
+            expected = revisions.get(chunk_id)
+            if expected is None:
+                continue
+            kwargs: Dict[str, Any] = {
+                "graph_status": "indexed",
+                "graph_content_revision": int(expected),
+            }
+            if chunk_id in failed_chunk_ids:
+                kwargs["vector_status"] = "failed"
+                kwargs["vector_content_revision"] = None
+            else:
+                kwargs["vector_status"] = "indexed"
+                kwargs["vector_content_revision"] = int(expected)
+            update_projection_state(kb_id, chunk_id, expected_revision=int(expected), **kwargs)
 
     def _require_kb_scope(self, kb_id: Optional[str]) -> str:
         """delete/clear 类操作的 kb 强制点：缺失/非法时在任何 DB 访问之前拒绝。"""

@@ -1,0 +1,6 @@
+# P6 一次性 Postgres 集成验证用的临时 Python 镜像（宿主机按需构建，跑完只剩镜像层缓存）。
+# 依赖与 backend/requirements.txt 完全一致：被验的是生产依赖下的真实导入路径，不是精简替身。
+FROM python:3.11-slim
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
