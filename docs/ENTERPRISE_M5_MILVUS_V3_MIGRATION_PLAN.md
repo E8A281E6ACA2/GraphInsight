@@ -1074,6 +1074,37 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 回归（实跑）：统一门禁 `total=24 failed=0`；契约测试 `48/0`（32→48）；护栏自检 `13/0`、契约矩阵 `77/0`、B0 全绿不变；`--dry-run` RC=3。
 连接范围不变：未 push；真实 disposable 执行仍**未授权**；M5-B1 冻结。
 
+---
+
+### 9.23 非空 disposable 真实执行（2026-10-07 · 首次授权执行）
+
+首次以 `--authorize NONEMPTY-DISPOSABLE-AUTHORIZED` 真实执行非空 disposable 全链路（独立容器
+PG 55433 / Neo4j 29532 / Milvus 19532，仅绑 127.0.0.1，禁止触碰共享端口/v2/v3、未启动 M5-B1、
+未 push）。首轮 fail-closed 暴露 **4 个真实缺陷**（离线契约/夹具均未覆盖），逐一修复后全绿：
+
+1. **Milvus collection 缺向量索引**——`load_collection` 报 `index not found`（code=700），
+   query 报 `collection not loaded`，S1 双写与 backfill 全败。修复：S1_DRIVER 建 collection 后
+   `create_index(FLAT/IP)`。
+2. **backfill embedding 打真实 API**——`embedding_service.embed_texts` 用假 key 触发 401
+   AuthenticationError，Milvus 腿判 failed。修复：`_embed_texts_for_backfill` 支持
+   `EMBEDDING_DETERMINISTIC_VECTOR=true` 时用确定性本地向量（dim=4），disposable 注入该 env。
+3. **写后读回看不到 growing segment**——`upsert` 后立即 `query` 返回空（`after-upsert rows=[]`），
+   `verify_versioned_rows` 判 VERIFY_MISMATCH 假阴。修复：`_upsert_to` 写后 `flush`、
+   `_query_rows` 读回前 `load_collection`（load 失败 → 不可校验）。
+4. **端口被代理软件动态抢占**——55433 被 Clash Verge（mihomo）动态占用，docker bind 失败
+   （"forbidden by its access permissions"）。修复：预检阶段 socket bind 探测目标端口，
+   被占用 fail-closed 拒绝执行。
+
+修复后验收口径：backfill 在 dual_write（v2 primary 无版本 + v3 shadow 有版本）下前置门必然
+OPEN（验收门读 primary 的 content_revision 为空、判 needs_reindex，且 disposable 无 worker 消费
+reindex job），故 `verify_backfill` 接受退出码 0/3（技术迁移完成），1/2 才是失败；存储对账
+（primary 前后字段向量完全不变、shadow 显式 content_revision=1、重跑 rows_new=0 幂等、回滚后
+rows_new=2）严格通过。
+
+回归（实跑）：`SUMMARY checks=41 failed=0`、`ROUND_EXIT=0`、单 `RUN_ID` 证据落盘、零
+`gi-nonempty-*` 残留；统一门禁 `24/0`、契约矩阵 `77/0`、契约测试 `48/0`、护栏 `13/0` 不变。
+连接范围：仅独立容器与卷，未触碰共享 dev/v2/v3，未 push，M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
