@@ -848,7 +848,7 @@ blocker = `DATA_UNKNOWN` + `VECTOR_CAPABILITY_OFF` + `COLLECTIONS_UNKNOWN` + `BA
 | 判红机制 | runner 检测到该标记 → **该子项直接判失败**（即使退出码为 0） |
 | 服务替身 | 新增 `backend/tests/_offline_services.py`：导入 app **之前**安装 Neo4j 驱动替身（不建连接；替身被真正使用即抛 `OfflineServiceUsedError`，不静默返回空结果）；DocQA/NL2Cypher 两子项已接入 |
 | 负向对照 | 实测：`127.0.0.1:7687` → 拦截；`1.1.1.1:443` → 拦截；普通回环高位端口 → 放行（非护栏误伤） |
-| 结果 | 在**真实护栏**下 `run_unified_boundary_guards.py` → `SUMMARY total=22 failed=0`（此时"全离线"是被强制保证的，而非"恰好没连"） |
+| 结果 | 在**真实护栏**下 `run_unified_boundary_guards.py` → `SUMMARY total=22 failed=0`（隔离由机制强制，而非"恰好没连"）。**覆盖范围收窄（见 §9.14.6）**：仅 Python `socket` 路径；原生驱动/子进程自带网络栈不在覆盖内，不得据此宣称"所有网络调用均被隔离" |
 
 #### 9.13.7 回归结果（本轮实跑）
 
@@ -866,6 +866,78 @@ blocker = `DATA_UNKNOWN` + `VECTOR_CAPABILITY_OFF` + `COLLECTIONS_UNKNOWN` + `BA
 **连接范围披露**：本轮代码与测试**零真实服务连接**（进程内假体 + 临时隔离库）；预检为只读，实际连接受阻
 （PG/Milvus `connect_failed`、Neo4j 读到 0）；未写入任何生产或共享 v2/v3、未建 v3、未跑共享 backfill、
 未改受控配置、未重启共享服务、未 push；M5-B1 继续冻结。
+
+---
+
+### 9.14 复核问题整改（第二轮 · 2026-10-06 · 四条 P1 + 一条 P2）
+
+复核方在集成树独立复跑后指出上一轮**漏掉了第五项 P1**（primary 归属核验），并新增四条缺口。
+逐条整改如下（只改代码/测试/文档；门禁判定不变：真实 v3 迁移仍关闭、`MILVUS_DUAL_WRITE` 默认 false）。
+
+#### 9.14.1 P1 遗漏项：primary 归属核验（读源不变量）
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | `_query_present_ids` 只证明"同名 ID 存在"：primary 里的同名行属于 `kb-b`，以 `kb-a` 回填照样放行并把版本写进 shadow |
+| 整改 | 改为 `_query_primary_rows`：按**实际 schema** 取 `chunk_id/doc_id/kb_id/tenant_id/project_id/vector`，逐行核对四件套归属与**向量证据**（非空序列）。返回五态：`ok / missing / scope_mismatch / vector_unreadable / unreadable`，映射到 `PRIMARY_VECTOR_MISSING`、`PRIMARY_SCOPE_MISMATCH`、`PRIMARY_VECTOR_UNREADABLE`、`PRIMARY_UNREADABLE`，**全部在写之前判定**（shadow 零写入） |
+| 验证 | 契约矩阵 C21：KB/tenant/doc 各一例归属不符 + 向量证据为空 → 对应 reason 且 `upsert_calls == []`；**正向对照**（同域且带向量）必须放行，避免"一律拒绝"式假修复 |
+
+#### 9.14.2 P1 守卫晚于副作用
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | worker 顺序是 `ensure_collection` → `upsert_chunks`（范围守卫在 upsert 内部）；非授权 KB 最终被拒，但**集合已经创建** |
+| 整改 | store 新增公开入口 `assert_write_allowed(chunks, operation, collection=None)`（只读、零副作用，与 upsert 内部守卫**同一份实现**）；worker 改为 **先建 `VectorChunk` 列表 → `assert_write_allowed` → `ensure_collection` → `upsert_chunks`** |
+| 验证 | B0 E5（真实 worker 链路）：非授权 KB → `ensure_collection_calls == []`、`create_calls == []`、upsert 零记录，该 chunk 如实记 `failed`（未收敛）；契约矩阵 C22：公开入口拒绝时"无建集合 / 无 upsert / 无 delete" |
+
+#### 9.14.3 P1 删除范围不完整（delete/clear）
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | `delete_doc`/`clear` 只按 `kb_id` 过滤；配置了 `t1/p1` 后删除表达式里没有 tenant/project |
+| 整改 | 新增 `_scoped_delete_conditions(collection, operation)`：把**已配置的** tenant/project 追加进过滤表达式（primary 与 shadow 各按自身 schema 校验）；`collection_field_names()` 按**实际 schema** 判定；字段缺失或 schema 不可读 → `DELETE_SCOPE_UNSUPPORTED` **拒绝执行**，绝不放宽成"只按 KB 删"；配置非法仍走 `SCOPE_CONFIG_INVALID` |
+| 验证 | 契约矩阵 C23：假体**按表达式真的删行**并记录 `delete_calls`——断言过滤含 `tenant_id ==`/`project_id ==`、primary+shadow 各一次、**外域行（t2）两侧都保留**、同域行（t1）被删；另加"集合缺 tenant/project 字段 → `DELETE_SCOPE_UNSUPPORTED` 且零删除" |
+
+#### 9.14.4 P1 读回合同与实现不符（版本键）
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | 文档称 legacy primary 应"不带版本键"，但 `verify_versioned_rows` 把 `revision=None` 当作"不比较"——向 primary 注入 `revision=99`，`verify_write_targets` 仍返回 `ok=true` |
+| 整改 | `write_targets()` 改为显式**版本合同** `version_contract: "equal" \| "absent"`；`"absent"` 在 `verify_versioned_rows` 里走 `require_absent` —— **主动观察**该键，出现非空值即违约（≠"不比较"）。查询字段按**实际 schema**：`_query_rows` 区分"字段不存在"与"不可校验"，并**精确解析缺失字段名**——只有缺的正是 `content_revision` 才判"版本键结构化不存在"，缺别的字段（如 `text`）一律按不可校验 `None`（不冒充通过） |
+| 验证 | C24：合同断言 `["absent","equal"]`；正常读回通过；**注入 primary `revision=99` → `ok=False` 且定位到 primary 集合**；另用 `strict_fields=True` 假体（未知 output_fields 直接报错，模拟真实 legacy collection）证明读回走"字段缺失=结构化 absent"而不是靠宽松夹具 |
+
+#### 9.14.5 P2 网络护栏仍可假绿
+
+| 项 | 内容 |
+|---|---|
+| 原缺陷 | 拦截异常被静默 try/except 掉后，stdout 没有任何标记 → **child exit=0 / marker=false / runner_pass=true** |
+| 整改 | 护栏**拦截即写持久违规记录**（`GUARD_NET_VIOLATIONS` 追加 JSONL，**先写再抛**），导入期写 `guard_loaded` 到 `GUARD_NET_STATUS`；runner 为每个子项分配独立留痕文件，判红依据改为三条独立信号：①未发现加载留痕 → 隔离未生效即判红；②违规留痕非空 → 判红（**不依赖 stdout**）；③stdout 标记（次要，便于定位）。留痕目录随 case 结束清理 |
+| 验证 | 新增门禁子项 `netguard_enforcement`（`check_netguard_enforcement.py`）N1–N5：加载留痕、**静默吞异常时输出为空但违规留痕仍记录 7687**、外网 1.1.1.1:443 被拦、普通回环不误拦、以及**把该探针交给真实 runner `_run_case` 必须被判红**（证明留痕已接入判据，不只是"记了没管"） |
+
+#### 9.14.6 离线覆盖范围收窄（如实声明）
+
+护栏只作用于 **Python `socket` 路径**（`socket.socket.connect`、`connect_ex`、`socket.create_connection`）。
+**不覆盖**：原生扩展内部的网络调用、子进程自带的网络栈、以及绕过 `socket` 模块的实现。因此正确表述是：
+
+> 统一门禁在**护栏覆盖的 Python socket 路径**上被强制离线并通过留痕校验；
+> 不得据此宣称"所有网络调用均被隔离"。
+
+原先 §9.13 中"全离线被强制保证"的表述据此收窄。
+
+#### 9.14.7 回归（本轮实跑）
+
+| 命令 | 结果 |
+|---|---|
+| `run_unified_boundary_guards.py`（护栏留痕判据下） | `SUMMARY total=23 failed=0`，EXIT=0（新增 `netguard_enforcement`） |
+| `check_vector_write_contract.py` | `RESULT: 66 passed, 0 failed`，EXIT=0（44 → 66，新增 C21–C24） |
+| `check_b0_reindex_chunks.py` | `✓ all M5-B0 reindex_chunks checks passed`，EXIT=0（含 E4/E5） |
+| `check_m5_wave3_handoff.py` | `RESULT: PASS`，EXIT=0 |
+| `check_m5a_revision_backfill.py` / `check_backfill_manifest.py` | 全绿，EXIT=0 |
+| `check_m5_dual_write.py` | `passed=23 failed=0`，EXIT=0 |
+| `check_kb_scope_isolation.py` / `check_m5_build_graph_revision.py` / `check_build_graph_shadow_retry.py` | 全绿，EXIT=0 |
+
+**连接范围**：本轮零真实服务连接（进程内假体 + 隔离临时库）；未写入生产/共享 v2/v3、未建 v3、
+未跑共享 backfill、未改受控配置、未重启共享服务、未 push；M5-B1 继续冻结。
 
 ## 10. 与既有章节的对应
 
