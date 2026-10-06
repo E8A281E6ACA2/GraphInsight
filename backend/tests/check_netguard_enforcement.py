@@ -195,6 +195,41 @@ def main() -> int:
          and bool(child_problems) and child.returncode == 0,
          f"rc={child.returncode} stderr={child.stderr!r} problems={child_problems}")
 
+    # N9 空加载文件 → 判红（P2：只检查文件存在会让"空加载文件"假绿）
+    problems = runner._netguard_problems(
+        {"exists": True, "records": [], "bad_lines": 0, "error": None},
+        {"exists": False, "records": [], "bad_lines": 0, "error": None},
+        "",
+    )
+    step("N9 空加载文件（无 guard_loaded 记录）→ 判红",
+         any("guard_loaded" in p for p in problems), f"problems={problems}")
+
+    # N10 无关 JSON 对象（文件存在但非 guard_loaded 记录）→ 判红
+    problems = runner._netguard_problems(
+        {"exists": True, "records": [{"foo": "bar"}], "bad_lines": 0, "error": None},
+        {"exists": False, "records": [], "bad_lines": 0, "error": None},
+        "",
+    )
+    step("N10 无关 JSON 对象（非 guard_loaded 记录）→ 判红",
+         any("guard_loaded" in p for p in problems), f"problems={problems}")
+
+    # N11 真实 runner 级：子进程加载护栏后**清空加载留痕**、exit 0 → 真实 runner 必须判红
+    # （证明判据接在 _run_case 的真实路径上，而不是只在 _netguard_problems 单测里成立）。
+    with tempfile.TemporaryDirectory(prefix="netguard-empty-status-") as empty_dir:
+        probe = Path(empty_dir) / "probe_empty_status.py"
+        probe.write_text(
+            "import os\n"
+            "p = os.environ.get('GUARD_NET_STATUS')\n"
+            "if p:\n"
+            "    open(p, 'w').close()\n",  # 清空加载留痕，模拟"护栏未真正写 guard_loaded"
+            encoding="utf-8",
+        )
+        case = runner.GuardCase("probe_empty_status", str(probe), 60, "empty status probe")
+        probe_ok, _duration, probe_out, probe_rc = runner._run_case(Path(PYTHON_EXE), case)
+    step("N11 真实 runner 判定：空加载文件被判红",
+         probe_ok is False and "guard_loaded" in probe_out and probe_rc == 0,
+         f"ok={probe_ok} rc={probe_rc} out={probe_out[-200:]}")
+
     print()
     print(f"RESULT: {len(PASSES)} passed, {len(FAILURES)} failed")
     if FAILURES:

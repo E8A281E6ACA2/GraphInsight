@@ -94,6 +94,8 @@ class FakeClient:
         self.dynamic_meta = dict(dynamic_meta or {})
         # 注入：`$meta` 查询本身失败（非"字段不存在"类错误）→ 读回必须按不可校验处理
         self.fail_query_on_meta = False
+        # 注入：查询时丢弃这些 chunk_id 的行（模拟"缺行"——返回行数少于请求行数）
+        self.drop_query_rows: set = set()
         self.delete_calls: List[Dict[str, str]] = []
 
     # --- schema 探针 ---
@@ -187,22 +189,36 @@ class FakeClient:
         rows = list(self.cols.get(collection_name, {}).get("rows", []))
         if self.fail_query_on_meta and DYN_META in (output_fields or []):
             raise RuntimeError("injected meta query failure")
+        known = {str(f.get("name") or "") for f in (self.cols.get(collection_name, {}).get("fields") or [])}
         if self.strict_fields:
-            known = {str(f.get("name") or "") for f in (self.cols.get(collection_name, {}).get("fields") or [])}
-            if self.dynamic_field:
-                known.add(DYN_META)
+            # 真实 SDK 行为：动态字段开启时，`$meta`（保留字段）与 schema 外的动态键都**可查**，
+            # 动态键会从 `$meta` 展开到顶层返回（pymilvus 3.x）；动态字段关闭/未知时才报 field_missing。
             for field in output_fields or []:
-                if field not in known:
-                    raise RuntimeError(f"field {field} not exist in collection {collection_name}")
+                if field in known:
+                    continue
+                if self.dynamic_field:
+                    # 动态字段开启：`$meta`（保留字段）与 schema 外动态键均可查，动态键从 `$meta` 展开
+                    continue
+                raise RuntimeError(f"field {field} not exist in collection {collection_name}")
         wanted = self._filtered_ids(filter)
         if wanted is not None:
             rows = [row for row in rows if str(row.get("chunk_id") or "") in wanted]
         out = []
         for row in rows[: (limit or len(rows))]:
-            item = {key: row.get(key) for key in output_fields if key in row}
             cid = str(row.get("chunk_id") or "")
-            if DYN_META in (output_fields or []) and cid in self.dynamic_meta:
-                item[DYN_META] = dict(self.dynamic_meta[cid])
+            if cid in self.drop_query_rows:
+                continue  # 注入缺行：该 chunk 查询不返回
+            meta = self.dynamic_meta.get(cid) or {}
+            item: Dict[str, Any] = {}
+            for key in output_fields:
+                if key == DYN_META:
+                    # 真实 SDK：`$meta` 被解码器展开为顶层字段，`$meta` 键本身不返回
+                    item.update(meta)
+                elif key in row:
+                    item[key] = row[key]
+                elif key in meta:
+                    # 动态键从 `$meta` 展开到顶层
+                    item[key] = meta[key]
             if cid in self.tamper_revision:
                 item["content_revision"] = self.tamper_revision[cid]
             out.append(item)
@@ -675,7 +691,8 @@ def main() -> int:
           strict_verdict["ok"] is True)
 
     # ---- C25：显式字段不存在 ≠ 没有版本（动态字段残留必须被观察到） ----
-    # C25a 复核组合反例：严格查询（显式版本字段报缺失）+ 动态字段里残留 content_revision=99
+    # C25a 动态字段开启 + `$meta` 残留 content_revision=99：真实 pymilvus 3.x 会把 `$meta`
+    # 展开为顶层字段，读回（require_absent 合同）必须抓到顶层残留并拒绝。
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS},
                         strict_fields=True, dynamic_field=True,
@@ -683,7 +700,7 @@ def main() -> int:
     store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
     store.upsert_chunks([chunk("c1", 1)], [VEC])
     verdict = store.verify_write_targets(expected_map)
-    check("C25 严格查询 + 动态残留 99 → ok=False（显式字段缺失≠无版本）",
+    check("C25 动态残留 99（顶层展开）→ ok=False（显式字段缺失≠无版本）",
           verdict["ok"] is False,
           )
     check("C25 残留失败定位到 primary 集合",
@@ -708,15 +725,88 @@ def main() -> int:
     check("C25 动态渠道无法观察 → 不可校验（ok=False，不判 absent）",
           unknown_verdict["ok"] is False)
 
-    # C25d $meta 查询本身失败（非"字段不存在"）→ 不可校验
+    # C25d 动态开关未知 + `$meta` 查询本身抛错（非"字段不存在"，如网络/解码失败）→ 不可校验
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS},
-                        strict_fields=True, dynamic_field=True)
+                        strict_fields=True, dynamic_field=None)
     client.fail_query_on_meta = True
     store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
     store.upsert_chunks([chunk("c1", 1)], [VEC])
-    check("C25 $meta 查询不可用 → 不可校验（ok=False）",
+    check("C25 $meta 查询抛错 → 不可校验（ok=False）",
           store.verify_write_targets(expected_map)["ok"] is False)
+
+    # ---- C26：真实 SDK 解码器契约（离线构造 grpc 响应 + 真实 pymilvus 解码器） ----
+    # pymilvus 3.x 把 `$meta` 展开为顶层字段（`$meta` 键本身不返回）。用真实解码器离线构造该
+    # 形态，验证观察逻辑能拒绝残留、并在无残留/不可解释/2.x dict 形态下给出正确判定。
+    import services.vector_store as vs_mod
+    try:
+        import json as _json
+        from pymilvus.grpc_gen import schema_pb2 as _pb
+        from pymilvus.client.types import HybridExtraList as _HEL
+        from pymilvus.client.entity_helper import (
+            extract_dynamic_field_from_result as _edffr,
+            extract_row_data_from_fields_data_v2 as _erdfv2,
+        )
+        _HAS_SDK = True
+    except Exception:  # noqa: BLE001 - pymilvus 未安装则跳过 SDK 解码器契约
+        _HAS_SDK = False
+
+    if _HAS_SDK:
+        def _sdk_decode(meta_entries, output_fields):
+            """复现 grpc_handler.query 的解码流程：chunk_id(VARCHAR) + $meta(JSON 动态字段)。"""
+            fd_id = _pb.FieldData()
+            fd_id.type = 21  # VARCHAR
+            fd_id.field_name = "chunk_id"
+            for _ in meta_entries:
+                fd_id.scalars.string_data.data.append("audit-sdk")
+            fd_meta = _pb.FieldData()
+            fd_meta.type = 23  # JSON
+            fd_meta.field_name = "$meta"
+            fd_meta.is_dynamic = True
+            for obj in meta_entries:
+                fd_meta.scalars.json_data.data.append(_json.dumps(obj).encode())
+
+            class _Raw:
+                def __init__(self, fields_data, output_fields):
+                    self.fields_data = fields_data
+                    self.output_fields = output_fields
+                    self.element_indices = None
+                    self.session_ts = 0
+
+            raw = _Raw([fd_id, fd_meta], output_fields)
+            _, dyn = _edffr(raw)
+            template = dict.fromkeys([fd.field_name for fd in raw.fields_data if fd.field_name != "$meta"])
+            results = [template.copy() for _ in meta_entries]
+            lazy = [fd for fd in raw.fields_data if _erdfv2(fd, results)]
+            return [dict(r) for r in _HEL(lazy, results, extra={}, dynamic_fields=dyn)]
+
+        sdk_row = _sdk_decode([{"content_revision": 99}], ["chunk_id", "$meta"])[0]
+        check("C26 真实 SDK 把 $meta 展开为顶层字段（无 $meta 键、有顶层残留）",
+              "$meta" not in sdk_row and sdk_row.get("content_revision") == 99)
+        check("C26 顶层展开残留 99 → 观察逻辑判 residual",
+              vs_mod.MilvusVectorStore._dynamic_version_residual(sdk_row) == "residual")
+        sdk_clean = _sdk_decode([{}], ["chunk_id", "$meta"])[0]
+        check("C26 真实 SDK 无残留形态 → clean",
+              vs_mod.MilvusVectorStore._dynamic_version_residual(sdk_clean) == "clean")
+        check("C26 $meta 是坏 JSON 字符串 → 不可解释（unavailable）",
+              vs_mod.MilvusVectorStore._dynamic_version_residual(
+                  {"chunk_id": "c1", "$meta": "{not-json"}) == "unavailable")
+        check("C26 $meta dict（pymilvus 2.x 形态）残留 99 → residual",
+              vs_mod.MilvusVectorStore._dynamic_version_residual(
+                  {"chunk_id": "c1", "$meta": {"content_revision": 99}}) == "residual")
+    else:
+        print("  [SKIP] C26 真实 SDK 解码器契约（pymilvus 未安装）")
+
+    # ---- C27：缺行（查询返回行数少于请求 chunk 数）→ 不可校验 ----
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS},
+                        strict_fields=True, dynamic_field=True)
+    client.cols["graphinsight_chunks_v2"]["rows"] = [seed_row("c1"), seed_row("c2")]
+    client.drop_query_rows = {"c2"}  # 注入缺行：c2 查询不返回
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    # 观察动态版本请求 c1+c2，但只返回 c1 → 缺行必须判 unavailable（不能据此断言"无残留"）
+    check("C27 缺行（返回行数不足）→ 观察动态版本判 unavailable",
+          store._observe_dynamic_version("graphinsight_chunks_v2", ["c1", "c2"]) == "unavailable")
 
     print()
     print(f"RESULT: {len(PASSES)} passed, {len(FAILURES)} failed")
