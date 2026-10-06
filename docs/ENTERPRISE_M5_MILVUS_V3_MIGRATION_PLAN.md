@@ -1042,6 +1042,19 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 回归（实跑）：统一门禁 `total=23 failed=0`；护栏自检 `13/0`；契约矩阵 `77/0`；B0 全绿；`check_m5_nonempty_disposable_contract.py` `21/0`；`--dry-run` RC=3。
 连接范围不变：未 push；真实 disposable 执行仍**未授权**；M5-B1 冻结。
 
+---
+
+### 9.21 最终落盘复验 + backfill 存储对账 + 补齐故障注入（第九轮 · 2026-10-06）
+
+复核指出三处缺口（两 P1 一 P2），本轮补齐：
+
+1. **P1：校验最终落盘文件**——`write_evidence` 初版复验通过后又重写最终 JSON/meta，却没读回最终版本；注入"第二次写入损坏"会 JSON 不可解析、返回 0、`ROUND_EXIT=0`。修复：阶段 6 读回最终落盘版本复验（JSON 可解析 + RUN_ID 一致 + 步骤数 + `ROUND_EXIT` 自洽），失败 → 紧急证据 `nonempty_emergency.txt` + 返回 2。离线复验：第二次写入损坏 → `exit=2`、紧急证据存在。
+2. **P1：补 backfill 实际存储对账**——`verify_backfill` 原先只查退出码 + `rows_new=1`。新增 `BACKFILL_RECON_DRIVER` 读回 primary/shadow 的字段+向量快照：primary 前后字段及向量完全不变、shadow 新增显式 `content_revision=1`、重跑 `rows_new=0` 且两侧内容不变。
+3. **P2：补齐声称覆盖的故障测试**——`test_main_finally_protection` 原先只注入 archive 失败（cleanup/write_evidence 替身正常返回）。改为四场景：archive 失败 / cleanup 失败 / write_evidence 抛异常 / write_evidence 返回 2，分别断言调用顺序、失败进证据（`归档/清理/证据` 失败步骤）、退出码；新增 `test_evidence_finalize_corruption`；并把 `check_m5_nonempty_disposable_contract.py` **接入统一门禁**（第 24 个 case）。
+
+回归（实跑）：统一门禁 `total=24 failed=0`（23→24）；契约测试 `32/0`（21→32）；护栏自检 `13/0`、契约矩阵 `77/0`、B0 全绿不变；`--dry-run` RC=3。
+连接范围不变：未 push；真实 disposable 执行仍**未授权**；M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
