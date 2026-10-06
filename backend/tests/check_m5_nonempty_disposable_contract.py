@@ -124,21 +124,50 @@ def test_evidence_write_failure() -> None:
         check("写盘失败：emergency 证据存在", (base / "nonempty_emergency.txt").exists())
 
 
-def test_main_finally_protection() -> None:
-    """真实 main 流程：archive/cleanup/write_evidence 失败分别注入，后续步骤仍被调用。"""
+def test_evidence_finalize_corruption() -> None:
+    """P1：初版复验通过后重写最终 JSON/meta 又损坏 → 最终落盘复验必须读回并返回 2。"""
+    _reset()
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        m.add_step("步骤", True)
+        orig_write = Path.write_text
+        call_count = [0]
+
+        def corrupt_final_write(self, data, *args, **kwargs):
+            call_count[0] += 1
+            # 第 3 次写 = 阶段 5 重写最终 steps JSON，写入不可解析内容
+            if call_count[0] == 3 and self.name == "nonempty_steps.json":
+                return orig_write(self, "{not-valid-json", *args, **kwargs)
+            return orig_write(self, data, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", corrupt_final_write):
+            exit_code = m.write_evidence(base, "RUN-c", "2026-01-01T00:00:00")
+        check("最终落盘损坏：write_evidence 返回 2", exit_code == 2, f"exit={exit_code}")
+        check("最终落盘损坏：emergency 证据存在（明确失败证据）",
+              (base / "nonempty_emergency.txt").exists())
+
+
+def _run_main_with_faults(archive_fail: bool = False, cleanup_fail: bool = False,
+                          write_evidence_fail: bool = False, write_evidence_return: int = 0):
+    """跑真实 main，注入指定故障。返回 (exit_code, calls, failed_step_names)。"""
     _reset()
     calls = []
 
     def fake_archive(base, tmp):
         calls.append("archive")
-        raise RuntimeError("archive fail")
+        if archive_fail:
+            raise RuntimeError("archive fail")
 
     def fake_cleanup(tmp, kb, keep):
         calls.append("cleanup")
+        if cleanup_fail:
+            raise RuntimeError("cleanup fail")
 
     def fake_write_evidence(base, run_id, exec_time):
         calls.append("write_evidence")
-        return 0
+        if write_evidence_fail:
+            raise RuntimeError("write fail")
+        return write_evidence_return
 
     with tempfile.TemporaryDirectory() as td:
         # mock 预检（无同名对象）→ ensure_containers 抛异常（主流程进 except）→ finally 三步。
@@ -152,10 +181,36 @@ def test_main_finally_protection() -> None:
              mock.patch.object(m, "cleanup", side_effect=fake_cleanup), \
              mock.patch.object(m, "write_evidence", side_effect=fake_write_evidence):
             exit_code = m.main()
-        check("main：archive 失败后 cleanup 仍被调用", "cleanup" in calls, str(calls))
-        check("main：cleanup 后 write_evidence 仍被调用", "write_evidence" in calls, str(calls))
-        check("main：三步都被调用", calls == ["archive", "cleanup", "write_evidence"], str(calls))
-        check("main：返回非零（主流程异常 + archive 失败）", exit_code != 0, f"exit={exit_code}")
+    failed_steps = [s.get("name", "") for s in m.STEPS if s.get("ok") is False]
+    return exit_code, calls, failed_steps
+
+
+def test_main_finally_protection() -> None:
+    """真实 main 流程：archive/cleanup/write_evidence 失败分别注入，后续步骤仍被调用、失败进证据。"""
+    # 场景 1：archive 失败
+    exit_code, calls, failed_steps = _run_main_with_faults(archive_fail=True)
+    check("场景1：archive 失败 → cleanup 仍被调用", "cleanup" in calls, str(calls))
+    check("场景1：archive 失败 → write_evidence 仍被调用", "write_evidence" in calls, str(calls))
+    check("场景1：三步都被调用", calls == ["archive", "cleanup", "write_evidence"], str(calls))
+    check("场景1：archive 失败进入失败证据", any("归档" in s for s in failed_steps), str(failed_steps))
+    check("场景1：返回非零", exit_code != 0, f"exit={exit_code}")
+
+    # 场景 2：cleanup 失败
+    exit_code, calls, failed_steps = _run_main_with_faults(cleanup_fail=True)
+    check("场景2：cleanup 失败 → write_evidence 仍被调用", "write_evidence" in calls, str(calls))
+    check("场景2：cleanup 失败进入失败证据", any("清理" in s for s in failed_steps), str(failed_steps))
+    check("场景2：返回非零", exit_code != 0, f"exit={exit_code}")
+
+    # 场景 3：write_evidence 抛异常
+    exit_code, calls, failed_steps = _run_main_with_faults(write_evidence_fail=True)
+    check("场景3：write_evidence 抛异常仍被调用", "write_evidence" in calls, str(calls))
+    check("场景3：write_evidence 异常进入失败证据", any("证据" in s for s in failed_steps), str(failed_steps))
+    check("场景3：返回非零", exit_code != 0, f"exit={exit_code}")
+
+    # 场景 4：write_evidence 返回 2（不抛异常）
+    exit_code, calls, _ = _run_main_with_faults(write_evidence_return=2)
+    check("场景4：write_evidence 返回 2 → main 返回 2", exit_code == 2, f"exit={exit_code}")
+    check("场景4：三步都被调用", calls == ["archive", "cleanup", "write_evidence"], str(calls))
 
 
 def test_no_container_on_unauthorized() -> None:
@@ -196,6 +251,7 @@ def main() -> int:
     test_evidence_run_id_mismatch()
     test_evidence_meta_read_failure()
     test_evidence_write_failure()
+    test_evidence_finalize_corruption()
     test_main_finally_protection()
     test_no_container_on_unauthorized()
     print()

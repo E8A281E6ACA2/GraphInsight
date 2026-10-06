@@ -173,6 +173,12 @@ CASES: tuple[GuardCase, ...] = (
         180,
         "敏感信息扫描器正样本自检与路径排除守卫",
     ),
+    GuardCase(
+        "m5_nonempty_disposable_contract",
+        "check_m5_nonempty_disposable_contract.py",
+        120,
+        "M5 非空 disposable 执行器离线故障注入契约（证据 fail-closed / finally 保护 / 不创建容器）",
+    ),
 )
 
 
