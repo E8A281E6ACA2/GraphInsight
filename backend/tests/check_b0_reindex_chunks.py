@@ -646,6 +646,25 @@ def section_e4(h: Harness) -> None:
             f"counts={counts}",
         )
 
+    # E5 守卫必须早于副作用：非授权 KB → 拒写且**零副作用**（不建集合、不 upsert）
+    out = scenario(h, "s1_scope_guard.db", "scope_guard_before_side_effects")
+    side = obj_marker(out, "__SIDE_EFFECTS__")
+    revs = rev_map(out)
+    counts = counts_of(out)
+    row = revs.get("c-1", {})
+    step(
+        "P1 [E5] 非授权 KB → 未调用 ensure_collection（守卫早于建集合）",
+        side.get("ensure_collection_calls") == [],
+        f"side={side}",
+    )
+    step("P1 [E5] 非授权 KB → 零建集合、零向量写入",
+         side.get("create_calls") == [] and (side.get("upserts") or {}) == {}, f"side={side}")
+    step(
+        "P1 [E5] 该 chunk 如实记 failed（未收敛，不虚报 indexed）",
+        row.get("vector_status") == "failed" and counts.get("vector_indexed") == 0,
+        f"row={row} counts={counts}",
+    )
+
 
 def main() -> int:
     print("=" * 60)

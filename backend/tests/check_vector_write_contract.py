@@ -61,9 +61,12 @@ class FakeSchema:
 class FakeClient:
     """最小 MilvusClient 假体：schema 探针 + 行级 upsert/query + 注入点。"""
 
+    # legacy v2 的真实形态：包含代码实际写入的文本/身份字段，但**没有** content_revision。
+    # （夹具不放宽：严格模式下未知 output_fields 会被拒，读回必须按实际 schema 走。）
     V2_FIELDS = [
         {"name": "chunk_id", "data_type": "VARCHAR"},
         {"name": "doc_id", "data_type": "VARCHAR"},
+        {"name": "text", "data_type": "VARCHAR"},
         {"name": "kb_id", "data_type": "VARCHAR"},
         {"name": "tenant_id", "data_type": "VARCHAR"},
         {"name": "project_id", "data_type": "VARCHAR"},
@@ -71,13 +74,19 @@ class FakeClient:
     ]
     V3_FIELDS = V2_FIELDS + [{"name": "content_revision", "data_type": "INT64"}]
 
-    def __init__(self, collections: Dict[str, List[Dict[str, Any]]]) -> None:
+    def __init__(self, collections: Dict[str, List[Dict[str, Any]]],
+                 strict_fields: bool = False) -> None:
         self.cols = {name: {"fields": fields, "rows": []} for name, fields in collections.items()}
         self.upsert_calls: List[str] = []
         self.fail_upsert_on: set = set()
         self.partial_on: set = set()
         self.tamper_revision: Dict[str, int] = {}
         self.drop_collection_calls: List[str] = []
+        self.created_collections: List[str] = []
+        # 严格模式：output_fields 里出现 schema 之外（或不存在）的字段 → 像真实 Milvus 一样报错。
+        # 用于证明"读回按实际 schema 校验"，而不是靠宽松夹具（忽略 output_fields）放行。
+        self.strict_fields = strict_fields
+        self.delete_calls: List[Dict[str, str]] = []
 
     # --- schema 探针 ---
     def has_collection(self, name: str) -> bool:
@@ -90,6 +99,7 @@ class FakeClient:
         return FakeSchema("__pending__")
 
     def create_collection(self, collection_name: str, schema: FakeSchema) -> None:
+        self.created_collections.append(collection_name)
         self.cols[collection_name] = {"fields": list(schema.fields), "rows": []}
 
     def prepare_index_params(self) -> Any:
@@ -121,8 +131,35 @@ class FakeClient:
             return {"upsert_count": max(0, len(data) - 1)}
         return {"upsert_count": len(data)}
 
+    # --- delete：记录 filter 表达式并按表达式**真的删行**（可验证外域行保留） ---
+    @staticmethod
+    def _matches(row: Dict[str, Any], filter_str: str) -> bool:
+        """最小布尔求值：仅支持本仓库用到的 `field == "v"` 与 `field in ["a", "b"]` 用 and 连接。"""
+        for raw in str(filter_str or "").split(" and "):
+            cond = raw.strip()
+            if not cond:
+                continue
+            m_in = re.match(r'^(\w+)\s+in\s+\[(.*)\]$', cond)
+            if m_in:
+                wanted = {v.replace('\\"', '"') for v in re.findall(r'"((?:[^"\\]|\\.)*)"', m_in.group(2))}
+                if str(row.get(m_in.group(1)) or "") not in wanted:
+                    return False
+                continue
+            m_eq = re.match(r'^(\w+)\s*==\s*"(.*)"$', cond)
+            if m_eq:
+                if str(row.get(m_eq.group(1)) or "") != m_eq.group(2).replace('\\"', '"'):
+                    return False
+                continue
+            raise AssertionError(f"假体不支持的过滤条件：{cond!r}（夹具必须与真实表达式同步）")
+        return True
+
     def delete(self, collection_name: str, filter: str) -> None:  # noqa: A002
         self.upsert_calls.append(f"delete:{collection_name}")
+        self.delete_calls.append({"collection": collection_name, "filter": filter})
+        page = self.cols.get(collection_name)
+        if page is None:
+            return
+        page["rows"] = [row for row in page["rows"] if not self._matches(row, filter)]
 
     # --- read ---
     @staticmethod
@@ -137,6 +174,11 @@ class FakeClient:
     def query(self, collection_name: str, filter: str, output_fields: List[str], limit: int = None,
               **_kw: Any) -> List[Dict[str, Any]]:
         rows = list(self.cols.get(collection_name, {}).get("rows", []))
+        if self.strict_fields:
+            known = {str(f.get("name") or "") for f in (self.cols.get(collection_name, {}).get("fields") or [])}
+            for field in output_fields or []:
+                if field not in known:
+                    raise RuntimeError(f"field {field} not exist in collection {collection_name}")
         wanted = self._filtered_ids(filter)
         if wanted is not None:
             rows = [row for row in rows if str(row.get("chunk_id") or "") in wanted]
@@ -180,6 +222,24 @@ def chunk(cid: str, revision: int | None, kb: str = "kb-a", tenant: str = "t1", 
 
 
 VEC = [0.1, 0.2, 0.3, 0.4]
+
+
+def seed_row(cid: str, kb: str = "kb-a", tenant: str = "t1", project: str = "p1", doc: str = "d1",
+             vector: List[float] = None) -> Dict[str, Any]:
+    """读源行的**完整形态**（归属四件套 + 向量证据）。
+
+    P1 修复后夹具必须反映真实行形态：读源不变量要核对 `kb/tenant/project/doc` 与向量证据，
+    只给 `{chunk_id, kb_id}` 的"宽松行"会被正确拒绝（那正是外域同名行混入的入口）。
+    """
+    return {
+        "chunk_id": cid, "doc_id": doc, "kb_id": kb, "tenant_id": tenant,
+        "project_id": project, "vector": list(vector if vector is not None else VEC),
+    }
+
+
+def seed_primary(client: FakeClient, *chunk_ids: str, collection: str = "graphinsight_chunks_v2",
+                 **kw: Any) -> None:
+    client.cols[collection]["rows"] = [seed_row(cid, **kw) for cid in chunk_ids]
 
 
 def main() -> int:
@@ -278,7 +338,7 @@ def main() -> int:
     # C8 历史回填：primary 已有该 chunk → 只写影子
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    seed_primary(client, "c1")
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
     written = store.upsert_chunks([chunk("c1", 1)], [VEC], intent="backfill_versioned")
     check("C8 回填返回确认数 1", written == 1)
@@ -313,7 +373,7 @@ def main() -> int:
     # C11 回填：写后读回不一致 → 拒标 indexed
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    seed_primary(client, "c1")
     client.tamper_revision["c1"] = 99
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
     err = None
@@ -326,7 +386,7 @@ def main() -> int:
     # C12 revision 2/3 保留 + 重跑幂等
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c9", "kb_id": "kb-a"}]
+    seed_primary(client, "c9")
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
     store.upsert_chunks([chunk("c9", 3)], [VEC], intent="backfill_versioned")
     store.upsert_chunks([chunk("c9", 3)], [VEC], intent="backfill_versioned")
@@ -338,8 +398,8 @@ def main() -> int:
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
     client.cols["graphinsight_chunks_v2"]["rows"] = [
-        {"chunk_id": "c-b", "kb_id": "kb-b"},
-        {"chunk_id": "c-a", "kb_id": "kb-a"},
+        seed_row("c-b", kb="kb-b"),
+        seed_row("c-a", kb="kb-a"),
     ]
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
                                scope={"kb_ids": ["kb-a"], "tenant_id": "", "project_id": ""}), client)
@@ -357,7 +417,7 @@ def main() -> int:
     # C14 范围守卫：tenant 不一致
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    seed_primary(client, "c1")
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
                                scope={"kb_ids": ["kb-a"], "tenant_id": "t-authorized", "project_id": ""}), client)
     err = None
@@ -379,7 +439,7 @@ def main() -> int:
     # C15 版本承载侧：显式 revision=2 + metadata revision=99 → 落库必须是 2
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    seed_primary(client, "c1")
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
     store.upsert_chunks([_mk_chunk("c1", 2, {"content_revision": 99})], [VEC], intent="backfill_versioned")
     v3_row = client.cols["graphinsight_chunks_v3"]["rows"][0]
@@ -412,7 +472,7 @@ def main() -> int:
     # C18 kb_ids 配置非法（","）→ SCOPE_CONFIG_INVALID 且零写入
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    seed_primary(client, "c1")
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
                                scope={"kb_ids": [], "kb_ids_configured": True,
                                       "tenant_id": "", "project_id": ""}), client)
@@ -429,7 +489,8 @@ def main() -> int:
     # C19 kb_ids **未配置** 但 tenant 已配置 → tenant 限制必须独立生效
     client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    # 读源行必须与本次 chunk 同域（含 tenant）：否则连读源不变量都不成立（P1 归属核验）
+    seed_primary(client, "c1", tenant="t-authorized")
     store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
                                scope={"kb_ids": [], "kb_ids_configured": False,
                                       "tenant_id": "t-authorized", "project_id": ""}), client)
@@ -438,7 +499,7 @@ def main() -> int:
     check("C19 kb_ids 未配置时 tenant 匹配 → 放行", written == 1)
     client2 = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
                           "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
-    client2.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    seed_primary(client2, "c1", tenant="t-authorized")
     store2, vs2 = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
                                  scope={"kb_ids": [], "kb_ids_configured": False,
                                         "tenant_id": "t-authorized", "project_id": ""}), client2)
@@ -483,6 +544,116 @@ def main() -> int:
     check("C20 clear 在非法配置下拒绝（不得退化为无限制）",
           err is not None and err.reason == vs_bad.REASON_SCOPE_CONFIG_INVALID
           and not client.upsert_calls)
+
+    # ---- C21：读源同名行**归属核验**（P1 遗漏项：只证明"同名 ID 存在"不够） ----
+    for label, bad_row, expected_reason in (
+        ("KB 属 kb-b", seed_row("c1", kb="kb-b"), vs.REASON_PRIMARY_SCOPE_MISMATCH),
+        ("tenant 属 t-other", seed_row("c1", tenant="t-other"), vs.REASON_PRIMARY_SCOPE_MISMATCH),
+        ("doc 属 d-other", seed_row("c1", doc="d-other"), vs.REASON_PRIMARY_SCOPE_MISMATCH),
+        ("向量证据为空", seed_row("c1", vector=[]), vs.REASON_PRIMARY_VECTOR_UNREADABLE),
+    ):
+        client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                             "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+        client.cols["graphinsight_chunks_v2"]["rows"] = [bad_row]
+        store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+        err = None
+        try:
+            store.upsert_chunks([chunk("c1", 1)], [VEC], intent="backfill_versioned")
+        except vs_one.VectorWriteContractError as exc:
+            err = exc
+        check(f"C21 读源行{label}不符 → 拒绝（{expected_reason}）",
+              err is not None and err.reason == expected_reason)
+        check(f"C21 读源行{label}不符 → shadow 零写入（写前拒绝）", not client.upsert_calls)
+    # 正向对照：同域且带向量的读源行必须放行（避免"一律拒绝"式假修复）
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    seed_primary(client, "c1")
+    store, vs_ok = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    written = store.upsert_chunks([chunk("c1", 1)], [VEC], intent="backfill_versioned")
+    check("C21 同域读源行放行（正向对照）", written == 1)
+
+    # ---- C22：写前范围校验的公开入口**零副作用**（守卫早于建集合/建索引/mutation） ----
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS})
+    store, vs_one = make_store(cfg(dual=False, scope={"kb_ids": ["kb-a"], "kb_ids_configured": True,
+                                                      "tenant_id": "", "project_id": ""}), client)
+    err = None
+    try:
+        store.assert_write_allowed([chunk("c1", 1, kb="kb-b")], "reindex_chunks")
+    except vs_one.VectorWriteContractError as exc:
+        err = exc
+    check("C22 写前范围校验拒绝非授权 KB（KB_NOT_ALLOWED）",
+          err is not None and err.reason == vs_one.REASON_KB_NOT_ALLOWED)
+    check("C22 写前校验零副作用（无建集合、无 upsert、无 delete）",
+          not client.created_collections and not client.upsert_calls and not client.delete_calls)
+
+    # ---- C23：delete/clear 的 tenant/project 过滤与"无法限定则拒绝" ----
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    for name in ("graphinsight_chunks_v2", "graphinsight_chunks_v3"):
+        client.cols[name]["rows"] = [seed_row("c1", tenant="t1"), seed_row("c2", tenant="t2")]
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
+                                   scope={"kb_ids": ["kb-a"], "kb_ids_configured": True,
+                                          "tenant_id": "t1", "project_id": "p1"}), client)
+    store.delete_doc("d1", "kb-a")
+    filters = [call["filter"] for call in client.delete_calls]
+    check("C23 delete 过滤携带 tenant/project",
+          bool(filters) and all("tenant_id ==" in f and "project_id ==" in f for f in filters),
+          )
+    check("C23 两侧都按同一作用域删除（primary + shadow 各一次）",
+          sorted({call["collection"] for call in client.delete_calls})
+          == ["graphinsight_chunks_v2", "graphinsight_chunks_v3"])
+    check("C23 外域行（tenant=t2）在两侧都保留",
+          all(any(row["chunk_id"] == "c2" for row in client.cols[name]["rows"])
+              for name in ("graphinsight_chunks_v2", "graphinsight_chunks_v3")))
+    check("C23 同域行（tenant=t1）已删除",
+          all(not any(row["chunk_id"] == "c1" for row in client.cols[name]["rows"])
+              for name in ("graphinsight_chunks_v2", "graphinsight_chunks_v3")))
+
+    NARROW_FIELDS = [
+        {"name": "chunk_id", "data_type": "VARCHAR"},
+        {"name": "kb_id", "data_type": "VARCHAR"},
+        {"name": "vector", "data_type": "FLOAT_VECTOR", "params": {"dim": 4}},
+    ]
+    client = FakeClient({"graphinsight_chunks_narrow": NARROW_FIELDS})
+    client.cols["graphinsight_chunks_narrow"]["rows"] = [seed_row("c1")]
+    store, vs_one = make_store(cfg(collection="graphinsight_chunks_narrow", dual=False,
+                                   scope={"kb_ids": [], "kb_ids_configured": False,
+                                          "tenant_id": "t1", "project_id": "p1"}), client)
+    err = None
+    try:
+        store.clear(["kb-a"])
+    except vs_one.VectorWriteContractError as exc:
+        err = exc
+    check("C23 配置了 tenant/project 但集合缺这些字段 → DELETE_SCOPE_UNSUPPORTED",
+          err is not None and err.reason == vs_one.REASON_DELETE_SCOPE_UNSUPPORTED)
+    check("C23 无法安全限定 → 零删除（不放宽成只按 KB 删）", not client.delete_calls)
+
+    # ---- C24：读回合同（"要求版本键不存在" ≠ "不比较版本"）+ legacy 字段按实际 schema 校验 ----
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([chunk("c1", 1)], [VEC])
+    contracts = [t["version_contract"] for t in store.write_targets()]
+    check("C24 legacy primary 的版本合同是 absent、shadow 是 equal",
+          contracts == ["absent", "equal"])
+    expected_map = {"c1": {"text": "text-c1", "content_revision": 1}}
+    check("C24 正常写入后读回通过", store.verify_write_targets(expected_map)["ok"] is True)
+    # 注入：primary 行出现版本值（"剥版本"未生效 / 版本被写回 v2）→ 必须被抓到
+    client.cols["graphinsight_chunks_v2"]["rows"][0]["content_revision"] = 99
+    verdict = store.verify_write_targets(expected_map)
+    check("C24 primary 被注入 revision=99 → ok=False（不是'不比较'）", verdict["ok"] is False)
+    check("C24 失败定位到 primary 集合",
+          (verdict.get("results") or {}).get("graphinsight_chunks_v2") is False)
+
+    # 严格 schema 假体（未知 output_fields 直接报错，模拟真实 Milvus 的 legacy collection）：
+    # 读回必须走"字段不存在 = 结构化 absent"而不是把查询错误当通过或当失败。
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS}, strict_fields=True)
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([chunk("c1", 1)], [VEC])
+    strict_verdict = store.verify_write_targets(expected_map)
+    check("C24 严格 schema 下 legacy primary 读回仍通过（字段缺失=结构化 absent）",
+          strict_verdict["ok"] is True)
 
     print()
     print(f"RESULT: {len(PASSES)} passed, {len(FAILURES)} failed")

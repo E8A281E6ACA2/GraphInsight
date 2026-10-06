@@ -444,6 +444,9 @@ class ReadbackClient:
         self.mismatch = mismatch
         self.mismatch_collections = set(mismatch_collections or ())
         self.tamper_text = tamper_text
+        # 副作用记录：用于断言"范围校验早于建集合/建索引/mutation"
+        self.ensure_collection_calls: List[str] = []
+        self.create_calls: List[str] = []
 
     def has_collection(self, name):
         return True
@@ -487,7 +490,8 @@ class NoQueryReadbackClient(ReadbackClient):
 
 def _install_real_vector_write(client, *, dual_write: bool = False, shadow: str = "",
                                field_map: Dict[str, bool] = None,
-                               collection: str = "graphinsight_chunks_v2") -> None:
+                               collection: str = "graphinsight_chunks_v2",
+                               scope: Dict[str, Any] = None) -> None:
     """向量腿保持**真实** `_write_milvus_projection` + 真实 `upsert_chunks`，只换 client。
 
     注意导入形态：必须取**单例** `services.embedding_service.embedding_service`；
@@ -506,6 +510,7 @@ def _install_real_vector_write(client, *, dual_write: bool = False, shadow: str 
     embedding_service.config = lambda: {"model": "m-test"}
     embedding_service.content_hash = lambda value: "h-test"
 
+    from services import vector_store as vs_module
     from services.vector_store import vector_store
 
     vector_store._get_client = lambda: client
@@ -518,10 +523,20 @@ def _install_real_vector_write(client, *, dual_write: bool = False, shadow: str 
         "dual_write": dual_write,
         "shadow_collection": shadow,
     }
-    vector_store.ensure_collection = lambda **k: None
+    # 记录 ensure_collection 调用（副作用），而不是静默吃掉：E5 要断言"守卫早于建集合"。
+    vector_store.ensure_collection = lambda **k: client.ensure_collection_calls.append("ensure_collection")
     vector_store.has_content_revision_field = lambda coll=None, *a, **k: fields.get(
         str(coll or collection), True
     )
+    if scope is not None:
+        original = vs_module.get_vector_store_runtime_config
+
+        def _scoped() -> Dict[str, Any]:
+            cfg_values = dict(original())
+            cfg_values["write_scope"] = scope
+            return cfg_values
+
+        vs_module.get_vector_store_runtime_config = _scoped
 
 
 def scenario_readback_verified() -> None:
@@ -578,6 +593,29 @@ def scenario_readback_shadow_mismatch() -> None:
                               field_map={V2: False, V3: True})
     _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
     print("__MILVUS_WRITTEN__" + json.dumps(client.upserts, ensure_ascii=False, default=str))
+
+
+def scenario_scope_guard_before_side_effects() -> None:
+    """P1 负向：非授权 KB 的范围校验必须**早于** ensure_collection 等副作用（零副作用）。
+
+    只断言"最终被拒"不够——此前顺序是 ensure_collection → upsert（守卫在 upsert 内部），
+    非授权 KB 虽然被拒，但集合已经被创建。
+    """
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    client = ReadbackClient()
+    _install_real_vector_write(
+        client, dual_write=True, shadow=V3, field_map={V2: False, V3: True},
+        scope={"kb_ids": ["kb-unrelated"], "kb_ids_configured": True,
+               "tenant_id": "", "project_id": ""},
+    )
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+    print("__SIDE_EFFECTS__" + json.dumps({
+        "ensure_collection_calls": client.ensure_collection_calls,
+        "create_calls": client.create_calls,
+        "upserts": {k: len(v) for k, v in client.upserts.items()},
+    }, ensure_ascii=False, sort_keys=True))
 
 
 def scenario_readback_unavailable() -> None:
@@ -920,6 +958,7 @@ SCENARIOS = {
     "legacy_v2_s1_online": scenario_legacy_v2_s1_online,
     "readback_shadow_mismatch": scenario_readback_shadow_mismatch,
     "readback_unavailable": scenario_readback_unavailable,
+    "scope_guard_before_side_effects": scenario_scope_guard_before_side_effects,
     "current_moved": scenario_current_moved,
     "current_deleted_race": scenario_current_deleted_race,
     "idempotent_rerun": scenario_idempotent_rerun,

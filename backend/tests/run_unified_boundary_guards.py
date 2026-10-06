@@ -2,8 +2,10 @@
 """Run the Python-side unified boundary guard suite."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 from dataclasses import dataclass
@@ -23,20 +25,42 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def _utf8_env(base: dict[str, str]) -> dict[str, str]:
+def _utf8_env(base: dict[str, str], *, status_file: Path, violations_file: Path) -> dict[str, str]:
     env = base.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     # 网络护栏：把 tests/netguard 注入 PYTHONPATH，Python 启动时会自动 import sitecustomize，
-    # 从而**禁止一切 TCP 连接**（默认全禁，仅 GUARD_NET_ALLOW 白名单例外）。见 netguard/sitecustomize.py。
+    # 从而禁止外网与真实服务端口连接。见 netguard/sitecustomize.py。
     netguard = str(TESTS_DIR / "netguard")
     existing = env.get("PYTHONPATH") or ""
     parts = [netguard] + [p for p in existing.split(os.pathsep) if p]
     env["PYTHONPATH"] = os.pathsep.join(parts)
+    # 加载留痕 + 违规留痕（独立文件）：**不依赖子进程打印什么**，捕获异常静默也不能假绿。
+    env["GUARD_NET_STATUS"] = str(status_file)
+    env["GUARD_NET_VIOLATIONS"] = str(violations_file)
     return env
 
 
 NETGUARD_MARKER = "NEUTRALIZED_NETWORK"
+
+
+def _read_netguard_records(path: Path) -> list[dict]:
+    """读取护栏 JSONL 留痕；不存在/不可解析一律返回空列表（缺失由调用方判失败）。"""
+    records: list[dict] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                records.append(item)
+    except FileNotFoundError:
+        return []
+    return records
 
 
 @dataclass(frozen=True)
@@ -62,6 +86,8 @@ CASES: tuple[GuardCase, ...] = (
     GuardCase("qa_cost", "check_qa_cost_summary_unit.py", 60, "QA cost aggregation unit check"),
     GuardCase("admin_env_override", "check_admin_env_override_unit.py", 60, "unified runtime env override guard"),
     GuardCase("rate_limit_exempt", "check_rate_limit_exempt_unit.py", 60, "internal health probe rate limit exemption"),
+    GuardCase("netguard_enforcement", "check_netguard_enforcement.py", 180,
+              "网络护栏自检（含静默吞异常仍留痕的负向用例）"),
     GuardCase("backfill_manifest", "check_backfill_manifest.py", 180, "backfill 运行清单（隔离 SQLite，零真实连接）"),
     GuardCase("vector_write_contract", "check_vector_write_contract.py", 60, "向量写入契约矩阵（两种意图 + KB 范围守卫，进程内假体）"),
     GuardCase("rbac_catalog_parity", "check_rbac_catalog_parity.py", 120, "Python/Go RBAC 权限目录精确对账"),
@@ -116,29 +142,49 @@ def _resolve_python() -> Path:
 
 def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str, int]:
     started = time.perf_counter()
-    proc = subprocess.run(  # noqa: S603
-        [str(python_bin), str(TESTS_DIR / case.script)],
-        cwd=str(ROOT.parent),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=_utf8_env(os.environ),
-        timeout=case.timeout_seconds,
-        check=False,
-    )
+    problems: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=f"netguard-{case.name}-") as guard_dir_name:
+        guard_dir = Path(guard_dir_name)
+        status_file = guard_dir / "load_status.jsonl"
+        violations_file = guard_dir / "violations.jsonl"
+        proc = subprocess.run(  # noqa: S603
+            [str(python_bin), str(TESTS_DIR / case.script)],
+            cwd=str(ROOT.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_utf8_env(os.environ, status_file=status_file, violations_file=violations_file),
+            timeout=case.timeout_seconds,
+            check=False,
+        )
+        status_records = _read_netguard_records(status_file)
+        violation_records = _read_netguard_records(violations_file)
     duration = time.perf_counter() - started
     output = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
     combined = output
     if err:
         combined = f"{combined}\n[stderr]\n{err}".strip()
-    # 意外外连 = 该子项不满足隔离要求 → 直接判红（**不因为退出码为 0 就放行**）。
-    if NETGUARD_MARKER in combined:
-        combined = (
-            f"{combined}\n[NETGUARD] 该子项尝试了真实网络连接（被网络护栏拦截）。"
-            "门禁必须全程离线：请补导入阶段/请求阶段的服务替身，或在确有需要时显式配置 GUARD_NET_ALLOW。"
+
+    # 判红依据（三条独立信号，任一命中即失败；不因为退出码为 0 就放行）：
+    #   1) 护栏**确实加载**（加载留痕存在）——否则"隔离"根本没生效；
+    #   2) 违规留痕为空——**即使子项把拦截异常静默 try/except 掉、stdout 无任何标记**；
+    #   3) stdout 标记（次要信号，便于定位）。
+    if not status_records:
+        problems.append("[NETGUARD] 未发现护栏加载留痕：隔离未生效（PYTHONPATH/sitecustomize 注入失败）")
+    if violation_records:
+        detail = "; ".join(
+            f"{item.get('host')}:{item.get('port')}" for item in violation_records[:5]
         )
+        problems.append(
+            f"[NETGUARD] 检测到 {len(violation_records)} 次真实网络连接尝试（持久留痕，"
+            f"不依赖子进程输出）：{detail}"
+        )
+    if NETGUARD_MARKER in combined and not violation_records:
+        problems.append("[NETGUARD] 输出现拦截标记但无留痕（护栏状态异常）")
+    if problems:
+        combined = f"{combined}\n" + "\n".join(problems)
         return False, duration, combined, proc.returncode
     return proc.returncode == 0, duration, combined, proc.returncode
 

@@ -16,11 +16,38 @@
 
 白名单：`GUARD_NET_ALLOW`（逗号分隔 `host` 或 `host:port`）可显式放行，须在评审中说明理由。
 DNS（`getaddrinfo`）不拦：只拦真正的连接动作。
+
+**违规留痕（P2 加固）**：拦截时**同步**把违规记录追加到独立文件（`GUARD_NET_VIOLATIONS`），
+并在导入期写一条 `guard_loaded` 到 `GUARD_NET_STATUS`。这两件事都不依赖调用方"打印什么"：
+若某处把拦截异常静默 try/except 掉，输出里不会出现标记，但**违规文件仍有记录**——runner 校验
+该文件与加载状态，不能只靠 stdout 标记（否则"捕获异常且不打印"就能假绿）。
+
+覆盖范围（如实声明）：本护栏只作用于 **Python `socket` 路径**（`socket.socket.connect/connect_ex`、
+`socket.create_connection`）。原生扩展（如某些 C 驱动）或子进程自带网络栈不在其覆盖内，不得据此宣称
+"所有网络调用都被隔离"。
 """
+import json
 import os
 import socket
+import time
 
 _MARKER = "NEUTRALIZED_NETWORK"
+_VIOLATION_FILE = (os.environ.get("GUARD_NET_VIOLATIONS") or "").strip()
+_STATUS_FILE = (os.environ.get("GUARD_NET_STATUS") or "").strip()
+
+
+def _append_record(path: str, record: dict) -> None:
+    """追加一条 JSON 行；留痕失败不得影响拦截动作本身（拦截优先）。"""
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+
 DEFAULT_DENY_PORTS = {
     "5432", "5433", "5434",  # PostgreSQL（含项目 compose 栈 5434）
     "6379",                  # Redis
@@ -62,6 +89,15 @@ class NeutralizedNetworkError(RuntimeError):
 
 def _blocked(address) -> "NeutralizedNetworkError":
     host, port = _host_port(address)
+    # **拦截即留痕**（独立文件，先写再抛）：即使调用方把异常 try/except 掉且不打印，
+    # 违规依然可被 runner 检出——"捕获异常且不打印"不能构成假绿。
+    _append_record(_VIOLATION_FILE, {
+        "event": "blocked_connect",
+        "host": host,
+        "port": port,
+        "pid": os.getpid(),
+        "time": time.time(),
+    })
     return NeutralizedNetworkError(f"{_MARKER}:{host}:{port}")
 
 
@@ -94,3 +130,13 @@ def _guarded_create_connection(address, *args, **kwargs):  # noqa: ANN001
 socket.socket.connect = _guarded_connect
 socket.socket.connect_ex = _guarded_connect_ex
 socket.create_connection = _guarded_create_connection
+
+# 导入即留痕（放在补丁之后：此时常量与策略已就绪）——runner 据此确认子进程**确实加载了护栏**，
+# 没加载 = 隔离不成立 → 判红（不能因为"没打印标记"就当作通过）。
+_append_record(_STATUS_FILE, {
+    "event": "guard_loaded",
+    "pid": os.getpid(),
+    "deny_ports": sorted(str(port) for port in _DENY_PORTS),
+    "allow": sorted(_ALLOW),
+    "time": time.time(),
+})
