@@ -1055,6 +1055,25 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 回归（实跑）：统一门禁 `total=24 failed=0`（23→24）；契约测试 `32/0`（21→32）；护栏自检 `13/0`、契约矩阵 `77/0`、B0 全绿不变；`--dry-run` RC=3。
 连接范围不变：未 push；真实 disposable 执行仍**未授权**；M5-B1 冻结。
 
+---
+
+### 9.22 结构化对账 + 步骤状态与 meta 统计一致性（第十轮 · 2026-10-06）
+
+复核方两组针对性反例又发现假绿：
+
+1. **backfill 对账用字符串包含**——`"rows_new=1" in out` 会把 `rows_new=10` 判成 1；`'"rev": 1' in shadow` 会把 `rev=10` 判成 1；primary 不存在时 `before_primary == after_primary == None` 仍通过。
+2. **最终证据复验不校验步骤状态**——只查 JSON 可解析/RUN_ID/步骤数/`ROUND_EXIT`，注入"最终 JSON 步骤改为 `ok=false` 但步骤数不变"仍返回 0、`ROUND_EXIT=0`。
+
+整改：
+
+1. **backfill 对账结构化**：新增 `_parse_int`（`rows_new=<整数>` 精确解析）、`_parse_json_line`（`BF_PRIMARY=/BF_SHADOW=` JSON 结构化解析）、`_snap_ok`（强制 `exists=1、rows=1`，primary 缺失/无行不得通过）、`_same_snap`（字段精确 + 向量逐元素容差比较）；`rev` 用整数相等（`rev==1`），`rows_new`/重跑 `rows_new==0` 均整数相等。
+2. **最终证据复验校验步骤状态与 meta 统计一致**：阶段 6 解析最终 JSON 的 steps 失败数 `count(ok=false)`，并解析 meta 的 `CHECKS_TOTAL/CHECKS_FAILED/ROUND_EXIT`，强制 `CHECKS_TOTAL==len(steps)`、`CHECKS_FAILED==count(ok=false)`、`ROUND_EXIT==2 iff failed>0`；不一致 → 紧急证据 + 返回 2。
+
+离线契约新增：`test_evidence_step_status_tamper`（篡改 ok→false 步骤数不变 → 返回 2 + 紧急证据）、`test_backfill_reconcile_parsing`（`rows_new=10≠1`、`rev=10≠1`、primary 缺失/无行不通过、结构化 JSON 解析、向量严格比较）。
+
+回归（实跑）：统一门禁 `total=24 failed=0`；契约测试 `48/0`（32→48）；护栏自检 `13/0`、契约矩阵 `77/0`、B0 全绿不变；`--dry-run` RC=3。
+连接范围不变：未 push；真实 disposable 执行仍**未授权**；M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
