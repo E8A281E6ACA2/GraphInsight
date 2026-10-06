@@ -599,6 +599,32 @@ def _dialect_gate_present(source: str) -> bool:
     )
 
 
+# 真实引擎 disposable 测试：真实引擎（非 sqlite）+ docker 独立容器编排。
+# 与 SQLite 隔离测试分开约束（见 test_real_disposable_scripts_are_isolated）。
+REAL_DISPOSABLE_ENGINE_MARKERS = (
+    "postgresql", "psycopg", "MilvusClient", "GraphDatabase.driver", "neo4j",
+)
+# 共享/其它项目的端口：真实 disposable 不得连接或发布这些端口（连上 = 碰共享栈）。
+SHARED_PORTS = frozenset({
+    "5432", "5434",                       # PostgreSQL（默认 / 共享 dev）
+    "7474", "7687",                       # Neo4j HTTP / Bolt
+    "9003", "19530", "19531", "29530", "29531",  # Milvus / 一次性栈 / 其它项目
+    "55432",                              # phase3 PG
+})
+
+
+def _is_real_disposable(source: str) -> bool:
+    """真实引擎 disposable：真实引擎（非 sqlite）+ docker 独立容器编排。
+
+    识别看本质特征（真实引擎 + docker），不把"授权门"当识别门槛——缺授权门是
+    判据之一，而不是"不识别"的理由（否则缺授权门的脚本反而逃过约束）。
+    """
+    return (
+        any(marker in source for marker in REAL_DISPOSABLE_ENGINE_MARKERS)
+        and "docker" in source
+    )
+
+
 def _db_isolation_findings(files: list) -> list:
     """对 [(path, source)] 执行共享开发库隔离判据，返回 findings（空 == 干净）。
 
@@ -613,6 +639,10 @@ def _db_isolation_findings(files: list) -> list:
             # 本守卫源码里带着被禁字面量（构造匹配规则用），不参与扫描
             continue
         if not any(marker in source for marker in ENGINE_BUILD_MARKERS):
+            continue
+        if _is_real_disposable(source):
+            # 真实引擎 disposable 不走 sqlite 隔离判据（它要连真实引擎），改由
+            # _real_disposable_findings 约束（见 test_real_disposable_scripts_are_isolated）。
             continue
         if BARE_DATABASE_URL_RE.search(source):
             findings.append(
@@ -646,6 +676,36 @@ def _db_isolation_findings(files: list) -> list:
             findings.append(
                 f"{path.name} 未把测试库指向显式 sqlite URL（sqlite:// 内存或 sqlite:/// 临时文件）"
             )
+    return findings
+
+
+def _real_disposable_findings(files: list) -> list:
+    """对真实引擎 disposable 脚本执行隔离判据，返回 findings（空 == 干净）。
+
+    作用面与 `_db_isolation_findings` 相同（建引擎/建表的脚本），只约束其中的
+    `_is_real_disposable` 命中者。判据（相互独立）：
+    1. 显式授权门（--authorize/--confirm）——真实引擎写入必须有授权，不能直接跑；
+    2. 禁止共享地址——连接/发布共享端口（连上 = 碰共享栈）；
+    3. 禁止默认 env 回落——显式钉 ADMIN_DATABASE_URL（否则回落 backend/.env 连共享库）。
+    "独立容器/卷"由识别特征（docker 编排）保证，"固定独立端口"由判据 2 的共享端口 deny 保证。
+    """
+    findings = []
+    self_name = Path(__file__).name
+    for path, source in files:
+        if path.name == self_name:
+            continue
+        if not any(marker in source for marker in ENGINE_BUILD_MARKERS):
+            continue
+        if not _is_real_disposable(source):
+            continue
+        name = path.name
+        if "--authorize" not in source and "--confirm" not in source:
+            findings.append(f"{name} 缺显式授权门（--authorize/--confirm）")
+        for match in re.finditer(r"(?:127\.0\.0\.1|localhost):(\d+)", source):
+            if match.group(1) in SHARED_PORTS:
+                findings.append(f"{name} 引用共享端口 {match.group(1)}（真实 disposable 必须独立端口）")
+        if "ADMIN_DATABASE_URL" not in source:
+            findings.append(f"{name} 未显式钉 ADMIN_DATABASE_URL（禁止默认 env 回落连共享库）")
     return findings
 
 
@@ -730,6 +790,56 @@ def test_engine_building_scripts_pin_env_url_and_dialect() -> None:
     if offenders:
         raise AssertionError("engine-building scripts must pin env file + ADMIN_DATABASE_URL + dialect gate: "
                              + "; ".join(offenders))
+
+
+def test_real_disposable_scripts_are_isolated() -> None:
+    """真实引擎 disposable 铁律：真实引擎 + 独立容器/卷 + 显式授权 + 独立端口 + 显式钉库。
+
+    与 SQLite 隔离测试**分开**（不共用、不放宽 sqlite 判据）：真实引擎 disposable 必须
+    显式授权、用独立端口（不碰共享端口）、显式钉 ADMIN_DATABASE_URL，否则一旦执行就会
+    连/写共享栈。识别特征（真实引擎 + docker）不把授权门当门槛，因此缺授权门同样判红。
+    """
+    offenders = list(_real_disposable_findings(_tracked_backend_tests("*.py")))
+
+    # 正向自证：合规的真实 disposable 样本必须放行（真进入判据，不是被作用面跳过）
+    compliant = (
+        'ADMIN_DATABASE_URL="postgresql+psycopg://gi@127.0.0.1:55433/gi_nonempty"\n'
+        'subprocess.run(["docker", "run", "-d", "--name", "gi-nonempty-pg", "-p", '
+        '"127.0.0.1:55433:5432", "postgres:16-alpine"])\n'
+        'if "--authorize" not in sys.argv:\n    raise SystemExit(3)\n'
+        "Base.metadata.create_all(engine)\n"
+    )
+    found = _real_disposable_findings([(Path("ok_disposable.py"), compliant)])
+    if found:
+        offenders.append(f"合规样本被误报：ok_disposable.py -> {found}")
+
+    # 负向自证：三类缺陷各造合成样本，必须命中对应判据（规则真在拦截而非空转）
+    cases = [
+        ("no_authz.py",
+         'ADMIN_DATABASE_URL="postgresql+psycopg://gi@127.0.0.1:55433/gi"\n'
+         'subprocess.run(["docker", "run", "gi-x-pg", "postgres:16-alpine"])\n'
+         "Base.metadata.create_all(engine)\n",
+         "缺显式授权门"),
+        ("shared_port.py",
+         'ADMIN_DATABASE_URL="postgresql+psycopg://gi@127.0.0.1:5434/gi"\n'
+         'subprocess.run(["docker", "run", "gi-x-pg", "postgres:16-alpine"])\n'
+         'if "--authorize" not in sys.argv:\n    raise SystemExit(3)\n'
+         "Base.metadata.create_all(engine)\n",
+         "共享端口"),
+        ("no_db_url.py",
+         'from pymilvus import MilvusClient\n'
+         'subprocess.run(["docker", "run", "gi-x-pg", "postgres:16-alpine"])\n'
+         'if "--authorize" not in sys.argv:\n    raise SystemExit(3)\n'
+         "Base.metadata.create_all(engine)\n",
+         "未显式钉 ADMIN_DATABASE_URL"),
+    ]
+    for name, source, expect in cases:
+        found = _real_disposable_findings([(Path(name), source)])
+        if not any(expect in item for item in found):
+            offenders.append(f"负向自证失败：{name} 应命中「{expect}」，实际 {found}")
+
+    if offenders:
+        raise AssertionError("real disposable tests must isolate: " + "; ".join(offenders))
 
 
 def _subprocess_calls_without_env(source: str) -> list:
@@ -822,6 +932,7 @@ def main() -> int:
     test_kb_scope_strict_mode_has_no_compat_toggle()
     test_sqlite_isolated_tests_use_env_file_not_blank_override()
     test_engine_building_scripts_pin_env_url_and_dialect()
+    test_real_disposable_scripts_are_isolated()
     test_windows_utf8_acceptance_chain_is_self_enforced()
     print("MIGRATION_CLEANUP_GUARDS_OK")
     return 0
