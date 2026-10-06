@@ -393,6 +393,31 @@ SEED_BF_DRIVER = (
 )
 
 
+# backfill 对账：读回 primary/shadow 的 bf_chunk 字段+向量快照（前后/重跑对比用）
+BACKFILL_RECON_DRIVER = (
+    "from pymilvus import MilvusClient\n"
+    "import json\n"
+    "uri={uri!r}; primary={primary!r}; shadow={shadow!r}; chunk={chunk!r}\n"
+    "c=MilvusClient(uri=uri)\n"
+    "def snap(name, rev_field):\n"
+    "    if not c.has_collection(name):\n"
+    "        return {{'exists': 0}}\n"
+    "    c.load_collection(collection_name=name)\n"
+    "    fields=['chunk_id','kb_id','doc_id','text','vector']\n"
+    "    if rev_field: fields.append('content_revision')\n"
+    "    rows=list(c.query(collection_name=name, filter='chunk_id == \"'+chunk+'\"', output_fields=fields, limit=10) or [])\n"
+    "    if not rows:\n"
+    "        return {{'exists': 1, 'rows': 0}}\n"
+    "    r=rows[0]\n"
+    "    v=r.get('vector')\n"
+    "    return {{'exists': 1, 'rows': 1, 'chunk_id': r.get('chunk_id'), 'kb_id': r.get('kb_id'), "
+    "        'doc_id': r.get('doc_id'), 'text': r.get('text'), 'rev': r.get('content_revision'), "
+    "        'vector': list(v) if v is not None else None}}\n"
+    "print('BF_PRIMARY=' + json.dumps(snap(primary, False), ensure_ascii=False, sort_keys=True))\n"
+    "print('BF_SHADOW=' + json.dumps(snap(shadow, True), ensure_ascii=False, sort_keys=True))\n"
+)
+
+
 def seed_backfill(tmp: Path, kb: str, bf_chunk: str, doc: str) -> None:
     """backfill 数据组：解析产物（可恢复证据）+ primary(v2) 预写向量，PG 无 current revision。
 
@@ -485,13 +510,51 @@ def verify_s1_dual_write(tmp: Path, kb: str, doc: str, chunk: str) -> None:
              "S1_SHADOW_ROWS=1" in out and "S1_SHADOW_REV=[1]" in out, out[-400:])
 
 
+def _recon_out(tmp: Path, kb: str, bf_chunk: str) -> str:
+    code, out = run_py(tmp, "-c", [BACKFILL_RECON_DRIVER.format(
+        uri=MILVUS_URI, primary=PRIMARY_COLLECTION, shadow=SHADOW_COLLECTION, chunk=bf_chunk)],
+        dual_write=True)
+    return out if code == 0 else ""
+
+
+def _extract_line(out: str, prefix: str) -> Optional[str]:
+    for line in out.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return None
+
+
 def verify_backfill(tmp: Path, kb: str, bf_chunk: str) -> None:
-    # 单向回填（backfill_versioned）：backfill 组 chunk（bf_chunk）→ rows_new=1。
-    # 需要 dual_write/shadow 生效（_upsert_backfill_versioned 依赖 resolve_dual_write().active）。
+    """单向回填（backfill_versioned）：backfill 组 chunk（bf_chunk）→ rows_new=1 + 实际存储对账。
+
+    需要 dual_write/shadow 生效（_upsert_backfill_versioned 依赖 resolve_dual_write().active）。
+    对账：primary 前后字段及向量完全不变、shadow 新增显式 content_revision=1、重跑两侧内容不变。
+    """
+    def _snapshot():
+        out = _recon_out(tmp, kb, bf_chunk)
+        return _extract_line(out, "BF_PRIMARY="), _extract_line(out, "BF_SHADOW=")
+
+    before_primary, before_shadow = _snapshot()
+
     code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
     add_step("单向回填：backfill 退出 0", code == 0, out[-400:])
     add_step("单向回填：rows_new=1（backfill 组 bf_chunk）", "rows_new=1" in out, out[-400:])
+
+    after_primary, after_shadow = _snapshot()
+    add_step("单向回填：primary 前后字段及向量完全不变",
+             before_primary is not None and before_primary == after_primary,
+             f"before={before_primary} after={after_primary}")
+    add_step("单向回填：shadow 新增显式 content_revision=1",
+             after_shadow is not None and '"rev": 1' in after_shadow, after_shadow)
+
+    code2, out2 = run_py(tmp, "admin/backfill_chunk_revisions.py",
+                         ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
+    add_step("单向回填：重跑 rows_new=0", code2 == 0 and "rows_new=0" in out2, out2[-400:])
+    rerun_primary, rerun_shadow = _snapshot()
+    add_step("单向回填：重跑两侧内容不变",
+             rerun_primary == after_primary and rerun_shadow == after_shadow,
+             f"primary_same={rerun_primary == after_primary} shadow_same={rerun_shadow == after_shadow}")
 
 
 def verify_readback(tmp: Path, kb: str, s1_chunk: str, bf_chunk: str) -> None:
@@ -712,6 +775,30 @@ def write_evidence(base: Path, run_id: str, exec_time: str) -> int:
         _dump_meta(finalized_failed)
     except Exception as exc:  # noqa: BLE001
         _write_emergency_evidence(base, run_id, exec_time, f"finalize_write_failed:{type(exc).__name__}")
+        return 2
+
+    # 阶段 6：复验**最终落盘版本**（P1：不能只复验初版；重写后必须读回最终文件，
+    # 否则"第二次写入损坏/不一致"会静默返回 0 + ROUND_EXIT=0）。
+    expected_round_exit = "ROUND_EXIT=%d" % (2 if finalized_failed else 0)
+    try:
+        final_doc = json.loads(steps_path.read_text(encoding="utf-8"))
+        final_meta_text = meta_path.read_text(encoding="utf-8")
+        final_ok = (
+            final_doc.get("run_id") == run_id
+            and isinstance(final_doc.get("steps"), list)
+            and len(final_doc.get("steps")) == len(final_snapshot)
+            and f"RUN_ID={run_id}" in final_meta_text
+            and expected_round_exit in final_meta_text
+        )
+        final_detail = "" if final_ok else "最终落盘内容与预期不一致"
+    except Exception as exc:  # noqa: BLE001
+        final_ok = False
+        final_detail = f"{type(exc).__name__}: {exc}"
+
+    if not final_ok:
+        add_step("证据合同复验（最终落盘版本：JSON 可解析 + RUN_ID 一致 + 步骤数/ROUND_EXIT 自洽）",
+                 False, final_detail)
+        _write_emergency_evidence(base, run_id, exec_time, f"finalize_verify_failed:{final_detail}")
         return 2
 
     return 2 if finalized_failed else 0
