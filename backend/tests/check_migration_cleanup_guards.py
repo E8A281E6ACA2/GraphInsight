@@ -625,6 +625,41 @@ def _is_real_disposable(source: str) -> bool:
     )
 
 
+# 宿主地址:端口（含远程/非回环形态）：真实 disposable 连/发布这些端口的共享值即判红。
+HOST_ADDR_RE = re.compile(
+    r"(?:\d{1,3}(?:\.\d{1,3}){3}|localhost|0\.0\.0\.0|host\.docker\.internal|\[::1\]|::1):(\d{2,5})"
+)
+
+
+def _shared_port_findings(source: str) -> list:
+    """用 AST 提取代码里的共享端口引用（排除注释），返回 findings 片段。
+
+    堵三类漏洞（相对纯正则）：
+    - 拼接地址：端口常量定义 `XXX_PORT = 5434`（f-string 拼端口时连接串里匹配不到数字，改查常量值）；
+    - 远程共享端口：匹配任意宿主地址（0.0.0.0 / IPv4 / host.docker.internal / localhost / ::1）；
+    - 注释豁免：AST 只扫描代码节点，注释里的端口说明（如"避开共享 5434"）不参与。
+    """
+    findings = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return findings
+    for node in ast.walk(tree):
+        # 端口常量定义：*_PORT = 整数（堵 f-string 拼接地址）
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.upper().endswith("PORT"):
+                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, int):
+                        if str(node.value.value) in SHARED_PORTS:
+                            findings.append(f"端口常量 {target.id}={node.value.value} 命中共享端口")
+        # 字符串字面量里的宿主地址:端口（堵远程/非回环共享端口）
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for match in HOST_ADDR_RE.finditer(node.value):
+                if match.group(1) in SHARED_PORTS:
+                    findings.append(f"连接宿主地址 {match.group(0)} 命中共享端口 {match.group(1)}")
+    return findings
+
+
 def _db_isolation_findings(files: list) -> list:
     """对 [(path, source)] 执行共享开发库隔离判据，返回 findings（空 == 干净）。
 
@@ -701,9 +736,8 @@ def _real_disposable_findings(files: list) -> list:
         name = path.name
         if "--authorize" not in source and "--confirm" not in source:
             findings.append(f"{name} 缺显式授权门（--authorize/--confirm）")
-        for match in re.finditer(r"(?:127\.0\.0\.1|localhost):(\d+)", source):
-            if match.group(1) in SHARED_PORTS:
-                findings.append(f"{name} 引用共享端口 {match.group(1)}（真实 disposable 必须独立端口）")
+        for finding in _shared_port_findings(source):
+            findings.append(f"{name} {finding}（真实 disposable 必须独立端口）")
         if "ADMIN_DATABASE_URL" not in source:
             findings.append(f"{name} 未显式钉 ADMIN_DATABASE_URL（禁止默认 env 回落连共享库）")
     return findings
@@ -801,8 +835,11 @@ def test_real_disposable_scripts_are_isolated() -> None:
     """
     offenders = list(_real_disposable_findings(_tracked_backend_tests("*.py")))
 
-    # 正向自证：合规的真实 disposable 样本必须放行（真进入判据，不是被作用面跳过）
+    # 正向自证：合规的真实 disposable 样本必须放行（真进入判据，不是被作用面跳过）。
+    # 注释里带共享端口说明（5434/19530）——AST 只扫代码，注释豁免、不判红。
     compliant = (
+        '# 独立端口：避开共享 5434/19530（注释豁免，不判红）\n'
+        "PG_PORT = 55433\n"
         'ADMIN_DATABASE_URL="postgresql+psycopg://gi@127.0.0.1:55433/gi_nonempty"\n'
         'subprocess.run(["docker", "run", "-d", "--name", "gi-nonempty-pg", "-p", '
         '"127.0.0.1:55433:5432", "postgres:16-alpine"])\n'
@@ -813,7 +850,7 @@ def test_real_disposable_scripts_are_isolated() -> None:
     if found:
         offenders.append(f"合规样本被误报：ok_disposable.py -> {found}")
 
-    # 负向自证：三类缺陷各造合成样本，必须命中对应判据（规则真在拦截而非空转）
+    # 负向自证：各类缺陷各造合成样本，必须命中对应判据（规则真在拦截而非空转）
     cases = [
         ("no_authz.py",
          'ADMIN_DATABASE_URL="postgresql+psycopg://gi@127.0.0.1:55433/gi"\n'
@@ -822,6 +859,20 @@ def test_real_disposable_scripts_are_isolated() -> None:
          "缺显式授权门"),
         ("shared_port.py",
          'ADMIN_DATABASE_URL="postgresql+psycopg://gi@127.0.0.1:5434/gi"\n'
+         'subprocess.run(["docker", "run", "gi-x-pg", "postgres:16-alpine"])\n'
+         'if "--authorize" not in sys.argv:\n    raise SystemExit(3)\n'
+         "Base.metadata.create_all(engine)\n",
+         "共享端口"),
+        ("concat_shared_port.py",
+         'PG_PORT = 5434\n'
+         'ADMIN_DATABASE_URL=f"postgresql+psycopg://gi@127.0.0.1:{PG_PORT}/gi"\n'
+         'subprocess.run(["docker", "run", "gi-x-pg", "postgres:16-alpine"])\n'
+         'if "--authorize" not in sys.argv:\n    raise SystemExit(3)\n'
+         "Base.metadata.create_all(engine)\n",
+         "共享端口"),
+        ("remote_shared_port.py",
+         'ADMIN_DATABASE_URL="postgresql+psycopg://gi@127.0.0.1:55433/gi"\n'
+         'MILVUS_URI="http://0.0.0.0:19530"\n'
          'subprocess.run(["docker", "run", "gi-x-pg", "postgres:16-alpine"])\n'
          'if "--authorize" not in sys.argv:\n    raise SystemExit(3)\n'
          "Base.metadata.create_all(engine)\n",
