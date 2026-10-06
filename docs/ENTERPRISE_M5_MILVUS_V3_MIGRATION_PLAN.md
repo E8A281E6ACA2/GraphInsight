@@ -1012,6 +1012,22 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 回归（实跑）：统一门禁 `total=23 failed=0`；契约矩阵 `77/0`、护栏自检 `12/0`、B0 全绿不变。
 连接范围不变：零真实服务连接，未 push；M5-B1 冻结。
 
+---
+
+### 9.19 disposable 执行器四项实质缺陷修复 + socket 级阻断证据（第七轮 · 2026-10-06）
+
+复核指出第六轮 disposable 执行器仍有四处实质缺陷（均为 BLOCKED 级），本轮修复：
+
+1. **env 未真正传递**：`run_py()` 构造了 `base_env()` 却未传给 `_run()`（`ENV_FORWARDED=False`）。修复：`_run()` 增加 `env` 参数，`run_py()` 传 `env=env`（离线复验 `ENV_FORWARDED=True`）。
+2. **就绪失败不抛异常**：`ensure_containers()` 就绪失败只记 FAIL、继续迁移播种。修复：就绪失败 `raise RuntimeError`（fail-closed），由 main 的 except 记入失败证据并停止。
+3. **清理所有权守卫不完整**：`cleanup()` 即使 `CREATED_RESOURCES=False` 仍连 Neo4j/Milvus 删 collection。修复：新增 `SEEDED` 标志（`seed_nonempty` 成功后才置位），Neo4j/Milvus 清理仅在 `SEEDED` 时执行，未播种不得连接任何引擎。
+4. **证据合同复验必然失败**：`write_evidence()` 写完 JSON 后又 `add_step`，导致 `len(read_back["steps"]) == len(STEPS)` 恒假（`EVIDENCE_CONTRACT_OK=False`），且 meta 仍写 `ROUND_EXIT=0`。修复：落盘用 `steps_snapshot` 快照、复验比较快照长度、`round_exit` 在复验之后计算（复验失败 → `ROUND_EXIT=2`）。离线复验：`复验步骤 ok=True`、`ROUND_EXIT=0`、`steps_in_json=2`。
+
+**socket 级阻断证据**：门禁输出仍出现 `成功连接到 Neo4j: bolt://localhost:7687`（离线替身让 `verify_connectivity` 返回 None 的假信号）。补 netguard 自检 N12：**不带离线替身**、直接 `socket.create_connection(('localhost', 7687))` → netguard 在 socket 层拦截并留痕 `blocked_connect`——证明"零真实服务连接"有 socket 级第二道防线，不依赖 driver 层替身。
+
+回归（实跑）：统一门禁 `total=23 failed=0`；护栏自检 `13/0`（12→13，N12）；契约矩阵 `77/0`、B0 全绿不变。
+连接范围不变：未 push；真实 disposable 执行仍**未授权**（本轮仅修复执行器，未执行真实容器）；M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
