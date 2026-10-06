@@ -181,6 +181,12 @@ def get_vector_store_runtime_config() -> Dict[str, Any]:
         # 留空 = 不限制；tenant/project 可选，非空则逐 chunk 校验。
         "write_scope": {
             "kb_ids": _to_str_list(loaded.get("write_scope_kb_ids"), settings.milvus_write_scope_kb_ids),
+            # 是否**被显式配置过**（含"只写了逗号"这类非法形态）：消费方据此区分
+            # "未配置 = 不限制 KB" 与 "配置非法 = 拒绝"，后者不得退化成无限制（P1-4）。
+            "kb_ids_configured": bool(
+                str(loaded.get("write_scope_kb_ids") or "").strip()
+                or str(getattr(settings, "milvus_write_scope_kb_ids_raw", "") or "").strip()
+            ),
             "tenant_id": _first_non_empty(loaded.get("write_scope_tenant"), settings.milvus_write_scope_tenant),
             "project_id": _first_non_empty(loaded.get("write_scope_project"), settings.milvus_write_scope_project),
         },

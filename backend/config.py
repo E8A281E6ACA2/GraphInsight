@@ -140,8 +140,11 @@ class Settings:
         # 写入范围（canary 保护）：MILVUS_DUAL_WRITE 是**进程全局**开关，开启后所有 KB 都走扇出；
         # 授权通常只覆盖单个目标 KB，故需要一份 KB 级限制把全局开关收敛回目标 KB。
         # 逗号分隔；**留空 = 不限制**（保持历史行为）。布尔/名单非敏感，经 runtime_config 透出。
+        # 原始值必须保留：用于区分"**未配置**（= 不限制 KB）"与"**配置非法**（如只写了逗号 →
+        # 解析为空）"。后者绝不能退化成"无限制"（P1-4 修复）。
+        self.milvus_write_scope_kb_ids_raw = os.getenv("MILVUS_WRITE_SCOPE_KB_IDS", "").strip()
         self.milvus_write_scope_kb_ids = [
-            item.strip() for item in os.getenv("MILVUS_WRITE_SCOPE_KB_IDS", "").split(",") if item.strip()
+            item.strip() for item in self.milvus_write_scope_kb_ids_raw.split(",") if item.strip()
         ]
         self.milvus_write_scope_tenant = os.getenv("MILVUS_WRITE_SCOPE_TENANT", "").strip()
         self.milvus_write_scope_project = os.getenv("MILVUS_WRITE_SCOPE_PROJECT", "").strip()

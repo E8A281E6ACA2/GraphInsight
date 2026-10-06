@@ -40,6 +40,7 @@ REASON_VERIFY_MISMATCH = "VERIFY_MISMATCH"
 REASON_VERIFY_UNAVAILABLE = "VERIFY_UNAVAILABLE"
 REASON_KB_NOT_ALLOWED = "KB_NOT_ALLOWED"
 REASON_SCOPE_MISMATCH = "SCOPE_MISMATCH"
+REASON_SCOPE_CONFIG_INVALID = "SCOPE_CONFIG_INVALID"
 REASON_COLLECTION_NOT_WRITABLE = "COLLECTION_NOT_WRITABLE"
 
 
@@ -309,19 +310,33 @@ class MilvusVectorStore:
         kb_ids = scope.get("kb_ids") or []
         if isinstance(kb_ids, str):
             kb_ids = [item.strip() for item in kb_ids.split(",") if item.strip()]
+        parsed = [str(item).strip() for item in kb_ids if str(item).strip()]
+        configured = scope.get("kb_ids_configured")
+        if configured is None:
+            # 兼容未提供该标志的旧配置源：只要能拿到原始值，就按"解析为空但给过值 = 非法"判定
+            configured = bool(str(scope.get("kb_ids_raw") or "").strip() or parsed)
         return {
-            "kb_ids": [str(item).strip() for item in kb_ids if str(item).strip()],
+            "kb_ids": parsed,
+            "kb_ids_configured": bool(configured),
+            # 配置过 KB 名单但解析为空（典型：`MILVUS_WRITE_SCOPE_KB_IDS=","`）→ **非法**，
+            # 绝不允许退化成"无限制"（P1-4）。
+            "invalid": bool(configured) and not parsed,
             "tenant_id": str(scope.get("tenant_id") or "").strip(),
             "project_id": str(scope.get("project_id") or "").strip(),
         }
 
     def _guard_write_scope(self, chunks: List[VectorChunk], collection: str, operation: str) -> None:
-        """mutation 前校验：目标 KB / tenant / project / collection 均须在授权范围内。
+        """mutation 前校验：collection / KB 名单 / tenant / project **各自独立生效**。
 
-        - 未配置 kb_ids（默认）→ 不限制，行为与历史一致；
-        - 配置后：非名单 KB 一律拒（`KB_NOT_ALLOWED`），tenant/project 非空时必须逐 chunk 相等
-          （`SCOPE_MISMATCH`）；collection 只能是本次解析出的 primary/shadow（`COLLECTION_NOT_WRITABLE`）。
-        - 逐 chunk 判定，**任一不合规即整批拒**（不部分写）。
+        P1-4 修复前的问题：KB 名单为空即 `return` 提前放行，把 tenant/project 限制一并跳过；
+        且 `MILVUS_WRITE_SCOPE_KB_IDS=","` 解析为空后被当成"无限制"。现在的判定顺序：
+
+        1. collection 必须是本次解析出的 primary/shadow（`COLLECTION_NOT_WRITABLE`）；
+        2. KB 名单**被配置过但解析为空** → 拒绝（`SCOPE_CONFIG_INVALID`，非法不得变成无限制）；
+        3. KB 名单非空 → 逐 chunk 必须命中（`KB_NOT_ALLOWED`）；
+        4. tenant / project 只要被配置就逐 chunk 校验（**与 KB 名单是否为空无关**，`SCOPE_MISMATCH`）。
+
+        逐 chunk 判定，任一不合规即**整批拒绝**（零 mutation，不部分写）。
         """
         dw = self.resolve_dual_write()
         allowed_collections = {c for c in (dw.get("primary"), dw.get("shadow")) if c}
@@ -332,30 +347,43 @@ class MilvusVectorStore:
                 reason=REASON_COLLECTION_NOT_WRITABLE,
             )
         scope = self.resolve_write_scope()
-        kb_ids = scope["kb_ids"]
-        if not kb_ids:
-            return
+        if scope["invalid"]:
+            raise VectorWriteContractError(
+                f"write_scope.kb_ids 已配置但解析为空（配置非法），拒绝执行 {operation}（零写入）；"
+                "请修正配置或显式清空该键",
+                reason=REASON_SCOPE_CONFIG_INVALID,
+            )
+        allowed_kbs = scope["kb_ids"]
         for chunk in chunks:
             kb_id = str(chunk.kb_id or "")
-            if kb_id not in kb_ids:
+            if allowed_kbs and kb_id not in allowed_kbs:
                 raise VectorWriteContractError(
-                    f"KB {kb_id!r} 不在授权写入范围 {kb_ids} 内，拒绝执行 {operation}（零写入）",
+                    f"KB {kb_id!r} 不在授权写入范围 {allowed_kbs} 内，拒绝执行 {operation}（零写入）",
                     reason=REASON_KB_NOT_ALLOWED,
                 )
             if scope["tenant_id"] and str(chunk.tenant_id or "") != scope["tenant_id"]:
                 raise VectorWriteContractError(
-                    f"KB {kb_id!r} 的 tenant_id 与授权范围不一致，拒绝执行 {operation}",
+                    f"KB {kb_id!r} 的 tenant_id 与授权范围不一致，拒绝执行 {operation}（零写入）",
                     reason=REASON_SCOPE_MISMATCH,
                 )
             if scope["project_id"] and str(chunk.project_id or "") != scope["project_id"]:
                 raise VectorWriteContractError(
-                    f"KB {kb_id!r} 的 project_id 与授权范围不一致，拒绝执行 {operation}",
+                    f"KB {kb_id!r} 的 project_id 与授权范围不一致，拒绝执行 {operation}（零写入）",
                     reason=REASON_SCOPE_MISMATCH,
                 )
 
     def _guard_kb_write_scope(self, kb_ids: List[str], operation: str) -> None:
-        """按 KB 名单校验的轻量版本（delete/clear 等没有 chunk 对象的路径）。"""
+        """按 KB 名单校验的轻量版本（delete/clear 等没有 chunk 对象的路径）。
+
+        与 `_guard_write_scope` 同口径：非法配置拒绝；KB 名单为空**不**代表可以跳过校验
+        （此处没有 tenant/project 可校验，但仍须先判非法配置）。
+        """
         scope = self.resolve_write_scope()
+        if scope["invalid"]:
+            raise VectorWriteContractError(
+                f"write_scope.kb_ids 已配置但解析为空（配置非法），拒绝执行 {operation}（零写入）",
+                reason=REASON_SCOPE_CONFIG_INVALID,
+            )
         allowed = scope["kb_ids"]
         if not allowed:
             return
@@ -435,13 +463,34 @@ class MilvusVectorStore:
             logger.warning("加载 Milvus collection 失败", context={"collection": collection, "error": str(exc)})
         self._collection_ready = True
 
+    # 行内保留字段：身份 / 作用域 / 内容 / 向量 / 版本。
+    # P1-3 修复：metadata 一律不得覆盖这些键——此前 `**(chunk.metadata or {})` 展开在显式字段之前，
+    # 导致 metadata 里的 content_revision=99 能覆盖"剥版本"的结果、甚至覆盖 chunk_id/vector。
+    RESERVED_ROW_FIELDS = frozenset({
+        "chunk_id", "doc_id", "kb_id", "tenant_id", "project_id",
+        "text", "title", "location", "content_hash", "embedding_model",
+        "entities_json", "vector", "content_revision",
+    })
+
     @staticmethod
     def _build_rows(chunks: List[VectorChunk], vectors: List[List[float]]) -> List[Dict[str, Any]]:
         import json
 
         rows = []
         for chunk, vector in zip(chunks, vectors):
+            # 非保留的 metadata 先落（自定义扩展字段），保留字段随后显式覆盖；
+            # metadata 中出现的保留键**直接丢弃并告警**（不静默、也不允许"顺手写入"）。
+            extra: Dict[str, Any] = {}
+            for key, value in (chunk.metadata or {}).items():
+                if key in MilvusVectorStore.RESERVED_ROW_FIELDS:
+                    logger.warning(
+                        "VectorChunk.metadata 含保留字段，已丢弃（不得覆盖身份/内容/向量/版本）",
+                        context={"chunk_id": chunk.chunk_id, "field": str(key)},
+                    )
+                    continue
+                extra[key] = value
             row = {
+                **extra,
                 "chunk_id": chunk.chunk_id,
                 "doc_id": chunk.doc_id,
                 "text": (chunk.text or "")[:4096],
@@ -451,13 +500,15 @@ class MilvusVectorStore:
                 "embedding_model": (chunk.embedding_model or "")[:128],
                 "entities_json": json.dumps(chunk.entities or [], ensure_ascii=False)[:2048],
                 "vector": vector,
-                **(chunk.metadata or {}),
-                # 作用域与版本号以 VectorChunk 显式字段为准，元数据不能覆盖
+                # 作用域以 VectorChunk 显式字段为准，元数据不能覆盖
                 "kb_id": chunk.kb_id,
                 "tenant_id": chunk.tenant_id,
                 "project_id": chunk.project_id,
             }
-            if chunk.content_revision is not None:
+            if chunk.content_revision is None:
+                # "剥版本"必须是**彻底移除该键**（含 metadata 残留），不是留空值
+                row.pop("content_revision", None)
+            else:
                 row["content_revision"] = int(chunk.content_revision)
             rows.append(row)
         return rows
@@ -542,6 +593,68 @@ class MilvusVectorStore:
         except Exception:  # noqa: BLE001
             return None
         return {str(row.get("chunk_id") or "") for row in rows if isinstance(row, dict)}
+
+    def write_targets(self, intent: str = WRITE_INTENT_ONLINE) -> List[Dict[str, Any]]:
+        """本次意图的**写入目标清单**（写后读回的统一依据）。
+
+        每个目标：`{"collection": 名, "carries_version": bool}`
+        - 在线 S1：primary 恒在（legacy v2 无显式字段时 `carries_version=False`，即"剥版本写"）；
+          shadow 仅在 dual_write 生效且配置了 shadow 时加入（`carries_version=True`）。
+        - 历史回填：只有 shadow（`carries_version=True`）。
+
+        读回必须覆盖**全部**目标——任一目标不可读或不一致都不得标 indexed（P1-2 修复：
+        此前只读回 primary，注入"primary 新、shadow 陈旧/异常"仍被判 indexed）。
+        """
+        dw = self.resolve_dual_write()
+        if intent == WRITE_INTENT_BACKFILL:
+            shadow = str(dw.get("shadow") or "")
+            return [{"collection": shadow, "carries_version": True}] if shadow else []
+        primary = str(dw.get("primary") or "")
+        targets = [{"collection": primary, "carries_version": self.has_content_revision_field(primary)}]
+        if dw.get("active") and str(dw.get("shadow") or ""):
+            targets.append({"collection": str(dw["shadow"]), "carries_version": True})
+        return targets
+
+    def verify_write_targets(
+        self,
+        expected: Dict[str, Dict[str, Any]],
+        intent: str = WRITE_INTENT_ONLINE,
+    ) -> Dict[str, Any]:
+        """对**全部**写入目标做写后读回，返回逐目标三态汇总。
+
+        `expected`: `{chunk_id: {"text": str, "content_revision": int|None}}`（逐 chunk 自带版本，
+        因为同一批可能包含不同 target_revision）。版本期望按目标决定：`carries_version` 的目标
+        期望逐 chunk 版本号（**取不到版本即视为不可校验**），剥版本的目标（legacy v2）期望该键不存在。
+
+        返回 `{"ok": bool, "results": {collection: True|False|None}, "reason": str}`；
+        **任一目标 False（不一致）或 None（不可读/无法校验）→ ok=False**，调用方不得标 indexed。
+        """
+        results: Dict[str, Any] = {}
+        for target in self.write_targets(intent):
+            collection = str(target.get("collection") or "")
+            if not collection:
+                results[""] = False
+                continue
+            want: Dict[str, Dict[str, Any]] = {}
+            for chunk_id, item in expected.items():
+                revision = item.get("content_revision")
+                if target.get("carries_version") and revision is None:
+                    # 版本承载侧必须有版本可比对；取不到版本 → 该目标不可校验（ok=False 口径）
+                    want[str(chunk_id)] = {"content_revision": None, "text": item.get("text")}
+                    results[collection] = None
+                    break
+                want[str(chunk_id)] = {
+                    "content_revision": int(revision) if target.get("carries_version") else None,
+                    "text": item.get("text"),
+                }
+            if collection not in results:
+                results[collection] = self.verify_versioned_rows(collection, want)
+        bad = sorted(name for name, state in results.items() if state is not True)
+        return {
+            "ok": not bad,
+            "results": results,
+            "reason": "" if not bad else "VERIFY_FAILED:" + ",".join(bad),
+        }
 
     def _upsert_backfill_versioned(
         self, dw: Dict[str, Any], chunks: List[VectorChunk], vectors: List[List[float]], dimension: Optional[int]

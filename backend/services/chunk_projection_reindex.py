@@ -350,40 +350,6 @@ def _existing_milvus_fields(kb_id: str, chunk_ids: List[str]) -> Dict[str, Dict[
     return merged
 
 
-def _verify_milvus_readback(
-    kb_id: str,
-    items: List[Dict[str, Any]],
-    collection: str,
-) -> Optional[bool]:
-    """写入后回读校验（审计发现 F2）。
-
-    返回三态，**绝不把"没校验"读成"已校验"**：
-      True  = 每条 chunk 都能读回，且 `content_revision == target`、`text` 与写入内容一致；
-      False = 读回成功但与写入不一致（调用方必须记 write_failed，禁止标 indexed）；
-      None  = 无法校验（store 未启用 / client 不支持 query / 读回抛错）→ 告警并保留数量口径。
-
-    **统一实现**：读回判定只有 `services/vector_store.MilvusVectorStore.verify_versioned_rows`
-    一份（回填契约也用它），本函数只做"worker 语境下的映射"：把 store 的三态结果
-    原样返回（True/False/None），不在这里再复制一份比较逻辑。
-    """
-    from services.vector_store import vector_store
-
-    expected = {
-        str(item.get("chunk_id") or ""): {
-            "content_revision": item.get("target_revision"),
-            "text": item.get("content"),
-        }
-        for item in items
-    }
-    verified = vector_store.verify_versioned_rows(collection, expected)
-    if verified is None:
-        logger.warning(
-            "reindex_chunks 写入后回读不可用（store 侧无法校验，按未验证处理）",
-            context={"kb_id": kb_id, "collection": collection},
-        )
-    return verified
-
-
 def _write_milvus_projection(
     kb_id: str,
     items: List[Dict[str, Any]],
@@ -397,7 +363,13 @@ def _write_milvus_projection(
     同一判据的边界守卫，任一失败都记 write_failed，不写不可靠版本。
     """
     from services.embedding_service import embedding_service
-    from services.vector_store import VectorChunk, vector_store
+    from services.vector_store import (
+        REASON_SHADOW_FIELD_MISSING,
+        REASON_SHADOW_NOT_ACTIVE,
+        VectorChunk,
+        VectorStoreSchemaError,
+        vector_store,
+    )
 
     outcome: Dict[str, str] = {}
     if not items:
@@ -444,26 +416,40 @@ def _write_milvus_projection(
             )
         try:
             written = vector_store.upsert_chunks(chunks, vectors)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("reindex_chunks Milvus upsert 失败", context={"kb_id": kb_id, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - 契约拒绝/落库异常都必须逐 chunk 如实记态
+            # 版本无处可靠承载（§8.5：primary 缺字段且无生效 shadow）→ 保持 pending，不是失败；
+            # 其它契约违约（范围/归属/读回等）→ write_failed。
+            reason = str(getattr(exc, "reason", "") or "")
+            version_carrier_missing = reason in (
+                REASON_SHADOW_NOT_ACTIVE, REASON_SHADOW_FIELD_MISSING,
+            ) or (not reason and isinstance(exc, VectorStoreSchemaError))
+            state = OUTCOME_REVISION_FIELD_ABSENT if version_carrier_missing else OUTCOME_WRITE_FAILED
+            logger.warning(
+                "reindex_chunks Milvus upsert 被拒/失败",
+                context={"kb_id": kb_id, "state": state, "reason": reason or type(exc).__name__},
+            )
             for item in batch:
-                outcome[item["chunk_id"]] = OUTCOME_WRITE_FAILED
+                outcome[item["chunk_id"]] = state
             continue
         state = OUTCOME_INDEXED if written == len(chunks) else OUTCOME_WRITE_FAILED
         if state == OUTCOME_INDEXED:
-            # F2：数量确认之后必须再回读校验（写入 != 可读回）。读回不一致 → fail-closed 记 write_failed。
-            collection = str((vector_store.config() or {}).get("collection") or "")
-            verified = _verify_milvus_readback(kb_id, batch, collection)
-            if verified is False:
-                logger.warning(
-                    "reindex_chunks 写入后回读不一致 → 记 write_failed（fail-closed）",
-                    context={"kb_id": kb_id, "collection": collection, "chunks": len(chunks)},
-                )
+            # P1-2 修复：对**本次意图涉及的全部写入目标**统一读回（primary + 生效的 shadow）。
+            # 任何目标不一致或不可读（None）都不得标 indexed——此前只读回 primary 且把 None 当通过，
+            # 注入"primary 新、shadow=999"仍会判 indexed。
+            expected = {
+                item["chunk_id"]: {"text": item["content"], "content_revision": item["target_revision"]}
+                for item in batch
+            }
+            verdict = vector_store.verify_write_targets(expected)
+            if not verdict.get("ok"):
                 state = OUTCOME_WRITE_FAILED
-            elif verified is None:
                 logger.warning(
-                    "reindex_chunks 写入后回读不可用：本批 indexed 仅基于 upsert 数量确认（未回读）",
-                    context={"kb_id": kb_id, "collection": collection},
+                    "reindex_chunks 写入后读回未通过 → 记 write_failed（fail-closed）",
+                    context={
+                        "kb_id": kb_id,
+                        "results": {k: v for k, v in (verdict.get("results") or {}).items()},
+                        "reason": verdict.get("reason"),
+                    },
                 )
         for item in batch:
             outcome[item["chunk_id"]] = state
@@ -611,18 +597,24 @@ def reindex_chunks(*, job_id: int, payload: Dict[str, Any], scope: Dict[str, str
     vector_blocked = ""
     vector_outcome: Dict[str, str] = {}
     if vector_write:
-        from services.vector_store import vector_store
-
-        if not vector_store.has_content_revision_field():
-            # §8.5：collection 无显式字段就不写不可靠版本，投影保持 pending 等 v3 迁移
+        # P1-1 修复：这里**不再**用 `has_content_revision_field()`（只看 primary）做前置拦截——
+        # 那会让 legacy v2 在还没走到统一入口时就被拒，S1 路径永远不可达。判据统一交给
+        # `_write_milvus_projection` → `vector_store.upsert_chunks`（唯一写入契约）：
+        #   primary 缺字段 + shadow 生效 → primary 剥版本写、版本由 shadow 承载；
+        #   primary 缺字段 + 无 shadow    → 契约抛错，逐 chunk 记 revision_field_absent（保持 pending）；
+        #   其它契约违约（范围/归属/读回）→ 逐 chunk 记 write_failed。
+        vector_outcome = _write_milvus_projection(
+            kb_id,
+            vector_write,
+            tenant_id=scope["tenant_id"],
+            project_id=scope["project_id"],
+        )
+        if OUTCOME_REVISION_FIELD_ABSENT in vector_outcome.values():
+            # 版本无处可靠承载（legacy v2 且**无生效 shadow**）：仍是终态 `INDEX_UNAVAILABLE`
+            # （不自动重试，等 v3 迁移后重新入队），投影保持 pending——与旧口径一致；
+            # 区别只在判据来源：由统一契约的逐 chunk 结果判定，而不是"只看 primary 有没有字段"的
+            # 前置拦截（后者会让 legacy v2 + 生效 shadow 的 S1 路径永远不可达，即 P1-1）。
             vector_blocked = OUTCOME_REVISION_FIELD_ABSENT
-        else:
-            vector_outcome = _write_milvus_projection(
-                kb_id,
-                vector_write,
-                tenant_id=scope["tenant_id"],
-                project_id=scope["project_id"],
-            )
 
     # 复核 3：回写状态前确认 current 未被并发编辑移动
     post = _load_current_rows(kb_id, [item["chunk_id"] for item in items])
