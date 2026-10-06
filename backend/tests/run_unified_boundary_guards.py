@@ -83,13 +83,20 @@ def _netguard_problems(status: dict, violations: dict, combined_output: str) -> 
 
     判据（相互独立）：
       1. **加载留痕存在**——没有它 = 隔离根本没生效；
-      2. 留痕**不得损坏**（坏行/读取失败都算证据损坏，不得折为空后放行）；
-      3. 违规留痕必须为空；
-      4. stdout/stderr 出现拦截标记但无违规留痕 = 护栏状态异常（含"留痕写入失败"的回退信号）。
+      2. 加载留痕里必须有**有效的 `event=guard_loaded` 记录**——空文件、无关 JSON 对象都不能算
+         "已加载"（P2：只检查文件存在会让"空加载文件"假绿）；
+      3. 留痕**不得损坏**（坏行/读取失败都算证据损坏，不得折为空后放行）；
+      4. 违规留痕必须为空；
+      5. stdout/stderr 出现拦截标记但无违规留痕 = 护栏状态异常（含"留痕写入失败"的回退信号）。
     """
     problems: list[str] = []
+    loaded = any(item.get("event") == "guard_loaded" for item in status.get("records", []))
     if not status.get("exists"):
         problems.append("[NETGUARD] 未发现护栏加载留痕：隔离未生效（PYTHONPATH/sitecustomize 注入失败）")
+    elif not loaded:
+        problems.append(
+            "[NETGUARD] 加载留痕存在但无有效 event=guard_loaded 记录（空文件或无关 JSON 对象），隔离未生效"
+        )
     if status.get("error"):
         problems.append(f"[NETGUARD] 加载留痕读取失败（证据不可用）：{status['error']}")
     if status.get("bad_lines"):

@@ -692,41 +692,65 @@ class MilvusVectorStore:
 
         Milvus 在 `enable_dynamic_field=True` 时会把 schema 之外的键放进 `$meta`（JSON）。所以
         "collection 没有显式 content_revision 字段"**不等于**"行里没有版本键"——`revision` 可能以
-        dynamic metadata 形式残留（这正是 §8.5 要冻结的形态）。判定规则：
+        dynamic metadata 形式残留（这正是 §8.5 要冻结的形态）。
+
+        **真实 SDK 形态（pymilvus 3.x）**：查询 `$meta` 时解码器会把它**展开为顶层字段**，即返回
+        `{"chunk_id": "...", "content_revision": 99}`，`$meta` 键本身不存在。因此观察残留必须同时
+        认两种形态：`$meta` dict（pymilvus 2.x）与顶层展开键（pymilvus 3.x）——见
+        `_dynamic_version_residual`。判定规则：
 
         - 显式字段存在 → 由显式字段观察（不走本函数）；
         - 动态字段关闭 → 版本无处可存 → `absent`（结构性事实）；
-        - 动态字段开启（或未知但可查到 `$meta`）→ 查 `$meta`：出现非空 `content_revision` → `residual`；
-          确认无该键 → `absent`；
-        - **观察不到动态渠道**（无法确定是否开启、`$meta` 查询不可用）→ `unavailable`（调用方必须返回
-          "不可校验"，不得判 absent 成立）。
+        - 动态字段开启（或未知但可查到 `$meta`）→ 查 `$meta`：每行都观察到、出现非空
+          `content_revision` → `residual`；每行都观察到且均无残留 → `absent`；
+        - **缺行**（返回行数不足，有 chunk 没读到）→ `unavailable`（不能据此断言"无残留"）；
+        - **结果不可解释**（`$meta` 解析失败）或**观察不到动态渠道**（`$meta` 查询失败）→
+          `unavailable`（调用方必须返回"不可校验"，不得判 absent 成立）。
         """
         enabled = self.dynamic_field_enabled(collection)
         if enabled is False:
             return "absent"
         probe = self._query_rows(collection, chunk_ids, ["chunk_id", DYN_META_FIELD])
-        if probe["status"] == "ok":
-            observed_meta = False
-            for row in probe["rows"]:
-                meta = row.get(DYN_META_FIELD)
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except Exception:  # noqa: BLE001 - 解析不了按"观察到但不可判定"处理
-                        return "unavailable"
-                if isinstance(meta, dict):
-                    observed_meta = True
-                    if meta.get("content_revision") not in (None, ""):
-                        return "residual"
-            # 动态渠道确认可用（schema 说开启）或确实观察到 $meta → absent 成立
-            if enabled is True or observed_meta:
-                return "absent"
-            return "unavailable"
-        if probe["status"] == "field_missing":
+        if probe["status"] != "ok":
             # `$meta` 不可查询：只有**明确知道动态字段关闭**才算"版本无处可存"（该分支已在函数开头
             # 返回）。开关未知、或 schema 说开启却查不到 `$meta`（自相矛盾）→ 一律不可校验。
             return "unavailable"
-        return "unavailable"
+        rows = probe["rows"]
+        got = {str(row.get("chunk_id") or "") for row in rows}
+        if not {str(cid) for cid in chunk_ids} <= got:
+            # 缺行：返回行数不足 → 某些 chunk 未读到，不能证明"每行都无残留"
+            return "unavailable"
+        for row in rows:
+            verdict = self._dynamic_version_residual(row)
+            if verdict == "residual":
+                return "residual"
+            if verdict == "unavailable":
+                return "unavailable"
+        return "absent"
+
+    @staticmethod
+    def _dynamic_version_residual(row: Dict[str, Any]) -> str:
+        """判断单行是否有版本残留：`"residual" | "clean" | "unavailable"`。
+
+        支持两种真实 SDK 形态：
+        - `$meta` 是 dict 或 JSON 字符串（pymilvus 2.x）：检查其中的 `content_revision`；
+        - `$meta` 被解码器**展开为顶层字段**（pymilvus 3.x）：`$meta` 键不存在，其键直接落在行顶层，
+          检查顶层 `content_revision`。
+        任一形态出现非空 `content_revision` → `residual`；`$meta` 解析失败 → `unavailable`。
+        """
+        meta = row.get(DYN_META_FIELD)
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:  # noqa: BLE001 - 解析不了 = 结果不可解释
+                return "unavailable"
+        if isinstance(meta, dict):
+            if meta.get("content_revision") not in (None, ""):
+                return "residual"
+        # 顶层展开形态（pymilvus 3.x）：$meta 键不存在，版本键直接出现在行顶层
+        if row.get("content_revision") not in (None, ""):
+            return "residual"
+        return "clean"
 
     def verify_versioned_rows(self, collection: str, expected: Dict[str, Dict[str, Any]]) -> Optional[bool]:
         """写入后读回校验（统一实现，worker 与 backfill 共用）。
