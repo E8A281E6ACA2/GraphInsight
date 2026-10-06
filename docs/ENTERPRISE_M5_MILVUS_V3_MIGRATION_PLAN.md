@@ -939,6 +939,20 @@ blocker = `DATA_UNKNOWN` + `VECTOR_CAPABILITY_OFF` + `COLLECTIONS_UNKNOWN` + `BA
 **连接范围**：本轮零真实服务连接（进程内假体 + 隔离临时库）；未写入生产/共享 v2/v3、未建 v3、
 未跑共享 backfill、未改受控配置、未重启共享服务、未 push；M5-B1 继续冻结。
 
+---
+
+### 9.15 复核收口（第三轮 · 2026-10-06 · 两 P1 一 P2）
+
+| 项 | 整改 | 验证 |
+|---|---|---|
+| P1 显式字段缺失≠无版本 | 读回新增**动态字段观察**（`$meta`）：显式字段缺失时必须查动态渠道——`enable_dynamic_field=False` → 结构性 absent；开启（Milvus 默认）→ 查 `$meta`，出现非空 `content_revision` → 违约；**观察不到（开关未知 / `$meta` 不可查 / 查询失败）→ 不可校验**，不判 absent 成立。夹具按 Milvus 默认开启动态字段建模（`enable_dynamic_field`） | 契约矩阵 C25a–d：严格查询+`$meta` 残留 99 → `ok=False`；开启且无残留 → 通过；开关未知 → 不可校验；`$meta` 查询失败 → 不可校验 |
+| P1 非法配置仍先建集合 | `assert_write_allowed` 现在**同时**执行双写配置守卫与范围守卫（`_guard_dual_write_config` + `_guard_write_scope`），全部通过后才允许初始化集合；非法双写配置逐 chunk 记 `write_failed`（不降级 pending） | B0 E6（真实 worker 链路）：`dual_write=true、shadow=''` → `ensure_collection` 未被调用、零建集合、零 upsert、PG 记 failed |
+| P2 损坏留痕被折为空 | 留痕读取区分**合法空**与**证据损坏**：坏 JSON 行 / 读取失败均判红（`_read_netguard_records` 返回 `bad_lines/error`）；判定抽成纯函数 `_netguard_problems`；违规留痕**写入失败**时护栏回退 stderr 标记（runner 把"有标记无留痕"判红） | 自检 N6–N8：坏行 → 判红；读取失败 → 判红；违规文件不可写 + 静默吞异常 → stderr 回退标记 + runner 判红 |
+
+回归（实跑）：统一门禁 `total=23 failed=0`；契约矩阵 `71 passed, 0 failed`（66 → 71）；B0（含 E4–E6）、
+Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 passed, 0 failed`。
+连接范围不变：零真实服务连接，未 push；真实 v3 迁移仍关闭，M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
