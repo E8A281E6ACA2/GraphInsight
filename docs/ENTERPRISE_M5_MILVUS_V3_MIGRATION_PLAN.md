@@ -953,6 +953,23 @@ blocker = `DATA_UNKNOWN` + `VECTOR_CAPABILITY_OFF` + `COLLECTIONS_UNKNOWN` + `BA
 Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 passed, 0 failed`。
 连接范围不变：零真实服务连接，未 push；真实 v3 迁移仍关闭，M5-B1 冻结。
 
+---
+
+### 9.16 复核收口（第四轮 · 2026-10-06 · 一 P1 一 P2）
+
+复核方用**真实 pymilvus 3.0.2 解码器**离线构造响应，证明上轮夹具的返回形态仍不充分：SDK 会把
+`$meta` 展开为顶层字段（`{"chunk_id":"audit-sdk","content_revision":99}`，`$meta` 键本身不存在），
+上轮观察逻辑查 `$meta` 键拿不到、又因"动态字段开启"直接判 absent → 假绿。
+
+| 项 | 整改 | 验证 |
+|---|---|---|
+| P1 动态版本残留仍可假通过（真实 SDK 顶层展开） | `_observe_dynamic_version` 不再依赖 `$meta` 键本身；抽出 `_dynamic_version_residual` 同时认两种形态——`$meta` dict（pymilvus 2.x）与**顶层展开键**（pymilvus 3.x）；**删除"动态字段开启即判 absent"的短路**：只有逐行观察到无残留才判 absent；**缺行**（返回行数少于请求 chunk 数）与**结果不可解释**（`$meta` 解析失败）一律 `unavailable`。夹具 `FakeClient` 改为真实 SDK 语义（`$meta` 展开到顶层、动态键可查） | C25a–d 重构为顶层展开语义；C26 用**真实 pymilvus 3.0.2 解码器**（`HybridExtraList` + 真实 `FieldData`）离线构造 `$meta` 展开形态：残留 99 → `residual`、无残留 → `clean`、坏 JSON → `unavailable`、2.x dict → `residual`；C27 缺行 → `unavailable` |
+| P2 空加载记录仍被放行 | 护栏判据 `_netguard_problems` 不再只查文件存在，必须存在**有效 `event=guard_loaded` 记录**：空文件、无关 JSON 对象均判红（此前"文件存在即通过"会让空加载文件假绿） | 自检 N9 空加载文件 → 判红；N10 无关 JSON → 判红；N11 **真实 runner 级**（`_run_case`）：子进程加载护栏后清空加载留痕、exit 0 → 判红 |
+
+回归（实跑）：统一门禁 `total=23 failed=0`；契约矩阵 `77 passed, 0 failed`（71 → 77）；护栏自检
+`12 passed, 0 failed`（9 → 12）；B0（含 E4–E6）全绿。
+连接范围不变：零真实服务连接，未 push；真实 v3 迁移仍关闭，M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
