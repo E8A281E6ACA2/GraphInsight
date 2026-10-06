@@ -54,6 +54,7 @@ CASES: tuple[GuardCase, ...] = (
     GuardCase("admin_env_override", "check_admin_env_override_unit.py", 60, "unified runtime env override guard"),
     GuardCase("rate_limit_exempt", "check_rate_limit_exempt_unit.py", 60, "internal health probe rate limit exemption"),
     GuardCase("backfill_manifest", "check_backfill_manifest.py", 180, "backfill 运行清单（隔离 SQLite，零真实连接）"),
+    GuardCase("vector_write_contract", "check_vector_write_contract.py", 60, "向量写入契约矩阵（两种意图 + KB 范围守卫，进程内假体）"),
     GuardCase("rbac_catalog_parity", "check_rbac_catalog_parity.py", 120, "Python/Go RBAC 权限目录精确对账"),
     GuardCase("m5_dual_write", "check_m5_dual_write.py", 60, "M5 §16.1 S1 双写扇出与失败语义守卫"),
     GuardCase(
