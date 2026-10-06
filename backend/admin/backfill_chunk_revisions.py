@@ -131,6 +131,7 @@ def _new_manifest(kb_id: str, mode: str, trace_id: str, started_at: datetime) ->
             "milvus_failed": 0,
             "milvus_skipped": 0,
             "revision_field_absent": 0,
+            "milvus_primary_missing": 0,
             "projection_state_updated": 0,
             "state_write_failed": 0,
             "state_write_failed_ids": [],
@@ -456,56 +457,85 @@ def _load_milvus_chunks(kb_id: str) -> Dict[str, Dict[str, Any]]:
 
 
 def _backfill_milvus(kb_id: str, plans: List[ChunkPlan]) -> Dict[str, str]:
-    """仅对新 backfill 的 chunk embedding + upsert（显式 content_revision=1，§15.3 步骤 4）。
+    """历史回填的 Milvus 腿：走**统一写入契约**（`intent=backfill_versioned`）。
 
-    返回 {chunk_id: indexed|skipped|revision_field_absent|failed}，逐 chunk 判定。
+    与在线 S1 双写的目标分开定义（工单口径）：
+      - 在线 S1：primary(读源) 先写 + shadow 扇出，两侧都写；
+      - 历史回填：**只补版本承载侧 shadow(v3)**；v2 不改 schema、不覆写既有行、不把 revision
+        下沉进 dynamic metadata（§8.5）。历史上"backfill 直连 primary"已退役——它既不满足
+        "v2 只读"的边界，也无法把 revision 可靠承载到 v3。
+    前置条件（由契约在写之前判定，整批拒、零写入）：
+      - shadow 未生效 / 无显式 INT64 字段 → `revision_field_absent`（投影保持 pending）；
+      - primary 缺该 chunk 或读不到 primary（§16.1 读源不变量）→ `primary_vector_missing`（pending）。
+    写后必须读回一致才判 `indexed`（不一致或无法校验一律不标 indexed）。
+
+    返回 {chunk_id: indexed|skipped|revision_field_absent|primary_vector_missing|failed}，逐 chunk 判定。
     """
     outcome: Dict[str, str] = {}
     if not plans:
         return outcome
+    from services.vector_store import (
+        REASON_PRIMARY_UNREADABLE,
+        REASON_PRIMARY_VECTOR_MISSING,
+        REASON_SHADOW_FIELD_MISSING,
+        REASON_SHADOW_NOT_ACTIVE,
+        VectorChunk,
+        VectorWriteContractError,
+        vector_store,
+    )
+
     client, collection = _milvus_client()
     if not client.has_collection(collection):
         return {item.chunk_id: "skipped" for item in plans}
-    if not _milvus_has_revision_field(client, collection):
-        # §8.5：v2 无显式 content_revision 字段，禁止改 schema；不写不可靠版本，投影保持 pending。
-        return {item.chunk_id: "revision_field_absent" for item in plans}
     from services.embedding_service import embedding_service
+
+    def _mark(items, state: str) -> None:
+        for item in items:
+            outcome[item.chunk_id] = state
 
     for chunk in _batched(plans, 10):
         texts = [item.source_content for item in chunk]
         try:
             vectors = embedding_service.embed_texts(texts)
         except Exception:  # noqa: BLE001 - embedding 失败逐 chunk 记 failed，不伪装 indexed
-            for item in chunk:
-                outcome[item.chunk_id] = "failed"
+            _mark(chunk, "failed")
             continue
         if len(vectors) != len(chunk):
-            for item in chunk:
-                outcome[item.chunk_id] = "failed"
+            _mark(chunk, "failed")
             continue
-        rows = [
-            {
-                "chunk_id": item.chunk_id,
-                "doc_id": item.doc_id,
-                "kb_id": kb_id,
-                "tenant_id": item.tenant_id,
-                "project_id": item.project_id,
-                "text": (item.source_content or "")[:4096],
-                "content_revision": 1,
-                "vector": vector,
-            }
-            for item, vector in zip(chunk, vectors)
+        vchunks = [
+            VectorChunk(
+                chunk_id=item.chunk_id,
+                doc_id=item.doc_id,
+                text=item.source_content or "",
+                kb_id=kb_id,
+                tenant_id=item.tenant_id,
+                project_id=item.project_id,
+                content_revision=1,
+            )
+            for item in chunk
         ]
         try:
-            from services.vector_store import require_upsert_count
-
-            require_upsert_count(client.upsert(collection_name=collection, data=rows), len(rows))
-        except Exception:  # noqa: BLE001 - upsert 失败逐 chunk 记 failed
-            for item in chunk:
-                outcome[item.chunk_id] = "failed"
+            written = vector_store.upsert_chunks(vchunks, vectors, intent="backfill_versioned")
+        except VectorWriteContractError as exc:
+            if exc.reason in (REASON_SHADOW_NOT_ACTIVE, REASON_SHADOW_FIELD_MISSING):
+                # 版本无处可靠承载：不写不可靠版本，投影保持 pending（§8.5）。
+                _mark(chunk, "revision_field_absent")
+            elif exc.reason in (REASON_PRIMARY_VECTOR_MISSING, REASON_PRIMARY_UNREADABLE):
+                # 读源不变量（§16.1）：primary 尚不持有这些 chunk，只写 v3 会让读源丢数据。
+                _mark(chunk, "primary_vector_missing")
+            else:
+                _mark(chunk, "failed")
+            print(f"  [milvus-backfill] reason={exc.reason} chunks={len(chunk)}")
             continue
-        for item in chunk:
-            outcome[item.chunk_id] = "indexed"
+        except Exception:  # noqa: BLE001 - 其它写入异常逐 chunk 记 failed
+            _mark(chunk, "failed")
+            continue
+        if int(written) != len(vchunks):
+            # 契约入口在 store 关闭/短路时返回 0：数量不符一律不标 indexed（fail-closed）。
+            _mark(chunk, "failed")
+            continue
+        _mark(chunk, "indexed")
     return outcome
 
 
@@ -1119,6 +1149,7 @@ def _run_impl(kb_id: str, dry_run: bool, trace_id: str, mf: Dict[str, Any]) -> i
         "milvus_failed": 0,
         "milvus_skipped": 0,
         "revision_field_absent": 0,
+        "milvus_primary_missing": 0,
         "state_write_failed": 0,
     }
     state_write_failed: List[str] = []
@@ -1138,9 +1169,13 @@ def _run_impl(kb_id: str, dry_run: bool, trace_id: str, mf: Dict[str, Any]) -> i
             vector_status, vector_rev = "indexed", 1
             counts["milvus_upserted"] += 1
         elif milvus_state == "revision_field_absent":
-            # §8.5：collection 无显式 content_revision 字段，不写不可靠版本，保持 pending
+            # §8.5：无显式内容版本承载侧（shadow 未生效/无 INT64 字段），不写不可靠版本，保持 pending
             vector_status, vector_rev = "pending", None
             counts["revision_field_absent"] += 1
+        elif milvus_state == "primary_vector_missing":
+            # §16.1 读源不变量：primary 尚无该 chunk，只写 v3 会让读源丢数据 → 保持 pending
+            vector_status, vector_rev = "pending", None
+            counts["milvus_primary_missing"] += 1
         elif milvus_state == "skipped":
             vector_status, vector_rev = "skipped", None
             counts["milvus_skipped"] += 1
@@ -1176,11 +1211,18 @@ def _run_impl(kb_id: str, dry_run: bool, trace_id: str, mf: Dict[str, Any]) -> i
             "按 §8.5/§15.4 迁移 v3 collection 后重跑 reindex）"
         )
 
+    if counts["milvus_primary_missing"]:
+        print(
+            f"  MILVUS_PRIMARY_VECTOR_MISSING count={counts['milvus_primary_missing']}"
+            "（primary 尚无该 chunk，§16.1 读源不变量：只写 shadow 会让读源丢数据；vector 投影保持 pending，"
+            "需先由在线写入把该 chunk 落到 primary 后重跑）"
+        )
     if state_write_failed:
         print("✗ projection state CAS did not update exactly one current row; gate remains OPEN")
 
     for key in ("neo4j_indexed", "neo4j_failed", "milvus_upserted", "milvus_failed",
-                "milvus_skipped", "revision_field_absent", "state_write_failed"):
+                "milvus_skipped", "revision_field_absent", "milvus_primary_missing",
+                "state_write_failed"):
         mf["writes"][key] = counts[key]
     mf["writes"]["projection_state_updated"] = len(fresh_plans) - len(state_write_failed)
     mf["writes"]["state_write_failed_ids"] = sorted(state_write_failed)

@@ -21,6 +21,40 @@ class VectorStoreUpsertError(RuntimeError):
     """Milvus did not acknowledge the expected number of upserts."""
 
 
+# ---------------------------------------------------------------------------
+# 写入意图（统一写入契约）：同一入口，两种意图，语义分开定义
+#   ONLINE   = 在线读写路径（S1 双写：primary 先写 + shadow 扇出，读仍 primary）
+#   BACKFILL = 历史数据回填（只补"版本承载侧" shadow，**不写 primary**）
+# 两者的共同不变量：绝不把 revision 写进 dynamic metadata（§8.5）、绝不半写（写前判定）、
+# 失败可定位并保持未收敛。扇出/守卫/写后读回只有这一份实现（禁止复制第二份）。
+# ---------------------------------------------------------------------------
+WRITE_INTENT_ONLINE = "online_s1"
+WRITE_INTENT_BACKFILL = "backfill_versioned"
+
+# 契约拒绝原因（可机读；调用方据此决定成果状态，而不是靠字符串匹配）
+REASON_SHADOW_NOT_ACTIVE = "SHADOW_NOT_ACTIVE"
+REASON_SHADOW_FIELD_MISSING = "SHADOW_FIELD_MISSING"
+REASON_PRIMARY_VECTOR_MISSING = "PRIMARY_VECTOR_MISSING"
+REASON_PRIMARY_UNREADABLE = "PRIMARY_UNREADABLE"
+REASON_VERIFY_MISMATCH = "VERIFY_MISMATCH"
+REASON_VERIFY_UNAVAILABLE = "VERIFY_UNAVAILABLE"
+REASON_KB_NOT_ALLOWED = "KB_NOT_ALLOWED"
+REASON_SCOPE_MISMATCH = "SCOPE_MISMATCH"
+REASON_COLLECTION_NOT_WRITABLE = "COLLECTION_NOT_WRITABLE"
+
+
+class VectorWriteContractError(VectorStoreSchemaError):
+    """写入契约不满足：**在任何写入之前**判定并拒绝（绝不半写），原因是机读的 reason。
+
+    与 `VectorStoreSchemaError` 同族（都是"宁可不写也不写错"），但额外携带 `reason`，
+    让调用方（backfill / worker）把拒绝映射成逐 chunk 的 pending/failed，而不必解析文案。
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class DualWriteShadowError(VectorStoreUpsertError):
     """§16.1 S1 双写：主库（读源）已写成功，影子（v3）侧未收敛。
 
@@ -256,6 +290,82 @@ class MilvusVectorStore:
                 reason=str(dw.get("reason") or "未知原因"),
             )
 
+    def resolve_write_scope(self) -> Dict[str, Any]:
+        """写入范围（canary 保护）+ 可写集合白名单。
+
+        动机：S1 是**进程全局**配置，开启后所有 KB 都走扇出。授权通常只针对**单个目标 KB**，
+        因此需要一份可执行的 KB 级限制，把"全局开关"收敛回"目标 KB"。
+
+        配置（vector_store 类目 / 环境变量）：
+          write_scope.kb_ids      ← MILVUS_WRITE_SCOPE_KB_IDS（逗号分隔；**留空 = 不限制**，保持现状）
+          write_scope.tenant_id   ← MILVUS_WRITE_SCOPE_TENANT（可选，非空则必须逐 chunk 匹配）
+          write_scope.project_id  ← MILVUS_WRITE_SCOPE_PROJECT（可选）
+
+        返回统一结构；`kb_ids` 非空时，任何不在名单内的 KB 在**任何 mutation 之前**被拒。
+        """
+        loaded = get_vector_store_runtime_config()
+        raw = loaded.get("write_scope")
+        scope = raw if isinstance(raw, dict) else {}
+        kb_ids = scope.get("kb_ids") or []
+        if isinstance(kb_ids, str):
+            kb_ids = [item.strip() for item in kb_ids.split(",") if item.strip()]
+        return {
+            "kb_ids": [str(item).strip() for item in kb_ids if str(item).strip()],
+            "tenant_id": str(scope.get("tenant_id") or "").strip(),
+            "project_id": str(scope.get("project_id") or "").strip(),
+        }
+
+    def _guard_write_scope(self, chunks: List[VectorChunk], collection: str, operation: str) -> None:
+        """mutation 前校验：目标 KB / tenant / project / collection 均须在授权范围内。
+
+        - 未配置 kb_ids（默认）→ 不限制，行为与历史一致；
+        - 配置后：非名单 KB 一律拒（`KB_NOT_ALLOWED`），tenant/project 非空时必须逐 chunk 相等
+          （`SCOPE_MISMATCH`）；collection 只能是本次解析出的 primary/shadow（`COLLECTION_NOT_WRITABLE`）。
+        - 逐 chunk 判定，**任一不合规即整批拒**（不部分写）。
+        """
+        dw = self.resolve_dual_write()
+        allowed_collections = {c for c in (dw.get("primary"), dw.get("shadow")) if c}
+        if allowed_collections and collection not in allowed_collections:
+            raise VectorWriteContractError(
+                f"collection {collection} 不在本次可写集合 {sorted(allowed_collections)} 内，"
+                f"拒绝执行 {operation}",
+                reason=REASON_COLLECTION_NOT_WRITABLE,
+            )
+        scope = self.resolve_write_scope()
+        kb_ids = scope["kb_ids"]
+        if not kb_ids:
+            return
+        for chunk in chunks:
+            kb_id = str(chunk.kb_id or "")
+            if kb_id not in kb_ids:
+                raise VectorWriteContractError(
+                    f"KB {kb_id!r} 不在授权写入范围 {kb_ids} 内，拒绝执行 {operation}（零写入）",
+                    reason=REASON_KB_NOT_ALLOWED,
+                )
+            if scope["tenant_id"] and str(chunk.tenant_id or "") != scope["tenant_id"]:
+                raise VectorWriteContractError(
+                    f"KB {kb_id!r} 的 tenant_id 与授权范围不一致，拒绝执行 {operation}",
+                    reason=REASON_SCOPE_MISMATCH,
+                )
+            if scope["project_id"] and str(chunk.project_id or "") != scope["project_id"]:
+                raise VectorWriteContractError(
+                    f"KB {kb_id!r} 的 project_id 与授权范围不一致，拒绝执行 {operation}",
+                    reason=REASON_SCOPE_MISMATCH,
+                )
+
+    def _guard_kb_write_scope(self, kb_ids: List[str], operation: str) -> None:
+        """按 KB 名单校验的轻量版本（delete/clear 等没有 chunk 对象的路径）。"""
+        scope = self.resolve_write_scope()
+        allowed = scope["kb_ids"]
+        if not allowed:
+            return
+        for kb_id in kb_ids:
+            if str(kb_id or "") not in allowed:
+                raise VectorWriteContractError(
+                    f"KB {kb_id!r} 不在授权写入范围 {allowed} 内，拒绝执行 {operation}（零写入）",
+                    reason=REASON_KB_NOT_ALLOWED,
+                )
+
     def ensure_collection(self, dimension: Optional[int] = None, collection: Optional[str] = None) -> None:
         if not self.is_enabled():
             return
@@ -369,18 +479,186 @@ class MilvusVectorStore:
         result = client.upsert(collection_name=collection, data=rows)
         return require_upsert_count(result, len(rows))
 
-    def upsert_chunks(self, chunks: List[VectorChunk], vectors: List[List[float]]) -> int:
+    def verify_versioned_rows(self, collection: str, expected: Dict[str, Dict[str, Any]]) -> Optional[bool]:
+        """写入后读回校验（统一实现，worker 与 backfill 共用）。
+
+        expected: `{chunk_id: {"content_revision": int|None, "text": str|None}}`
+        返回三态：`True` 全部一致 / `False` 明确不一致 / `None` **无法校验**（取不到 client、
+        client 不支持 query、查询抛错）。**绝不把 None 当 True**——调用方必须显式处理 None
+        （回填契约把 None 视为"不可标 indexed"，宁可 pending）。
+        """
+        if not expected:
+            return True
+        try:
+            client = self._get_client()
+        except Exception:  # noqa: BLE001 - 取不到 client 属于"无法校验"
+            return None
+        query = getattr(client, "query", None)
+        if not callable(query):
+            return None
+        expr = "chunk_id in [" + ", ".join(
+            f'"{self._escape_filter_value(str(cid))}"' for cid in sorted(expected)
+        ) + "]"
+        try:
+            rows = list(query(collection_name=collection, filter=expr,
+                              output_fields=["chunk_id", "text", "content_revision"],
+                              limit=len(expected)) or [])
+        except Exception:  # noqa: BLE001 - 读回失败 = 无法校验（不冒充已验证）
+            return None
+        got = {str(row.get("chunk_id") or ""): row for row in rows if isinstance(row, dict)}
+        for chunk_id, want in expected.items():
+            row = got.get(str(chunk_id))
+            if row is None:
+                return False
+            rev = want.get("content_revision")
+            if rev is not None:
+                try:
+                    if int(row.get("content_revision")) != int(rev):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            want_text = want.get("text")
+            if want_text is not None and str(row.get("text") or "") != str(want_text):
+                return False
+        return True
+
+    def _query_present_ids(self, collection: str, chunk_ids: List[str]) -> Optional[set]:
+        """只读探测 collection 里已存在的 chunk_id 集合；无法读取返回 None（调用方须 fail-closed）。"""
+        try:
+            client = self._get_client()
+        except Exception:  # noqa: BLE001
+            return None
+        if not client.has_collection(collection):
+            return set()
+        query = getattr(client, "query", None)
+        if not callable(query):
+            return None
+        expr = "chunk_id in [" + ", ".join(
+            f'"{self._escape_filter_value(str(cid))}"' for cid in sorted(set(chunk_ids))
+        ) + "]"
+        try:
+            rows = list(query(collection_name=collection, filter=expr,
+                              output_fields=["chunk_id"], limit=len(set(chunk_ids))) or [])
+        except Exception:  # noqa: BLE001
+            return None
+        return {str(row.get("chunk_id") or "") for row in rows if isinstance(row, dict)}
+
+    def _upsert_backfill_versioned(
+        self, dw: Dict[str, Any], chunks: List[VectorChunk], vectors: List[List[float]], dimension: Optional[int]
+    ) -> int:
+        """历史回填意图：**只补版本承载侧（shadow/v3）**，不写 primary（v2 不改 schema、不覆写既有行）。
+
+        契约前置（全部在**写之前**判定，任一不满足即整批拒、零写入）：
+        1. shadow 必须生效（否则 revision 无处可靠承载 → 保持 pending，绝不下沉到 dynamic metadata）；
+        2. shadow 必须有显式 INT64 `content_revision` 字段；
+        3. **读源不变量（§16.1）**：primary 必须已持有这些 chunk——否则"只写 v3 + 读 v2"会让读源丢数据；
+           读不到 primary（`PRIMARY_UNREADABLE`）同样拒绝（不能证明不丢数据）。
+        写后必须读回一致才返回（不一致 `VERIFY_MISMATCH`、无法校验 `VERIFY_UNAVAILABLE` 均拒绝）。
+        """
+        shadow = str(dw.get("shadow") or "")
+        if not dw.get("active") or not shadow:
+            raise VectorWriteContractError(
+                "历史回填需要生效的双写影子集合来承载版本号；当前 dual_write/shadow_collection 未生效。"
+                "按 §8.5 禁止把 revision 写进 primary 的 dynamic metadata，本批保持 pending。",
+                reason=REASON_SHADOW_NOT_ACTIVE,
+            )
+        if not self.has_content_revision_field(shadow):
+            raise VectorWriteContractError(
+                f"影子 collection {shadow} 缺少显式 content_revision 字段，禁止回填版本号"
+                "（写进去只会进 dynamic metadata）。请先按 §8.5 建带显式 INT64 字段的 v3 集合。",
+                reason=REASON_SHADOW_FIELD_MISSING,
+            )
+        present = self._query_present_ids(str(dw.get("primary") or ""), [c.chunk_id for c in chunks])
+        if present is None:
+            raise VectorWriteContractError(
+                f"无法读取 primary {dw.get('primary')} 的现有 chunk，不能证明读源不丢数据（§16.1），"
+                "拒绝只写 shadow。",
+                reason=REASON_PRIMARY_UNREADABLE,
+            )
+        missing = [c.chunk_id for c in chunks if c.chunk_id not in present]
+        if missing:
+            raise VectorWriteContractError(
+                f"primary {dw.get('primary')} 尚无 {len(missing)} 个 chunk（示例 {missing[:5]}）："
+                "只写 shadow 会让读源丢数据（§16.1 禁止 v3 写 + v2 读），拒绝回填。",
+                reason=REASON_PRIMARY_VECTOR_MISSING,
+            )
+        written = self._upsert_to(shadow, chunks, vectors, dimension)
+        expected = {
+            c.chunk_id: {"content_revision": c.content_revision, "text": c.text} for c in chunks
+        }
+        verified = self.verify_versioned_rows(shadow, expected)
+        if verified is False:
+            raise VectorWriteContractError(
+                f"影子 {shadow} 写后读回与写入不一致，拒绝标记 indexed（投影保持 pending）",
+                reason=REASON_VERIFY_MISMATCH,
+            )
+        if verified is None:
+            raise VectorWriteContractError(
+                f"影子 {shadow} 写后读回不可用（无法校验），拒绝标记 indexed（宁可 pending）",
+                reason=REASON_VERIFY_UNAVAILABLE,
+            )
+        return written
+
+    def upsert_chunks(
+        self,
+        chunks: List[VectorChunk],
+        vectors: List[List[float]],
+        *,
+        intent: str = WRITE_INTENT_ONLINE,
+    ) -> int:
+        """**统一写入入口**（唯一扇出实现）。
+
+        - `intent=online_s1`（默认）：primary 先写 + shadow 扇出，读仍 primary；影子失败 fail-closed。
+        - `intent=backfill_versioned`：只补 shadow（版本承载侧），前置校验见 `_upsert_backfill_versioned`。
+        两条意图共用同一份 config 守卫、范围守卫、`_upsert_to`（§8.5 显式字段门 + 确认数校验）与写后读回。
+        """
         dw = self.resolve_dual_write()
-        self._guard_dual_write_config(dw, "upsert_chunks")
+        self._guard_dual_write_config(dw, f"upsert_chunks[{intent}]")
         if not dw["enabled"] or not chunks:
             return 0
         if len(chunks) != len(vectors):
             raise ValueError("chunks 与 vectors 数量不一致")
         vector_dimension = len(vectors[0]) if vectors and vectors[0] else None
 
+        if intent == WRITE_INTENT_BACKFILL:
+            self._guard_write_scope(chunks, str(dw.get("shadow") or dw.get("primary") or ""),
+                                    "upsert_chunks[backfill_versioned]")
+            return self._upsert_backfill_versioned(dw, chunks, vectors, vector_dimension)
+        if intent != WRITE_INTENT_ONLINE:
+            raise ValueError(f"未知写入意图: {intent!r}")
+
+        self._guard_write_scope(chunks, str(dw.get("primary") or ""), "upsert_chunks[online_s1]")
+
+        # §8.5 + S1 的 legacy v2 合同（工单 1：在线双写与历史回填的目标分开定义）：
+        #   primary 有显式 INT64 字段 → 两侧都写显式版本（正常 S1）；
+        #   primary 缺字段 + 影子生效   → primary **剥版本写**（不写 metadata、不改 v2 schema、
+        #                                版本由影子完整承载），影子必须先具备显式字段，否则 fail-closed；
+        #   primary 缺字段 + 无影子     → 拒写（版本无处可靠承载，绝不降级进 dynamic metadata）。
+        versioned = any(chunk.content_revision is not None for chunk in chunks)
+        primary_has_field = self.has_content_revision_field(dw["primary"])
+        primary_chunks = chunks
+        if versioned and not primary_has_field:
+            if not dw["active"]:
+                raise VectorStoreSchemaError(
+                    f"Milvus collection {dw['primary']} 缺少显式 content_revision 字段且无生效影子集合，"
+                    "禁止把投影版本号写入 dynamic metadata；请按 §8.5/§15.4 迁移到 "
+                    "graphinsight_chunks_v3 后重建向量"
+                )
+            if not self.has_content_revision_field(dw["shadow"]):
+                raise VectorStoreSchemaError(
+                    f"影子 collection {dw['shadow']} 缺少显式 content_revision 字段：主库 "
+                    f"{dw['primary']} 无法承载版本，若影子也不承载则会静默丢版本，拒绝写入"
+                )
+            from dataclasses import replace as _dc_replace
+
+            primary_chunks = [
+                _dc_replace(chunk, content_revision=None) if chunk.content_revision is not None else chunk
+                for chunk in chunks
+            ]
+
         # 主库（读源）先写。主库失败直接抛出：读源保持未收敛、调用方重试，
         # 绝不允许出现"影子已写、主库未写"，也不触发任何影子写。
-        primary_written = self._upsert_to(dw["primary"], chunks, vectors, vector_dimension)
+        primary_written = self._upsert_to(dw["primary"], primary_chunks, vectors, vector_dimension)
 
         if not dw["active"]:
             return primary_written
@@ -454,6 +732,8 @@ class MilvusVectorStore:
         self._guard_dual_write_config(dw, "delete_doc")
         if not dw["enabled"] or not doc_id:
             return
+        # 写入范围守卫（canary 保护）：非授权 KB 在**任何删除之前**拒绝，零写入。
+        self._guard_kb_write_scope([clean_kb], "delete_doc")
         collection = dw["primary"]
         client = self._get_client()
         if not client.has_collection(collection):
@@ -491,6 +771,8 @@ class MilvusVectorStore:
         self._guard_dual_write_config(dw, "clear")
         if not dw["enabled"]:
             return
+        # 写入范围守卫（canary 保护）：非授权 KB 在**任何清空之前**拒绝，零写入。
+        self._guard_kb_write_scope(list(kb_ids), "clear")
         self._delete_from(dw["primary"], filter_expr)
         if dw["active"]:
             try:

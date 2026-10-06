@@ -47,6 +47,17 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+def _to_str_list(value: Any, default: Any) -> List[str]:
+    """把配置值规范成字符串名单（支持 list / 逗号分隔字符串）；空值回落 default。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        value = default
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
 def _to_float(value: Any, default: float) -> float:
     try:
         return float(value)
@@ -166,6 +177,13 @@ def get_vector_store_runtime_config() -> Dict[str, Any]:
         # 默认关闭；shadow_collection 留空时 vector_store 侧判定双写不生效（见 resolve_dual_write）。
         "dual_write": _to_bool(loaded.get("dual_write"), settings.milvus_dual_write),
         "shadow_collection": _first_non_empty(loaded.get("shadow_collection"), settings.milvus_shadow_collection),
+        # 写入范围（canary 保护）：kb_ids 非空时，非名单 KB 在任何 mutation 前被拒（零写入）。
+        # 留空 = 不限制；tenant/project 可选，非空则逐 chunk 校验。
+        "write_scope": {
+            "kb_ids": _to_str_list(loaded.get("write_scope_kb_ids"), settings.milvus_write_scope_kb_ids),
+            "tenant_id": _first_non_empty(loaded.get("write_scope_tenant"), settings.milvus_write_scope_tenant),
+            "project_id": _first_non_empty(loaded.get("write_scope_project"), settings.milvus_write_scope_project),
+        },
     }
 
 

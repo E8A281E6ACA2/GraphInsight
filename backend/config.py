@@ -137,6 +137,14 @@ class Settings:
         # 默认关闭 = S0 现网安全态；开启是需单独授权的迁移动作，且 shadow_collection 必须异于主库。
         self.milvus_dual_write = os.getenv("MILVUS_DUAL_WRITE", "false").strip().lower() == "true"
         self.milvus_shadow_collection = os.getenv("MILVUS_SHADOW_COLLECTION", "").strip()
+        # 写入范围（canary 保护）：MILVUS_DUAL_WRITE 是**进程全局**开关，开启后所有 KB 都走扇出；
+        # 授权通常只覆盖单个目标 KB，故需要一份 KB 级限制把全局开关收敛回目标 KB。
+        # 逗号分隔；**留空 = 不限制**（保持历史行为）。布尔/名单非敏感，经 runtime_config 透出。
+        self.milvus_write_scope_kb_ids = [
+            item.strip() for item in os.getenv("MILVUS_WRITE_SCOPE_KB_IDS", "").split(",") if item.strip()
+        ]
+        self.milvus_write_scope_tenant = os.getenv("MILVUS_WRITE_SCOPE_TENANT", "").strip()
+        self.milvus_write_scope_project = os.getenv("MILVUS_WRITE_SCOPE_PROJECT", "").strip()
 
         # HTTP client 配置
         self.http_client_trust_env = os.getenv("HTTP_CLIENT_TRUST_ENV", "false").lower() == "true"
