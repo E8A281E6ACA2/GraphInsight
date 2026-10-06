@@ -1,6 +1,7 @@
 """Milvus vector store adapter for document chunks (M3: kb-scoped)."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +52,9 @@ REASON_DELETE_SCOPE_UNSUPPORTED = "DELETE_SCOPE_UNSUPPORTED"
 # 读源作用域四件套：读源行的归属必须与本次 chunk 完全一致，否则"同名即存在"不成立
 SCOPE_IDENTITY_FIELDS = ("kb_id", "tenant_id", "project_id", "doc_id")
 VECTOR_FIELD = "vector"
+# Milvus 动态字段（schema 之外的键以 JSON 存在这里）：版本**可能残留在动态字段**，
+# 因此"没有显式 content_revision 字段"不等于"行里没有版本键"（§8.5 冻结的正是这种形态）。
+DYN_META_FIELD = "$meta"
 
 
 class VectorWriteContractError(VectorStoreSchemaError):
@@ -388,8 +392,13 @@ class MilvusVectorStore:
         P1 修复：worker 原先在调用统一入口**之前**就 `ensure_collection`，导致非授权 KB 虽然最终
         被拒，但集合已经被创建（守卫晚于副作用）。调用方必须在任何建集合/建索引/mutation **之前**
         调用本方法；它与 `upsert_chunks` 内部守卫是**同一份实现**，不另立口径。
+
+        **两类守卫都在这里跑**（复核第二轮）：① 双写配置守卫——`dual_write=true` 但 `shadow_collection`
+        为空/同名等非法配置必须在建集合之前拒绝；② 写入范围守卫（collection/KB/tenant/project）。
+        只跑范围守卫时，"目标 KB 合法 + 双写配置非法"仍会先把 primary 集合建出来。
         """
         dw = self.resolve_dual_write()
+        self._guard_dual_write_config(dw, operation)
         target = str(collection or dw.get("primary") or "")
         self._guard_write_scope(chunks, target, operation)
 
@@ -659,6 +668,66 @@ class MilvusVectorStore:
         names = {str(field.get("name") or "") for field in fields if isinstance(field, dict)}
         return {name for name in names if name}
 
+    def dynamic_field_enabled(self, collection: str) -> Optional[bool]:
+        """collection 是否开启动态字段（`enable_dynamic_field`）；探测不到返回 None。"""
+        try:
+            client = self._get_client()
+            if not client.has_collection(collection):
+                return False
+            describe = getattr(client, "describe_collection", None)
+            if not callable(describe):
+                return None
+            description = describe(collection)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(description, dict):
+            return None
+        value = description.get("enable_dynamic_field", description.get("enableDynamicField"))
+        if isinstance(value, bool):
+            return value
+        return None
+
+    def _observe_dynamic_version(self, collection: str, chunk_ids: List[str]) -> str:
+        """观察动态字段里的版本残留，返回 `"absent" | "residual" | "unavailable"`。
+
+        Milvus 在 `enable_dynamic_field=True` 时会把 schema 之外的键放进 `$meta`（JSON）。所以
+        "collection 没有显式 content_revision 字段"**不等于**"行里没有版本键"——`revision` 可能以
+        dynamic metadata 形式残留（这正是 §8.5 要冻结的形态）。判定规则：
+
+        - 显式字段存在 → 由显式字段观察（不走本函数）；
+        - 动态字段关闭 → 版本无处可存 → `absent`（结构性事实）；
+        - 动态字段开启（或未知但可查到 `$meta`）→ 查 `$meta`：出现非空 `content_revision` → `residual`；
+          确认无该键 → `absent`；
+        - **观察不到动态渠道**（无法确定是否开启、`$meta` 查询不可用）→ `unavailable`（调用方必须返回
+          "不可校验"，不得判 absent 成立）。
+        """
+        enabled = self.dynamic_field_enabled(collection)
+        if enabled is False:
+            return "absent"
+        probe = self._query_rows(collection, chunk_ids, ["chunk_id", DYN_META_FIELD])
+        if probe["status"] == "ok":
+            observed_meta = False
+            for row in probe["rows"]:
+                meta = row.get(DYN_META_FIELD)
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:  # noqa: BLE001 - 解析不了按"观察到但不可判定"处理
+                        return "unavailable"
+                if isinstance(meta, dict):
+                    observed_meta = True
+                    if meta.get("content_revision") not in (None, ""):
+                        return "residual"
+            # 动态渠道确认可用（schema 说开启）或确实观察到 $meta → absent 成立
+            if enabled is True or observed_meta:
+                return "absent"
+            return "unavailable"
+        if probe["status"] == "field_missing":
+            # `$meta` 不可查询：只有**明确知道动态字段关闭**才算"版本无处可存"（该分支已在函数开头
+            # 返回）。开关未知、或 schema 说开启却查不到 `$meta`（自相矛盾）→ 一律不可校验。
+            return "unavailable"
+        return "unavailable"
+
     def verify_versioned_rows(self, collection: str, expected: Dict[str, Dict[str, Any]]) -> Optional[bool]:
         """写入后读回校验（统一实现，worker 与 backfill 共用）。
 
@@ -677,9 +746,16 @@ class MilvusVectorStore:
         probe = self._query_rows(collection, list(expected), ["chunk_id", "text", "content_revision"])
         version_observable = probe["status"] == "ok"
         if probe["status"] == "field_missing":
-            # 只有"缺的确实是 content_revision"才是"版本键结构化不存在"；缺别的字段 = 不可校验
+            # 只有"缺的确实是 content_revision"才谈得上"显式字段不存在"；缺别的字段 = 不可校验
             # （不能顺带把版本缺失当已满足——这正是宽松夹具会掩盖的形态）。
             if probe.get("missing_field") != "content_revision":
+                return None
+            # **显式字段不存在 ≠ 没有版本**（复核组合反例）：版本可能残留在动态字段（`$meta`）里。
+            # 必须观察动态渠道；无法观察时返回不可校验，**不能**判 absent 成立。
+            dynamic = self._observe_dynamic_version(collection, list(expected))
+            if dynamic == "residual":
+                return False
+            if dynamic != "absent":
                 return None
             probe = self._query_rows(collection, list(expected), ["chunk_id", "text"])
         if probe["status"] != "ok":
