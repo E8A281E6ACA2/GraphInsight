@@ -116,7 +116,7 @@ Neo4j/Milvus，而 Go 建任务端点一旦放行就会入队并被 worker 消�
 | ID | 事实（file:line） | 影响 |
 |---|---|---|
 | W4-F1 | Python `JobService.create_job`（`backend/admin/services/job_service.py:191`）**没有 HTTP 调用方**：admin 侧只挂内部唤醒路由（`backend/admin/api/route_registry.py:15-17`、`backend/admin/api/endpoints/jobs.py:24` `internal_router = APIRouter(prefix="/internal/jobs")`，且 `jobs.py:8` 明确 `PYTHON_PUBLIC_ADMIN_API_RETIRED = True`）。生产调用点为空，唯一调用方是取证驱动 `backend/tests/m5_wave3_handoff_driver.py:446/474/568` | GI-9e 的 §16.3 提交路径**当前只能由内部服务/测试触达**；线上无人能提交 reindex_chunks |
-| W4-F2 | **入口防线是路由分派，不是建任务白名单**（Wave 5 更正，原判据口径有误）。① HTTP 入口：`switch r.URL.Path`（`admin_jobs_native.go:228`）只列出 `/api/v1/admin/jobs/build-graph`、`/clear-kb`、`/reindex` 三个 case（`:229`），`reindex_chunks` 不在其中 → 落 default 分支返回 **404 `NOT_FOUND`**（`:278`），`adminJobTypeFromPath`（`:686-697`）对未知路径返回 `""`，`CreateJob` 从未被调用。② store 侧第二道线：白名单 `supportedJobTypes`（`go-backend/internal/adminstore/jobs.go:26-30`）= `build_graph/clear_kb/reindex`，`validateJobCreateRequest`（`jobs.go:592-605`，在 `CreateJob:139` 调用、`BeginTx`（`:147`）与 `INSERT` **之前**）返回 `ErrJobValidation`，由 `admin_jobs_native.go:758-761` 映射为 **400 `INVALID_BODY`**——只有内部/测试调用方直接触 `CreateJob` 时才会看到 | 结论不变：前端/运维无法通过 Go 控制面新建 reindex_chunks，且两层拒绝都在写库之前、fail-closed 成立。**但对外可观测语义是 404 而非 400**，runbook 与审计须按 404 判"入口未放行"；把 400 当成入口防线会高估白名的暴露面 |
+| W4-F2 | **入口防线是路由分派，不是建任务白名单**（Wave 5 更正，原判据口径有误）。① HTTP 入口：`switch r.URL.Path`（`admin_jobs_native.go:228`）只列出 `/api/v1/admin/jobs/build-graph`、`/clear-kb`、`/reindex` 三个 case（`:229`），`reindex_chunks` 不在其中 → 落 default 分支返回 **404 `NOT_FOUND`**（`:278`），`adminJobTypeFromPath`（`:686-697`）对未知路径返回 `""`，`CreateJob` 从未被调用。② store 侧第二道线：白名单 `supportedJobTypes`（`go-backend/internal/adminstore/jobs.go:26-30`）= `build_graph/clear_kb/reindex`，`validateJobCreateRequest`（`jobs.go:592-605`，在 `CreateJob:139` 调用、`BeginTx`（`:147`）与 `INSERT` **之前**）返回 `ErrJobValidation`，由 `admin_jobs_native.go:758-761` 映射为 **400 `INVALID_BODY`**——只有内部/测试调用方直接触 `CreateJob` 时才会看到 | 结论不变：前端/运维无法通过 Go 控制面新建 reindex_chunks，且两层拒绝都在写库之前、fail-closed 成立。**但对外可观测语义是 404 而非 400**，runbook 与审计须按 404 判"入口未放行"；把 400 当成入口防线会高估白名的暴露面。**Wave 10 复核补充现状口径（不改本行 Wave 4 当时的判定）**：写侧 switch 此后新增了 `/api/v1/admin/jobs/reindex-chunks` 专用 case（`admin_jobs_native.go:231`），所以 default 404 只对**未列出的路径**成立（判据 1 实测取下划线变体 `/api/v1/admin/jobs/reindex_chunks`），专用提交入口本身已实现且不返回 404；`supportedJobTypes` 仍是 `build_graph` / `clear_kb` / `reindex` 三项（`adminstore/jobs.go:26-30`），不含 `reindex_chunks` |
 | W4-F3 | 读侧不校验类型白名单：`buildJobWhere`（`jobs.go:570`）只在 `jobs.go:574-576` 对 `job_type` 做**等值过滤**（值任意，不在 `supportedJobTypes` 也照样进 WHERE）；`ListJobs`（`jobs.go:325`）、`GetJob`（`jobs.go:386`）、`RetryJob`（`jobs.go:181`）、`CancelJob`（`jobs.go:258`）均无 job_type 闸门 | 已存在的 reindex_chunks 行**能被列出、按类型筛出、查看、重试、取消**——写侧关门、读侧开门，语义不对称；`?job_type=reindex_chunks` 在 Go 层是合法读过滤 |
 | W4-F4 | `targets_hash` 对上层不可见：Go `JobItem` 结构体（`jobs.go:32-50`）无该字段，`grep -rn "targets_hash" go-backend --include=*.go` = 0 命中；前端同样 0 命中（`grep -rn targets_hash frontend/src` 空） | §16.3 去重结果（reused/retried/rejected）在任务中心**无法核对**，审计只能读 DB |
 | W4-F5 | 前端类型与筛选项缺项：`frontend/src/types/admin.ts:732` `JobType = 'build_graph' | 'clear_kb' | 'reindex'`（无 `reindex_chunks`），`frontend/src/pages/Admin/JobsPage.tsx:48-52` `jobTypeOptions` 同样缺项；表格直出原始值（`JobsPage.tsx:472` `{item.job_type}`），URL 参数按选项校验（`JobsPage.tsx:144-146`） | 行能显示（裸字符串），但类型层不认、筛选下拉选不到、`?job_type=reindex_chunks` 深链被忽略。**Wave 5 已按 §11.1-P2 补只读契约**（现树 `admin.ts:734` 含 `reindex_chunks`、`:765` 有 `targets_hash`），本行保留为 Wave 4 快照 |
@@ -1081,7 +1081,7 @@ a201e723325b7c29d6269cbc6b8aa4f0e6c25340	refs/pull/1/head
 
 ### 17.5 本轮维持的边界与授权范围
 
-- Wave 8 交付的**专用端点隔离验收**已被接收；`reindex_chunks` 仍**不在**通用作业创建白名单 `supportedJobTypes` 内，入口防御仍是路由 404（store 白名单 400 只是第二道）。白名单放行需要单独申请，本轮未申请。
+- Wave 8 交付的**专用端点隔离验收**已被接收；`reindex_chunks` 仍**不在**通用作业创建白名单 `supportedJobTypes` 内（该白名单现有 `build_graph` / `clear_kb` / `reindex` 三项，`adminstore/jobs.go:26-30`）。**404 只描述未开放路径**：`POST /api/v1/admin/jobs/reindex-chunks`（连字符，`admin_jobs_native.go:231`）是已实现的专用提交入口，不在 404 口径内；仍返回 404 `NOT_FOUND` 的是未列出的路径（判据 1 实测取下划线变体 `/api/v1/admin/jobs/reindex_chunks` 与 `/api/v1/admin/jobs/reindex-document`，且此路径下 `CreateJob` / `EnqueueReindexChunks` 调用数均为 0，`p6_disposable_pg_integration_test.go:416-438`）。白名单放行需要单独申请，本轮未申请。
 - Go 侧无 409 主张（`JOB_409` 仍 NOT-IMPLEMENTED）；`requireJobKnowledgeBase` 的 409 是 KB_ARCHIVED/KB_INVALID_STATE 的另一主题，不冲突。
 - 不合并、不部署、不执行共享库 `--confirm`、不进入 S2——本轮只做到"提交 + 推送审查分支 + 草稿 PR"。
 - `stash@{0}`/`stash@{1}`（GI-11）仍未触碰，原样保留。
@@ -1197,8 +1197,7 @@ DNS 配置错误，官方 SSH-over-443 已可用，**不必为本 PR 修改系�
 
 ### 18.2 修复：按 `revision_status` 分离读取，并把"唯一 current"变成显式断言
 
-`chunk_revisions` 上有部分唯一索引 `uq_chunk_revisions_current`（§15.1，数据库级强制"每
-(kb_id, chunk_id) 至多一条 `current`"）。修复就是把这条不变量搬到读侧，让两次读取各自最多命中一行：
+`chunk_revisions` 上有部分唯一索引 `uq_chunk_revisions_current`（§15.1，DDL 为 `CREATE UNIQUE INDEX … ON chunk_revisions (kb_id, chunk_id) WHERE revision_status = 'current'`，PostgreSQL 与 SQLite 两方言一致）。**该索引只约束 current 侧**：每 (kb_id, chunk_id) 至多一条 `current`；`superseded` 历史**可以有多条**，数据库不保证唯一。所以修复是两种不同的读法——current 侧建键（有索引背书，再加守卫双保险），superseded 侧保留为**列表**（不建键、不折叠）：
 
 ```python
 def _select_rows(where_status: str) -> list[dict]:
@@ -1230,9 +1229,7 @@ def raw_row_count() -> int:            # 该文档在 chunk_revisions 里的总�
   `content_change_projection_versions_align_with_new_revision` 再断言一次，含 `history[0]["rev"] == 1`）。
 
 关于"不要只调整排序"：`ORDER BY` 里加了 `content_revision` 只为让 `history_rows()` 的输出稳定可读，
-**它不参与任何判据成立**——两次读取已被 `revision_status` 谓词分开，在每个状态内同一 `chunk_id` 最多
-出现一次（部分唯一索引保证），因此无论数据库以什么顺序返回都不可能发生折叠。这一点由 18.3 的变异取证
-直接证明，而不是靠叙述。
+**它不参与任何判据成立**，理由是两条读取各自都不再有"同键覆盖"的可能：current 侧同一 `chunk_id` 至多一条由部分唯一索引 `uq_chunk_revisions_current` 强制（谓词把该索引的 WHERE 条件搬到读侧），dict 建键不可能被后一行覆盖，代码里的重复 current 守卫只是对该不变量的双保险；superseded 侧**数据库允许同 chunk 多条**，所以返回的是列表而非 dict，压根不存在"哪条存活"的问题。`len(history) == 1` 与 `raw_n == 2` 是**本用例的期望**（只发生过一次内容变更），不是表级不变量。这一点由 18.3 的变异取证直接证明，而不是靠叙述。
 
 其余 `rows()` 调用点（:345/:351/:405/:444/:477/:486/:489）执行时该文档只有一条 revision，改后的语义
 （"current 行"）与原先等价，并且额外获得重复 current 守卫。
@@ -1293,7 +1290,7 @@ PR #2 元数据（权威复核）：`gh pr view 2 --json commits --jq '.commits|
 ### 18.6 边界与未做事项
 
 - 未合并、未部署、未执行共享库 `--confirm` 迁移、未进 S2、通用白名单未开放（`supportedJobTypes` 仍不含
-  `reindex_chunks`）；专用 `/api/admin/jobs/reindex-chunks` 端点已实现并有 Go 集成判据覆盖。
+  `reindex_chunks`）；专用 `POST /api/v1/admin/jobs/reindex-chunks` 端点已实现并有 Go 集成判据覆盖（路由分支见 `go-backend/internal/httpserver/admin_jobs_native.go:231`）。**不存在通用 POST 创建端点**（分发层 `handlers.go:622-651`）：精确路径 `/api/v1/admin/jobs` 只接受 GET 列表，POST 到它在分发层就返回 **405 Method Not Allowed**（`handlers.go:623-629`），根本进不了 write handler；`/api/v1/admin/jobs/` 前缀下的 POST 才进 write handler，其中 `build-graph` / `clear-kb` / `reindex` 三条走 `store.CreateJob`（分发 `handlers.go:630`、写侧 case `admin_jobs_native.go:235`），`reindex-chunks` 走专用提交链（`:231`），其余未列出的 POST 路径在写侧 default 返回 404 `NOT_FOUND`。`supportedJobTypes` 现有三项 `build_graph` / `clear_kb` / `reindex`（`go-backend/internal/adminstore/jobs.go:26-30`），其中 `reindex` 是另一种作业类型，不含 `reindex_chunks`。
 - 未改系统 DNS / hosts，未关闭任何 TLS 校验；GitHub 连通性走 `ssh.github.com:443`，DNS 议题另立运维条目。
 - `stash@{0}`/`stash@{1}`（GI-11）仍未触碰。
 - 密钥扫描口径不变：CI 扫描范围只有 `artifacts/playwright-report/test-results/logs/dev`；
@@ -1311,3 +1308,25 @@ PR #2 元数据（权威复核）：`gh pr view 2 --json commits --jq '.commits|
 - 本地日志：`output/w10/{revision_check_fixed.log,unified_guards_w10.log,p6_disposable_pg_w10.log,secret_baseline_w10_finaltree.log,go_suite_w10_v2.log,mutation_w10.log}`
 - 远端日志：`output/w10/ci_green_72bbe6b.log`（run `37338598712`）
 - 作废日志（勿引用）：`output/w10/go_suite_w10.log`
+
+### 18.8 事实校正（本轮 docs-only，无代码/测试改动）
+
+审查员接收了 §18 的读语义修复与 CI 整改，并指出交接文字里三处事实需要校正。逐条对着代码核实后落笔，
+其中**第三处是我在上一笔校正里自己新写进去的错误**，在提交前自查抓出并一并改掉：
+
+| # | 原表述（错/不精确） | 校正后的事实 | 代码出处 |
+| --- | --- | --- | --- |
+| 1 | 部分唯一索引让"两次读取各自最多命中一行 / 每个状态内同一 `chunk_id` 最多出现一次" | 索引谓词是 `WHERE revision_status = 'current'`，**只约束 current 侧**；`superseded` 历史允许同 chunk 多条，数据库不保证唯一。因此 current 侧建 dict 键有索引背书，superseded 侧必须是列表 | `backend/admin/migrate_chunk_revisions.py:85-88`（PostgreSQL）与 `:126-129`（SQLite）同一条 DDL |
+| 2 | 专用端点写作 `/api/admin/jobs/reindex-chunks` | 实际路径带版本前缀：`POST /api/v1/admin/jobs/reindex-chunks`（连字符） | `go-backend/internal/httpserver/admin_jobs_native.go:231` |
+| 3 | （我上一笔新写入）"通用创建路径同样带前缀：`POST /api/v1/admin/jobs`"，暗示存在通用 POST 创建端点且 404 | **不存在通用 POST 创建端点**。精确路径 `/api/v1/admin/jobs` 只接受 GET 列表，POST 到它在分发层返回 **405**；只有 `/api/v1/admin/jobs/` 前缀下的已列路径进写侧 handler，未列出的 POST 路径才在写侧 default 返回 404 | `handlers.go:622-651`（分发，405 在 `:623-629`）、`admin_jobs_native.go:231/:235` |
+| 4 | 白名单只写"不含 `reindex_chunks`"，未列现有项 | `supportedJobTypes` 现有三项 `build_graph` / `clear_kb` / `reindex`，确实不含 `reindex_chunks`；`reindex` 是另一种作业类型（Neo4j 全文索引重建），别与 `reindex_chunks` 混读 | `go-backend/internal/adminstore/jobs.go:26-30` |
+
+同步修正的还有 §17.5 与 §119（W4-F2 行）里"入口防御仍是路由 404"的**未限定表述**：Wave 8 交付专用端点后，
+404 只对未开放路径成立（判据 1 实测取下划线变体 `/api/v1/admin/jobs/reindex_chunks` 与 `/api/v1/admin/jobs/reindex-document`，
+且这两个路径下 `CreateJob` / `EnqueueReindexChunks` 调用数均为 0，`p6_disposable_pg_integration_test.go:416-438`）。
+
+判据口径同时收紧一句：`len(history) == 1` 与 `raw_n == 2` 是**本用例的期望**（该文档只发生过一次内容变更），
+不是 `chunk_revisions` 的表级不变量——表级不变量只有"每 (kb_id, chunk_id) 至多一条 current"。
+
+本节为 docs-only 校正：未改任何生产代码、测试或门禁；这笔提交的远端 CI 结果记在 PR 描述与交审话术里，
+不在本节宣称。
