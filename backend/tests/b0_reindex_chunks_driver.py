@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -328,11 +329,19 @@ def scenario_capability_off() -> None:
 
 
 def scenario_revision_field_absent() -> None:
+    """legacy v2 无显式字段且**无生效 shadow** → 统一契约拒写 → 终态 INDEX_UNAVAILABLE（不自动重试）。
+
+    P1-1 之后判据来自统一写入契约（不再是 worker 里"只看 primary 有没有字段"的前置拦截），
+    因此本场景必须走**真实** `_write_milvus_projection` + 真实 `upsert_chunks`（只换假 client），
+    否则测的仍是那条已被删除的前置路径。
+    """
     _seed_kb()
     _seed_doc(DOC)
     _seed_rev("c-1", content="x")
-    _install(revision_field=False)
+    client = ReadbackClient()
+    _install_real_vector_write(client, dual_write=False, field_map={V2: False})
     _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+    print("__MILVUS_WRITTEN__" + json.dumps(client.upserts, ensure_ascii=False, default=str))
 
 
 def scenario_graph_write_failed() -> None:
@@ -424,11 +433,17 @@ def scenario_dual_write_shadow_failure() -> None:
 
 
 class ReadbackClient:
-    """写入后回读（F2）用假体：upsert 真记录；query 按 mismatch 开关回读。"""
+    """写入后回读假体：upsert 真记录；query 按集合粒度注入"不一致"。
 
-    def __init__(self, *, mismatch: bool):
+    覆盖 P1-2 要抓的两类形态：① 只有某个集合（如 shadow）读回版本不对；
+    ② 读回不可用（`NoQueryReadbackClient`）。
+    """
+
+    def __init__(self, *, mismatch: bool = False, mismatch_collections=(), tamper_text: bool = False):
         self.upserts: Dict[str, list] = {}
         self.mismatch = mismatch
+        self.mismatch_collections = set(mismatch_collections or ())
+        self.tamper_text = tamper_text
 
     def has_collection(self, name):
         return True
@@ -438,22 +453,41 @@ class ReadbackClient:
         return {"upsert_count": len(data)}
 
     def query(self, *, collection_name, filter, output_fields, limit=None):  # noqa: A002
+        wanted = self._filtered_ids(filter)
         rows = [row for page in self.upserts.get(collection_name, []) for row in page]
+        if wanted is not None:
+            rows = [row for row in rows if str(row.get("chunk_id")) in wanted]
+        tamper = self.mismatch or collection_name in self.mismatch_collections
         out = []
         for row in rows[: (limit or len(rows))]:
             rev = row.get("content_revision")
             out.append(
                 {
                     "chunk_id": row.get("chunk_id"),
-                    "text": row.get("text", ""),
-                    # mismatch=True 模拟"upsert 报成功但读回版本不对"（F2 要抓的形态）
-                    "content_revision": (int(rev) + 1) if (self.mismatch and rev is not None) else rev,
+                    "text": ("tampered" if self.tamper_text else row.get("text", "")),
+                    # 注入"upsert 报成功但读回版本不对"的形态
+                    "content_revision": (int(rev) + 1) if (tamper and rev is not None) else rev,
                 }
             )
         return out
 
+    @staticmethod
+    def _filtered_ids(filter_str: str):
+        m = re.search(r'chunk_id in \[(.*?)\]', filter_str or "")
+        if not m:
+            return None
+        return {v.replace('\\"', '"') for v in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))}
 
-def _install_real_vector_write(client) -> None:
+
+class NoQueryReadbackClient(ReadbackClient):
+    """读回**不可用**的假体：`query` 置 None（getattr 取到 None → 不可调用）。"""
+
+    query = None
+
+
+def _install_real_vector_write(client, *, dual_write: bool = False, shadow: str = "",
+                               field_map: Dict[str, bool] = None,
+                               collection: str = "graphinsight_chunks_v2") -> None:
     """向量腿保持**真实** `_write_milvus_projection` + 真实 `upsert_chunks`，只换 client。
 
     注意导入形态：必须取**单例** `services.embedding_service.embedding_service`；
@@ -461,6 +495,9 @@ def _install_real_vector_write(client) -> None:
     （本轮实测踩过：模块级赋值静默无效，向量腿仍走真实 embedding → 数量不一致）。
     """
     from services.embedding_service import embedding_service
+
+    fields = {"graphinsight_chunks_v2": True}
+    fields.update(field_map or {})
 
     worker._write_neo4j_projection = W.fake_graph
     worker.get_projection_capabilities = lambda: {"graph": True, "vector": True}
@@ -472,17 +509,19 @@ def _install_real_vector_write(client) -> None:
     from services.vector_store import vector_store
 
     vector_store._get_client = lambda: client
-    vector_store._revision_field = {"graphinsight_chunks_v2": True}
+    vector_store._revision_field = dict(fields)
     vector_store.is_enabled = lambda: True
     vector_store.config = lambda: {
         "enabled": True,
         "provider": "milvus",
-        "collection": "graphinsight_chunks_v2",
-        "dual_write": False,
-        "shadow_collection": "",
+        "collection": collection,
+        "dual_write": dual_write,
+        "shadow_collection": shadow,
     }
     vector_store.ensure_collection = lambda **k: None
-    vector_store.has_content_revision_field = lambda *a, **k: True
+    vector_store.has_content_revision_field = lambda coll=None, *a, **k: fields.get(
+        str(coll or collection), True
+    )
 
 
 def scenario_readback_verified() -> None:
@@ -503,6 +542,52 @@ def scenario_readback_mismatch() -> None:
     _seed_rev("c-1", content="x")
     client = ReadbackClient(mismatch=True)
     _install_real_vector_write(client)
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+
+
+# ---------------------------------------------------------------------------
+# P1-1 / P1-2：legacy v2 的 S1 真实链路（worker → 统一契约 → 全目标读回 → PG 状态）
+# ---------------------------------------------------------------------------
+
+V2 = "graphinsight_chunks_v2"
+V3 = "graphinsight_chunks_v3"
+
+
+def scenario_legacy_v2_s1_online() -> None:
+    """P1-1 正向：legacy v2 + 生效 shadow → 真实 worker 链路必须写通。
+
+    期望：v2 行**不含** content_revision（剥版本）；v3 行带显式版本=1；PG 收敛为 indexed/1。
+    """
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    client = ReadbackClient()
+    _install_real_vector_write(client, dual_write=True, shadow=V3,
+                              field_map={V2: False, V3: True})
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+    print("__MILVUS_WRITTEN__" + json.dumps(client.upserts, ensure_ascii=False, default=str))
+
+
+def scenario_readback_shadow_mismatch() -> None:
+    """P1-2 负向：primary 正常、**shadow 读回版本不对**（primary=1、shadow=999 形态）→ 不得 indexed。"""
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    client = ReadbackClient(mismatch_collections={V3})
+    _install_real_vector_write(client, dual_write=True, shadow=V3,
+                              field_map={V2: False, V3: True})
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+    print("__MILVUS_WRITTEN__" + json.dumps(client.upserts, ensure_ascii=False, default=str))
+
+
+def scenario_readback_unavailable() -> None:
+    """P1-2 负向：读回**不可用**（client 无 query）→ 不得 indexed（此前 None 被当成通过）。"""
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    client = NoQueryReadbackClient()
+    _install_real_vector_write(client, dual_write=True, shadow=V3,
+                              field_map={V2: False, V3: True})
     _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
 
 
@@ -832,6 +917,9 @@ SCENARIOS = {
     "dual_write_shadow_failure": scenario_dual_write_shadow_failure,
     "readback_verified": scenario_readback_verified,
     "readback_mismatch": scenario_readback_mismatch,
+    "legacy_v2_s1_online": scenario_legacy_v2_s1_online,
+    "readback_shadow_mismatch": scenario_readback_shadow_mismatch,
+    "readback_unavailable": scenario_readback_unavailable,
     "current_moved": scenario_current_moved,
     "current_deleted_race": scenario_current_deleted_race,
     "idempotent_rerun": scenario_idempotent_rerun,

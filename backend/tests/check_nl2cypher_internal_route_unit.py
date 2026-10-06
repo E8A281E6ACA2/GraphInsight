@@ -10,6 +10,11 @@ from fastapi.testclient import TestClient
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT))
+# 导入 app 之前安装离线服务替身：app 的 startup 会走 neo4j_service._connect() 真连 Neo4j，
+# 门禁必须全程离线（2026-10-06 复核：此前该子项真连过 Neo4j 并拿到鉴权失败）。
+from _offline_services import install_offline_doubles  # noqa: E402
+
+install_offline_doubles()
 
 from main import app  # noqa: E402
 

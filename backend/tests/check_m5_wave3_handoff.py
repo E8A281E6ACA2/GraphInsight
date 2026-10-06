@@ -437,6 +437,11 @@ def section_blocked(h: Harness) -> None:
         f"vector_calls={b.get('vector_calls')}",
     )
     step(
+        "真实写路径零 upsert（契约在写之前拒绝，不是事后回滚）",
+        b.get("real_upserts") == {},
+        f"real_upserts={b.get('real_upserts')}",
+    )
+    step(
         "以 ValidationException(INDEX_UNAVAILABLE) 收口，不排自动重试",
         b.get("job_status") == "failed" and "ValidationException" in str(b.get("error_message"))
         and b.get("retry_count") == 0 and b.get("retry_scheduled_count") == 0,

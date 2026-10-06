@@ -368,6 +368,122 @@ def main() -> int:
     check("C14 tenant 不一致 → SCOPE_MISMATCH", err is not None and err.reason == vs.REASON_SCOPE_MISMATCH)
     check("C14 零写入", len(client.cols["graphinsight_chunks_v3"]["rows"]) == 0)
 
+    # ---- C15–C17：P1-3 metadata 不得覆盖保留字段 / 剥版本必须彻底移除 ----
+    def _mk_chunk(cid: str, revision, metadata: Dict[str, Any]):
+        import services.vector_store as _vs
+
+        return _vs.VectorChunk(chunk_id=cid, doc_id="d1", text=f"text-{cid}", kb_id="kb-a",
+                               tenant_id="t1", project_id="p1", content_hash="h", embedding_model="m",
+                               content_revision=revision, metadata=metadata)
+
+    # C15 版本承载侧：显式 revision=2 + metadata revision=99 → 落库必须是 2
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([_mk_chunk("c1", 2, {"content_revision": 99})], [VEC], intent="backfill_versioned")
+    v3_row = client.cols["graphinsight_chunks_v3"]["rows"][0]
+    check("C15 metadata 里的 content_revision=99 被丢弃，落库为显式 2", v3_row["content_revision"] == 2)
+
+    # C16 剥版本侧（legacy v2 无字段）：metadata 试图补写版本 → 该键必须彻底不存在
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([_mk_chunk("c1", 1, {"content_revision": 99})], [VEC])
+    v2_row = client.cols["graphinsight_chunks_v2"]["rows"][0]
+    check("C16 剥版本后 v2 行**不含** content_revision 键（metadata 不能补写）",
+          "content_revision" not in v2_row)
+    check("C16 影子侧仍带显式版本 1", client.cols["graphinsight_chunks_v3"]["rows"][0]["content_revision"] == 1)
+
+    # C17 metadata 试图覆盖身份/向量 → 必须被丢弃
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks(
+        [_mk_chunk("c-keep", None, {"chunk_id": "hijack", "vector": [9.0] * 4, "kb_id": "kb-evil"})],
+        [VEC],
+    )
+    row = client.cols["graphinsight_chunks_v2"]["rows"][0]
+    check("C17 metadata 不能覆盖 chunk_id", row["chunk_id"] == "c-keep")
+    check("C17 metadata 不能覆盖 vector", row["vector"] == VEC)
+    check("C17 metadata 不能覆盖 kb_id", row["kb_id"] == "kb-a")
+
+    # ---- C18–C20：P1-4 范围条件独立生效 / 非法配置不得退化为无限制 ----
+    # C18 kb_ids 配置非法（","）→ SCOPE_CONFIG_INVALID 且零写入
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
+                               scope={"kb_ids": [], "kb_ids_configured": True,
+                                      "tenant_id": "", "project_id": ""}), client)
+    err = None
+    try:
+        store.upsert_chunks([chunk("c1", 1)], [VEC], intent="backfill_versioned")
+    except vs.VectorWriteContractError as exc:
+        err = exc
+    check("C18 非法配置（配置过但解析为空）→ SCOPE_CONFIG_INVALID",
+          err is not None and err.reason == vs.REASON_SCOPE_CONFIG_INVALID)
+    check("C18 非法配置零写入",
+          len(client.cols["graphinsight_chunks_v3"]["rows"]) == 0 and not client.upsert_calls)
+
+    # C19 kb_ids **未配置** 但 tenant 已配置 → tenant 限制必须独立生效
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    client.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
+                               scope={"kb_ids": [], "kb_ids_configured": False,
+                                      "tenant_id": "t-authorized", "project_id": ""}), client)
+    written = store.upsert_chunks([chunk("c1", 1, tenant="t-authorized")], [VEC],
+                                  intent="backfill_versioned")
+    check("C19 kb_ids 未配置时 tenant 匹配 → 放行", written == 1)
+    client2 = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                          "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    client2.cols["graphinsight_chunks_v2"]["rows"] = [{"chunk_id": "c1", "kb_id": "kb-a"}]
+    store2, vs2 = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
+                                 scope={"kb_ids": [], "kb_ids_configured": False,
+                                        "tenant_id": "t-authorized", "project_id": ""}), client2)
+    err = None
+    try:
+        store2.upsert_chunks([chunk("c1", 1, tenant="t-other")], [VEC], intent="backfill_versioned")
+    except vs2.VectorWriteContractError as exc:
+        err = exc
+    check("C19 kb_ids 未配置但 tenant 不符 → 仍拒（SCOPE_MISMATCH，零写入）",
+          err is not None and err.reason == vs2.REASON_SCOPE_MISMATCH
+          and len(client2.cols["graphinsight_chunks_v3"]["rows"]) == 0)
+
+    # C20 delete_doc / clear 同样受名单与非法配置约束（零 mutation）
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS})
+    store, vs = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
+                               scope={"kb_ids": ["kb-a"], "kb_ids_configured": True,
+                                      "tenant_id": "", "project_id": ""}), client)
+    err = None
+    try:
+        store.delete_doc("d1", "kb-b")
+    except vs.VectorWriteContractError as exc:
+        err = exc
+    check("C20 delete_doc 非名单 KB → KB_NOT_ALLOWED",
+          err is not None and err.reason == vs.REASON_KB_NOT_ALLOWED)
+    check("C20 delete_doc 零 mutation", not client.upsert_calls)
+    err = None
+    try:
+        store.clear(["kb-b"])
+    except vs.VectorWriteContractError as exc:
+        err = exc
+    check("C20 clear 非名单 KB → KB_NOT_ALLOWED 且零 mutation",
+          err is not None and err.reason == vs.REASON_KB_NOT_ALLOWED and not client.upsert_calls)
+    store_bad, vs_bad = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3",
+                                       scope={"kb_ids": [], "kb_ids_configured": True,
+                                              "tenant_id": "", "project_id": ""}), client)
+    err = None
+    try:
+        store_bad.clear(["kb-a"])
+    except vs_bad.VectorWriteContractError as exc:
+        err = exc
+    check("C20 clear 在非法配置下拒绝（不得退化为无限制）",
+          err is not None and err.reason == vs_bad.REASON_SCOPE_CONFIG_INVALID
+          and not client.upsert_calls)
+
     print()
     print(f"RESULT: {len(PASSES)} passed, {len(FAILURES)} failed")
     if FAILURES:

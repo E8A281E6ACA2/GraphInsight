@@ -27,7 +27,16 @@ def _utf8_env(base: dict[str, str]) -> dict[str, str]:
     env = base.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    # 网络护栏：把 tests/netguard 注入 PYTHONPATH，Python 启动时会自动 import sitecustomize，
+    # 从而**禁止一切 TCP 连接**（默认全禁，仅 GUARD_NET_ALLOW 白名单例外）。见 netguard/sitecustomize.py。
+    netguard = str(TESTS_DIR / "netguard")
+    existing = env.get("PYTHONPATH") or ""
+    parts = [netguard] + [p for p in existing.split(os.pathsep) if p]
+    env["PYTHONPATH"] = os.pathsep.join(parts)
     return env
+
+
+NETGUARD_MARKER = "NEUTRALIZED_NETWORK"
 
 
 @dataclass(frozen=True)
@@ -124,6 +133,13 @@ def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str, int]
     combined = output
     if err:
         combined = f"{combined}\n[stderr]\n{err}".strip()
+    # 意外外连 = 该子项不满足隔离要求 → 直接判红（**不因为退出码为 0 就放行**）。
+    if NETGUARD_MARKER in combined:
+        combined = (
+            f"{combined}\n[NETGUARD] 该子项尝试了真实网络连接（被网络护栏拦截）。"
+            "门禁必须全程离线：请补导入阶段/请求阶段的服务替身，或在确有需要时显式配置 GUARD_NET_ALLOW。"
+        )
+        return False, duration, combined, proc.returncode
     return proc.returncode == 0, duration, combined, proc.returncode
 
 

@@ -585,7 +585,7 @@ def section_e3(h: Harness) -> None:
     )
     step(
         "回读不一致告警可定位（日志含原因文案）",
-        "写入后回读不一致" in out,
+        "写入后读回未通过" in out,
         out[-300:],
     )
     step(
@@ -593,6 +593,58 @@ def section_e3(h: Harness) -> None:
         counts.get("graph_indexed") == 1,
         f"counts={counts}",
     )
+
+
+# ---------------------------------------------------------------------------
+# E4. P1-1/P1-2：legacy v2 的 S1 真实链路（worker → 统一契约 → 全目标读回 → PG 状态）
+# ---------------------------------------------------------------------------
+
+
+def section_e4(h: Harness) -> None:
+    print("[E4] P1-1/P1-2 worker 真实链路：legacy v2 S1 写通 + 读回全目标 fail-closed")
+
+    out = scenario(h, "s1_legacy.db", "legacy_v2_s1_online")
+    written = obj_marker(out, "__MILVUS_WRITTEN__")
+    v2_rows = [row for page in (written.get("graphinsight_chunks_v2") or []) for row in page]
+    v3_rows = [row for page in (written.get("graphinsight_chunks_v3") or []) for row in page]
+    revs = rev_map(out)
+    counts = counts_of(out)
+    step(
+        "P1-1 v2 收到写入且**不含** content_revision（剥版本，非 metadata 降级）",
+        bool(v2_rows) and all("content_revision" not in row for row in v2_rows),
+        f"v2={str(v2_rows)[:240]}",
+    )
+    step(
+        "P1-1 v3 收到写入且带显式版本=1（版本由影子承载）",
+        bool(v3_rows) and all(row.get("content_revision") == 1 for row in v3_rows),
+        f"v3={str(v3_rows)[:240]}",
+    )
+    row = revs.get("c-1", {})
+    step(
+        "P1-1 PG 状态收敛 indexed / vector_content_revision=1",
+        row.get("vector_status") == "indexed" and row.get("vector_content_revision") == 1,
+        f"row={row}",
+    )
+    step("P1-1 计数 vector_indexed=1", counts.get("vector_indexed") == 1, f"counts={counts}")
+
+    for name, db in (
+        ("readback_shadow_mismatch", "s1_shadow_bad.db"),
+        ("readback_unavailable", "s1_noverify.db"),
+    ):
+        out = scenario(h, db, name)
+        revs = rev_map(out)
+        counts = counts_of(out)
+        row = revs.get("c-1", {})
+        step(
+            f"P1-2 [{name}] 读回未通过 → PG 记 failed 且版本为 NULL（不虚报 indexed）",
+            row.get("vector_status") == "failed" and row.get("vector_content_revision") is None,
+            f"row={row}",
+        )
+        step(
+            f"P1-2 [{name}] 计数 vector_failed=1 且 vector_indexed=0",
+            counts.get("vector_failed") == 1 and counts.get("vector_indexed") == 0,
+            f"counts={counts}",
+        )
 
 
 def main() -> int:
@@ -614,6 +666,7 @@ def main() -> int:
         section_f(h)
         section_f2(h)
         section_e3(h)
+        section_e4(h)
         section_g(h)
     print("-" * 60)
     if FAILURES:

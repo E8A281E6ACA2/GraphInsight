@@ -290,6 +290,57 @@ class ShadowFailingClient:
         return {"upsert_count": len(data)}
 
 
+class LegacyV2NoShadowClient:
+    """legacy v2（无显式字段）且无 shadow 的假体：记录真实 upsert 调用，供"零写入"断言。"""
+
+    def __init__(self) -> None:
+        self.upserts: Dict[str, list] = {}
+
+    def has_collection(self, name):
+        return True
+
+    def upsert(self, *, collection_name, data):  # noqa: A002 - 匹配 pymilvus 关键字签名
+        self.upserts.setdefault(collection_name, []).append(data)
+        return {"upsert_count": len(data)}
+
+    def query(self, *, collection_name, filter, output_fields, limit=None):  # noqa: A002
+        return []
+
+
+def _install_legacy_v2_no_shadow() -> LegacyV2NoShadowClient:
+    """§8.5 场景（P1-1 后判据统一到写入契约）：向量腿走**真实**写入路径，只换 client。
+
+    primary 无显式 `content_revision` 字段且 dual_write 关闭 → 统一契约在**写之前**拒绝
+    （`VectorStoreSchemaError`）→ worker 映射 `revision_field_absent` → 终态 `INDEX_UNAVAILABLE`
+    （不自动重试）、向量零写入、投影保持 pending。这样测的是契约本身，而不是已被删除的
+    "worker 里只看 primary 有没有字段"的前置拦截。
+    """
+    import services.chunk_projection_reindex as worker
+    from services.embedding_service import embedding_service
+    from services.vector_store import vector_store
+
+    client = LegacyV2NoShadowClient()
+    worker._write_neo4j_projection = W.fake_graph
+    worker.get_projection_capabilities = lambda: {"graph": True, "vector": True}
+    worker._existing_milvus_fields = lambda kb_id, chunk_ids: {}
+    embedding_service.embed_texts = lambda texts: [[0.1, 0.2] for _ in texts]
+    embedding_service.config = lambda: {"model": "m-test"}
+    embedding_service.content_hash = lambda value: "h-test"
+    vector_store._get_client = lambda: client
+    vector_store._revision_field = {"graphinsight_chunks_v2": False}
+    vector_store.is_enabled = lambda: True
+    vector_store.config = lambda: {
+        "enabled": True,
+        "provider": "milvus",
+        "collection": "graphinsight_chunks_v2",
+        "dual_write": False,
+        "shadow_collection": "",
+    }
+    vector_store.ensure_collection = lambda **k: None
+    vector_store.has_content_revision_field = lambda coll=None, *a, **k: False
+    return client
+
+
 def _install_shadow_vector_store() -> ShadowFailingClient:
     from services.embedding_service import embedding_service
     from services.vector_store import vector_store
@@ -803,7 +854,7 @@ def scenario_index_unavailable(tmp: Path) -> None:
             ).scalar_one()
         )
 
-    _install_worker(revision_field=False)
+    client = _install_legacy_v2_no_shadow()
     from admin.services.job_service import job_service as svc
 
     svc._schedule_retry = lambda *a, **k: None
@@ -820,6 +871,7 @@ def scenario_index_unavailable(tmp: Path) -> None:
                 "error_message": row["error_message"][:220],
                 "retry_count": row["retry_count"],
                 "vector_calls": sorted(W.vector_calls),
+                "real_upserts": {k: len(v) for k, v in client.upserts.items()},
                 "c_1": revs.get("c-1"),
                 "doc_state": _documents().get(DOC),
                 "audit_details": audits[0]["details"] if audits else {},
