@@ -230,6 +230,16 @@ def main() -> int:
          probe_ok is False and "guard_loaded" in probe_out and probe_rc == 0,
          f"ok={probe_ok} rc={probe_rc} out={probe_out[-200:]}")
 
+    # N12 socket 级阻断证据：**不带离线替身**、直接 socket 连接 localhost:7687（与门禁里
+    # "成功连接到 Neo4j: bolt://localhost:7687" 同 host:port）→ netguard 在 **socket 层**阻断。
+    # 这是"零真实服务连接"的第二道防线证据：即使 driver 层离线替身失效，真实 socket 连接也会被拦。
+    s12 = _run_child(SILENT_CONNECT.format(host="localhost", port=7687))
+    s12_blocked = [r for r in s12["violations"] if r.get("event") == "blocked_connect"]
+    step("N12 socket 级阻断：localhost:7687 被 netguard 拦截并留痕（第二道防线）",
+         len(s12_blocked) == 1 and str(s12_blocked[0].get("port")) == "7687"
+         and str(s12_blocked[0].get("host")) == "localhost",
+         f"violations={s12['violations']}")
+
     print()
     print(f"RESULT: {len(PASSES)} passed, {len(FAILURES)} failed")
     if FAILURES:
