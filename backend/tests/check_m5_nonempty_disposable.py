@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -524,37 +525,80 @@ def _extract_line(out: str, prefix: str) -> Optional[str]:
     return None
 
 
+def _parse_json_line(out: str, prefix: str) -> Optional[dict]:
+    """按前缀取行并 JSON 解析；解析失败/缺失返回 None（不得用字符串包含判断）。"""
+    raw = _extract_line(out, prefix)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001 - 结构化解析失败视为不可用
+        return None
+
+
+def _parse_int(out: str, key: str) -> Optional[int]:
+    """按 `key=<整数>` 精确解析（`rows_new=10` 不会被当成 `rows_new=1`）。"""
+    m = re.search(rf"{re.escape(key)}=(-?\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def _snap_ok(snap: Optional[dict]) -> bool:
+    """快照必须存在（exists=1）且读到唯一行（rows=1）；primary 不存在不得通过。"""
+    return snap is not None and snap.get("exists") == 1 and snap.get("rows") == 1
+
+
+def _same_snap(a: Optional[dict], b: Optional[dict]) -> bool:
+    """严格比较字段与向量（向量逐元素容差，其余字段精确相等）。"""
+    if not _snap_ok(a) or not _snap_ok(b):
+        return False
+    for key in ("chunk_id", "kb_id", "doc_id", "text", "rev"):
+        if a.get(key) != b.get(key):
+            return False
+    va, vb = a.get("vector"), b.get("vector")
+    if va is None or vb is None:
+        return va is vb
+    if len(va) != len(vb):
+        return False
+    return all(abs(x - y) < 1e-5 for x, y in zip(va, vb))
+
+
 def verify_backfill(tmp: Path, kb: str, bf_chunk: str) -> None:
     """单向回填（backfill_versioned）：backfill 组 chunk（bf_chunk）→ rows_new=1 + 实际存储对账。
 
     需要 dual_write/shadow 生效（_upsert_backfill_versioned 依赖 resolve_dual_write().active）。
-    对账：primary 前后字段及向量完全不变、shadow 新增显式 content_revision=1、重跑两侧内容不变。
+    对账（结构化，禁止字符串包含）：primary 前后均 exists=1/rows=1 且字段向量完全不变、
+    shadow 新增显式 content_revision=1（整数相等）、重跑 rows_new=0 且两侧内容不变。
     """
     def _snapshot():
         out = _recon_out(tmp, kb, bf_chunk)
-        return _extract_line(out, "BF_PRIMARY="), _extract_line(out, "BF_SHADOW=")
+        return _parse_json_line(out, "BF_PRIMARY="), _parse_json_line(out, "BF_SHADOW=")
 
     before_primary, before_shadow = _snapshot()
 
     code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
     add_step("单向回填：backfill 退出 0", code == 0, out[-400:])
-    add_step("单向回填：rows_new=1（backfill 组 bf_chunk）", "rows_new=1" in out, out[-400:])
+    add_step("单向回填：rows_new=1（整数相等）", _parse_int(out, "rows_new") == 1, out[-400:])
 
     after_primary, after_shadow = _snapshot()
-    add_step("单向回填：primary 前后字段及向量完全不变",
-             before_primary is not None and before_primary == after_primary,
+    add_step("单向回填：primary 前后均 exists=1 且 rows=1",
+             _snap_ok(before_primary) and _snap_ok(after_primary),
              f"before={before_primary} after={after_primary}")
-    add_step("单向回填：shadow 新增显式 content_revision=1",
-             after_shadow is not None and '"rev": 1' in after_shadow, after_shadow)
+    add_step("单向回填：primary 前后字段及向量完全不变",
+             _same_snap(before_primary, after_primary),
+             f"before={before_primary} after={after_primary}")
+    add_step("单向回填：shadow 新增显式 content_revision=1（整数相等）",
+             _snap_ok(after_shadow) and after_shadow.get("rev") == 1, str(after_shadow))
 
     code2, out2 = run_py(tmp, "admin/backfill_chunk_revisions.py",
                          ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
-    add_step("单向回填：重跑 rows_new=0", code2 == 0 and "rows_new=0" in out2, out2[-400:])
+    add_step("单向回填：重跑 rows_new=0（整数相等）",
+             code2 == 0 and _parse_int(out2, "rows_new") == 0, out2[-400:])
     rerun_primary, rerun_shadow = _snapshot()
     add_step("单向回填：重跑两侧内容不变",
-             rerun_primary == after_primary and rerun_shadow == after_shadow,
-             f"primary_same={rerun_primary == after_primary} shadow_same={rerun_shadow == after_shadow}")
+             _same_snap(rerun_primary, after_primary) and _same_snap(rerun_shadow, after_shadow),
+             f"primary_same={_same_snap(rerun_primary, after_primary)} "
+             f"shadow_same={_same_snap(rerun_shadow, after_shadow)}")
 
 
 def verify_readback(tmp: Path, kb: str, s1_chunk: str, bf_chunk: str) -> None:
@@ -779,16 +823,34 @@ def write_evidence(base: Path, run_id: str, exec_time: str) -> int:
 
     # 阶段 6：复验**最终落盘版本**（P1：不能只复验初版；重写后必须读回最终文件，
     # 否则"第二次写入损坏/不一致"会静默返回 0 + ROUND_EXIT=0）。
-    expected_round_exit = "ROUND_EXIT=%d" % (2 if finalized_failed else 0)
+    # P2：还要校验步骤状态与 meta 统计一致——`CHECKS_TOTAL==len(steps)`、
+    # `CHECKS_FAILED==count(ok=false)`、`ROUND_EXIT==2 iff failed>0`，防止"篡改步骤状态但不改步骤数"假绿。
+    def _meta_int(text: str, key: str) -> Optional[int]:
+        m = re.search(rf"{re.escape(key)}=(-?\d+)", text)
+        return int(m.group(1)) if m else None
+
     try:
         final_doc = json.loads(steps_path.read_text(encoding="utf-8"))
         final_meta_text = meta_path.read_text(encoding="utf-8")
+        final_steps = final_doc.get("steps")
+        final_failed_count = (
+            sum(1 for s in final_steps if isinstance(s, dict) and s.get("ok") is False)
+            if isinstance(final_steps, list) else -1
+        )
+        meta_total = _meta_int(final_meta_text, "CHECKS_TOTAL")
+        meta_failed = _meta_int(final_meta_text, "CHECKS_FAILED")
+        meta_round_exit = _meta_int(final_meta_text, "ROUND_EXIT")
+
         final_ok = (
             final_doc.get("run_id") == run_id
-            and isinstance(final_doc.get("steps"), list)
-            and len(final_doc.get("steps")) == len(final_snapshot)
+            and isinstance(final_steps, list)
+            and len(final_steps) == len(final_snapshot)
             and f"RUN_ID={run_id}" in final_meta_text
-            and expected_round_exit in final_meta_text
+            # P2：步骤状态与 meta 统计一致
+            and final_failed_count >= 0
+            and meta_total == len(final_steps)
+            and meta_failed == final_failed_count
+            and meta_round_exit == (2 if final_failed_count > 0 else 0)
         )
         final_detail = "" if final_ok else "最终落盘内容与预期不一致"
     except Exception as exc:  # noqa: BLE001
@@ -796,7 +858,7 @@ def write_evidence(base: Path, run_id: str, exec_time: str) -> int:
         final_detail = f"{type(exc).__name__}: {exc}"
 
     if not final_ok:
-        add_step("证据合同复验（最终落盘版本：JSON 可解析 + RUN_ID 一致 + 步骤数/ROUND_EXIT 自洽）",
+        add_step("证据合同复验（最终落盘版本：JSON 可解析 + RUN_ID/步骤数/失败数/ROUND_EXIT 自洽）",
                  False, final_detail)
         _write_emergency_evidence(base, run_id, exec_time, f"finalize_verify_failed:{final_detail}")
         return 2
