@@ -1028,6 +1028,20 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 回归（实跑）：统一门禁 `total=23 failed=0`；护栏自检 `13/0`（12→13，N12）；契约矩阵 `77/0`、B0 全绿不变。
 连接范围不变：未 push；真实 disposable 执行仍**未授权**（本轮仅修复执行器，未执行真实容器）；M5-B1 冻结。
 
+---
+
+### 9.20 证据合同 fail-closed 收口 + S1/backfill 分组（第八轮 · 2026-10-06）
+
+收口 disposable 执行器后再申请真实执行（仍仅改脚本/测试/门禁/文档，未执行真实容器）：
+
+1. **证据合同 fail-closed**：`write_evidence` 改为"先检查后生成"——写 steps JSON（快照）→ 复验 JSON（读回：RUN_ID 一致 + 可解析 + 步骤数）→ 复验 meta（RUN_ID 落盘可读）→ 用最终 STEPS/CHECKS 一次性重写 JSON+meta。JSON/meta/退出码共用同一份 `finalized_failed`（`CHECKS_TOTAL`=最终步骤数、`CHECKS_FAILED`=最终失败数、`ROUND_EXIT=2 iff 有失败`）；不允许"先写 ROUND_EXIT=0 再追加复验步骤"。写盘失败 → 紧急证据 `nonempty_emergency.txt`（ROUND_EXIT=2）+ 返回 2。
+2. **finally 独立保护结构**：`archive_manifests`/`cleanup`/`write_evidence` 各自 try/except，任一步失败记录失败、继续后续，异常不覆盖最终失败证据；`write_evidence` 返回 2 时 main 返回 2。
+3. **S1 与 backfill 两组独立数据**：S1 组 `s1c1`（有 current revision → `online_s1` 双写，primary 剥版本 + shadow 带版本）；backfill 组 `bfc1`（PG 无 current revision、primary 预置向量、shadow 无 → `backfill_versioned`，`rows_new=1`、primary 不变、shadow 新增显式 content_revision）。
+4. **离线故障注入测试** `check_m5_nonempty_disposable_contract.py`（21 项）：JSON 解析失败 / RUN_ID 不一致 / meta 读取失败 / evidence 写入失败（emergency 证据 + ROUND_EXIT=2 + CHECKS_FAILED>0）；真实 main 流程的 finally 保护（archive/cleanup/write_evidence 失败不跳过后续）；未授权/dry-run/预检失败均不调用 `ensure_containers`（不创建容器）。
+
+回归（实跑）：统一门禁 `total=23 failed=0`；护栏自检 `13/0`；契约矩阵 `77/0`；B0 全绿；`check_m5_nonempty_disposable_contract.py` `21/0`；`--dry-run` RC=3。
+连接范围不变：未 push；真实 disposable 执行仍**未授权**；M5-B1 冻结。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
