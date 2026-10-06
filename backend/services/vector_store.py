@@ -592,6 +592,14 @@ class MilvusVectorStore:
                 )
         rows = self._build_rows(chunks, vectors)
         result = client.upsert(collection_name=collection, data=rows)
+        # upsert 后强制 flush：新数据落在 growing segment，不 flush 时写后读回 query 看不到，
+        # 会把"写入成功"误判成 VERIFY_MISMATCH 假阴（§15.4 写后读回必须可见）。
+        try:
+            flusher = getattr(client, "flush", None)
+            if callable(flusher):
+                flusher(collection_name=collection)
+        except Exception:  # noqa: BLE001 - flush 失败交给读回判 unavailable
+            pass
         return require_upsert_count(result, len(rows))
 
     def _query_rows(self, collection: str, chunk_ids: List[str], fields: List[str]) -> Dict[str, Any]:
@@ -611,6 +619,14 @@ class MilvusVectorStore:
         query = getattr(client, "query", None)
         if not callable(query):
             return {"status": "unavailable", "rows": []}
+        # 读回前必须 load：upsert 后的新数据落在 growing segment，未 load 时 query 看不到，
+        # 会把"写入成功"误判成"读回为空/不一致"（VERIFY_MISMATCH 假阴）。load 失败 → 不可校验。
+        try:
+            loader = getattr(client, "load_collection", None)
+            if callable(loader):
+                loader(collection)
+        except Exception:  # noqa: BLE001 - load 失败 = 无法校验，不得继续 query
+            return {"status": "unavailable", "rows": [], "missing_field": None}
         expr = "chunk_id in [" + ", ".join(
             f'"{self._escape_filter_value(cid)}"' for cid in ids
         ) + "]"

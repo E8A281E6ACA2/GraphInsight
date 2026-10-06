@@ -456,6 +456,25 @@ def _load_milvus_chunks(kb_id: str) -> Dict[str, Dict[str, Any]]:
     return rows
 
 
+_EMBEDDING_DETERMINISTIC_ENV = "EMBEDDING_DETERMINISTIC_VECTOR"
+
+
+def _deterministic_vector(text: str, dim: int = 4) -> List[float]:
+    """确定性本地向量（dim=4，不回外部模型）。disposable 全链路用，生产不触发。"""
+    digest = hashlib.sha256((text or "").encode("utf-8")).digest()
+    return [round(((digest[i % len(digest)] / 255.0) - 0.5) * 2.0, 6) for i in range(dim)]
+
+
+def _embed_texts_for_backfill(texts: List[str]) -> List[List[float]]:
+    """回填 embedding：disposable 环境用确定性向量（`EMBEDDING_DETERMINISTIC_VECTOR=true`），
+    生产走真实 embedding_service。避免 disposable 用假 API key 触发 401 而误判 vector 失败。"""
+    if os.environ.get(_EMBEDDING_DETERMINISTIC_ENV) == "true":
+        return [_deterministic_vector(t) for t in texts]
+    from services.embedding_service import embedding_service
+
+    return embedding_service.embed_texts(texts)
+
+
 def _backfill_milvus(kb_id: str, plans: List[ChunkPlan]) -> Dict[str, str]:
     """历史回填的 Milvus 腿：走**统一写入契约**（`intent=backfill_versioned`）。
 
@@ -487,7 +506,6 @@ def _backfill_milvus(kb_id: str, plans: List[ChunkPlan]) -> Dict[str, str]:
     client, collection = _milvus_client()
     if not client.has_collection(collection):
         return {item.chunk_id: "skipped" for item in plans}
-    from services.embedding_service import embedding_service
 
     def _mark(items, state: str) -> None:
         for item in items:
@@ -496,7 +514,7 @@ def _backfill_milvus(kb_id: str, plans: List[ChunkPlan]) -> Dict[str, str]:
     for chunk in _batched(plans, 10):
         texts = [item.source_content for item in chunk]
         try:
-            vectors = embedding_service.embed_texts(texts)
+            vectors = _embed_texts_for_backfill(texts)
         except Exception:  # noqa: BLE001 - embedding 失败逐 chunk 记 failed，不伪装 indexed
             _mark(chunk, "failed")
             continue
