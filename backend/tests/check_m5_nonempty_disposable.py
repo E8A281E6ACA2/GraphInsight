@@ -79,6 +79,8 @@ CHECKS: List[Tuple[str, bool]] = []
 STEPS: List[Dict[str, Any]] = []
 # 是否已创建一次性容器/网络（决定 cleanup 是否销毁；预检拒绝时不得误删他人同名对象）。
 CREATED_RESOURCES = False
+# 是否已播种 Neo4j/PG 数据（决定 cleanup 是否连 Neo4j/Milvus 清理；未播种时不得连接任何引擎）。
+SEEDED = False
 
 
 def say(line: str = "") -> None:
@@ -126,10 +128,12 @@ def print_plan() -> None:
 # ---------------------------------------------------------------------------
 # docker 辅助
 # ---------------------------------------------------------------------------
-def _run(cmd: List[str], *, timeout: int = 300, label: str = "", cwd: Optional[str] = None) -> Tuple[int, str]:
+def _run(cmd: List[str], *, timeout: int = 300, label: str = "", cwd: Optional[str] = None,
+         env: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout, cwd=cwd or str(BACKEND))
+                              errors="replace", timeout=timeout, cwd=cwd or str(BACKEND),
+                              env=env or os.environ)
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except subprocess.TimeoutExpired:
         return 124, f"timeout>{timeout}s ({label})"
@@ -213,7 +217,8 @@ def run_py(tmp: Path, script: str, args: List[str], *, neo4j_uri: str = NEO4J_UR
            milvus_uri: str = MILVUS_URI, dual_write: bool = True) -> Tuple[int, str]:
     cmd = [sys.executable, script] + list(args)
     env = base_env(tmp, neo4j_uri=neo4j_uri, milvus_uri=milvus_uri, dual_write=dual_write)
-    return _run(cmd, timeout=300, label=script, cwd=str(BACKEND))
+    # 受控 env 必须真正传给子进程（否则子进程继承宿主 os.environ，受控隔离失效）。
+    return _run(cmd, timeout=300, label=script, cwd=str(BACKEND), env=env)
 
 
 def pg_connect():
@@ -306,7 +311,13 @@ def ensure_containers() -> None:
         if pg_ready and neo_ready and mil_ready:
             break
         time.sleep(3)
-    add_step("disposable 容器就绪（PG + Neo4j + Milvus）", pg_ready and neo_ready and mil_ready,
+    if not (pg_ready and neo_ready and mil_ready):
+        # 就绪失败 fail-closed：抛异常 → main 的 except 记入失败证据并停止后续迁移/播种。
+        raise RuntimeError(
+            f"disposable 容器就绪失败（pg={pg_ready} neo4j={neo_ready} milvus={mil_ready}），"
+            "不得继续迁移/播种"
+        )
+    add_step("disposable 容器就绪（PG + Neo4j + Milvus）", True,
              f"pg={pg_ready} neo4j={neo_ready} milvus={mil_ready}")
 
 
@@ -381,6 +392,8 @@ def seed_nonempty(tmp: Path, kb: str, docs: Dict[str, List[str]]) -> None:
                          "t": "t-nonempty", "p": "p-nonempty"},
                     )
         driver.close()
+        global SEEDED
+        SEEDED = True  # Neo4j + PG 已播种，cleanup 才允许连 Neo4j/Milvus 清理
         add_step("Neo4j Chunk 节点播种（真实图库）", True)
     except Exception as exc:  # noqa: BLE001
         add_step("Neo4j Chunk 节点播种（真实图库）", False, f"{type(exc).__name__}: {exc}")
@@ -528,24 +541,27 @@ def verify_rollback(tmp: Path, kb: str) -> None:
 
 
 def cleanup(tmp: Path, kb: str, keep_containers: bool) -> None:
-    try:
-        driver = neo4j_driver()
-        with driver.session() as s:
-            s.run("MATCH (c:Chunk) WHERE c.kb_id=$kb DETACH DELETE c", {"kb": kb})
-        driver.close()
-        add_step("Neo4j 播种节点已删除", True)
-    except Exception as exc:  # noqa: BLE001
-        add_step("Neo4j 播种节点已删除", False, f"{type(exc).__name__}: {exc}")
-    try:
-        from pymilvus import MilvusClient
+    # 所有权守卫：只有真正播种过（SEEDED）才允许连 Neo4j/Milvus 清理。
+    # 预检失败/未播种时不得连接任何引擎（否则会连到可能不存在的容器，或误删他人对象）。
+    if SEEDED:
+        try:
+            driver = neo4j_driver()
+            with driver.session() as s:
+                s.run("MATCH (c:Chunk) WHERE c.kb_id=$kb DETACH DELETE c", {"kb": kb})
+            driver.close()
+            add_step("Neo4j 播种节点已删除", True)
+        except Exception as exc:  # noqa: BLE001
+            add_step("Neo4j 播种节点已删除", False, f"{type(exc).__name__}: {exc}")
+        try:
+            from pymilvus import MilvusClient
 
-        c = MilvusClient(uri=MILVUS_URI, timeout=3)
-        for name in (PRIMARY_COLLECTION, SHADOW_COLLECTION):
-            if c.has_collection(name):
-                c.drop_collection(name)
-        add_step("Milvus 合成 collection 已删除", True)
-    except Exception as exc:  # noqa: BLE001
-        add_step("Milvus 合成 collection 已删除", False, f"{type(exc).__name__}: {exc}")
+            c = MilvusClient(uri=MILVUS_URI, timeout=3)
+            for name in (PRIMARY_COLLECTION, SHADOW_COLLECTION):
+                if c.has_collection(name):
+                    c.drop_collection(name)
+            add_step("Milvus 合成 collection 已删除", True)
+        except Exception as exc:  # noqa: BLE001
+            add_step("Milvus 合成 collection 已删除", False, f"{type(exc).__name__}: {exc}")
     try:
         shutil.rmtree(tmp, ignore_errors=True)
         add_step("临时目录已删除", not tmp.exists())
@@ -566,9 +582,9 @@ def cleanup(tmp: Path, kb: str, keep_containers: bool) -> None:
 
 
 def write_evidence(base: Path, run_id: str, exec_time: str) -> None:
-    failed = [n for n, ok in CHECKS if not ok]
-    round_exit = 0 if not failed else 2
     base.mkdir(parents=True, exist_ok=True)
+    # 快照：落盘后不再往 JSON 追加步骤（避免"写完 JSON 又 add_step"导致复验必然失败）。
+    steps_snapshot = list(STEPS)
     steps_doc = {
         "schema": "gate0-nonempty-disposable-steps-v1",
         "run_id": run_id,
@@ -580,11 +596,28 @@ def write_evidence(base: Path, run_id: str, exec_time: str) -> None:
             "milvus": f"{MILVUS}@127.0.0.1:{MILVUS_PORT}",
         },
         "write_paths": {"s1_dual_write": "online_s1(primary+shadow)", "backfill": "backfill_versioned(shadow-only)"},
-        "steps": STEPS,
+        "steps": steps_snapshot,
     }
-    (base / "nonempty_steps.json").write_text(
+    steps_path = base / "nonempty_steps.json"
+    steps_path.write_text(
         json.dumps(steps_doc, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
     )
+
+    # 独立复验 JSON：读回与快照自洽（RUN_ID 一致 + JSON 可解析 + 步骤数 == 快照数）。
+    try:
+        read_back = json.loads(steps_path.read_text(encoding="utf-8"))
+        json_ok = (
+            read_back.get("run_id") == run_id
+            and isinstance(read_back.get("steps"), list)
+            and len(read_back.get("steps")) == len(steps_snapshot)
+        )
+        detail = f"run_id_ok={read_back.get('run_id') == run_id} steps_ok={len(read_back.get('steps')) == len(steps_snapshot)}"
+    except Exception as exc:  # noqa: BLE001
+        json_ok = False
+        detail = f"{type(exc).__name__}: {exc}"
+
+    failed = [n for n, ok in CHECKS if not ok]
+    round_exit = 0 if (not failed and json_ok) else 2
     meta = [
         "GATE NONEMPTY-DISPOSABLE ROUND METADATA (single round, overwritten each round)",
         "RUN_ID=" + run_id,
@@ -596,24 +629,17 @@ def write_evidence(base: Path, run_id: str, exec_time: str) -> None:
         "ROUND_EXIT=%d" % round_exit,
         "NOTE: real engines are disposable docker containers; no shared dev, no shared Milvus, no push.",
     ]
-    (base / "nonempty_meta.txt").write_text("\n".join(meta) + "\n", encoding="utf-8")
-    add_step("证据落盘（meta 覆盖写 + 步骤 JSON 可解析）",
-             (base / "nonempty_meta.txt").exists() and (base / "nonempty_steps.json").exists())
-    # 独立复验证据合同：读回 JSON 与 meta，校验 RUN_ID 一致、JSON 可解析、step 数自洽。
+    meta_path = base / "nonempty_meta.txt"
+    meta_path.write_text("\n".join(meta) + "\n", encoding="utf-8")
+
+    # 复验 meta（RUN_ID 落盘可读）
     try:
-        read_back = json.loads((base / "nonempty_steps.json").read_text(encoding="utf-8"))
-        meta_text = (base / "nonempty_meta.txt").read_text(encoding="utf-8")
-        contract_ok = (
-            read_back.get("run_id") == run_id
-            and f"RUN_ID={run_id}" in meta_text
-            and isinstance(read_back.get("steps"), list)
-            and len(read_back.get("steps")) == len(STEPS)
-        )
-        add_step("证据合同独立复验（RUN_ID 一致 + JSON 可解析 + meta 覆盖写）", contract_ok,
-                 f"run_id_ok={read_back.get('run_id') == run_id}")
-    except Exception as exc:  # noqa: BLE001
-        add_step("证据合同独立复验（RUN_ID 一致 + JSON 可解析 + meta 覆盖写）", False,
-                 f"{type(exc).__name__}: {exc}")
+        meta_ok = f"RUN_ID={run_id}" in meta_path.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        meta_ok = False
+
+    # 复验结果进失败证据（在 JSON/meta 落盘之后，add_step 不影响已写内容）
+    add_step("证据合同独立复验（RUN_ID 一致 + JSON 可解析 + 步骤数自洽）", json_ok and meta_ok, detail)
 
 
 def archive_manifests(base: Path, tmp: Path) -> None:
