@@ -970,6 +970,11 @@ Wave3、M5-A、manifest、dual_write、scope isolation 全绿；护栏自检 `9 
 `12 passed, 0 failed`（9 → 12）；B0（含 E4–E6）全绿。
 连接范围不变：零真实服务连接，未 push；真实 v3 迁移仍关闭，M5-B1 冻结。
 
+**下一阶段脚本已准备（未执行）**：`backend/tests/check_m5_nonempty_disposable.py` —— 非空 disposable
+全链路编排（真实 PG/Neo4j/Milvus、独立容器与卷、S1 双写与单向回填分别验证、读回、失败重放、幂等、回滚）。
+默认 `--dry-run` 打印计划（exit 3）；执行需 `--authorize NONEMPTY-DISPOSABLE-AUTHORIZED`，执行范围另行确认。
+已知约束：一次性 Milvus standalone（内嵌 etcd）可能起不来，起不来则 fail-closed 报 FAIL，不假绿。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
