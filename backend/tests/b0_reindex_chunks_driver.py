@@ -451,6 +451,18 @@ class ReadbackClient:
     def has_collection(self, name):
         return True
 
+    def describe_collection(self, name):
+        # Milvus 默认开启动态字段；本假体的行不带 $meta（无动态残留）→ 动态渠道可确认、无版本键
+        return {"fields": [
+            {"name": "chunk_id", "data_type": "VARCHAR"},
+            {"name": "doc_id", "data_type": "VARCHAR"},
+            {"name": "text", "data_type": "VARCHAR"},
+            {"name": "kb_id", "data_type": "VARCHAR"},
+            {"name": "tenant_id", "data_type": "VARCHAR"},
+            {"name": "project_id", "data_type": "VARCHAR"},
+            {"name": "vector", "data_type": "FLOAT_VECTOR", "params": {"dim": 2}},
+        ], "enable_dynamic_field": True}
+
     def upsert(self, *, collection_name, data):  # noqa: A002 - 匹配 pymilvus 关键字
         self.upserts.setdefault(collection_name, []).append(data)
         return {"upsert_count": len(data)}
@@ -610,6 +622,26 @@ def scenario_scope_guard_before_side_effects() -> None:
         scope={"kb_ids": ["kb-unrelated"], "kb_ids_configured": True,
                "tenant_id": "", "project_id": ""},
     )
+    _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
+    print("__SIDE_EFFECTS__" + json.dumps({
+        "ensure_collection_calls": client.ensure_collection_calls,
+        "create_calls": client.create_calls,
+        "upserts": {k: len(v) for k, v in client.upserts.items()},
+    }, ensure_ascii=False, sort_keys=True))
+
+
+def scenario_dual_config_guard_before_side_effects() -> None:
+    """P1 负向：目标 KB 合法，但 dual_write=true + shadow=''（配置非法）→ 写前拒绝、零副作用。
+
+    复核反例：此前写前入口只跑范围守卫；双写配置守卫在 upsert 内部——目标 KB 合法时，
+    集合已经被建出来后才拒绝。
+    """
+    _seed_kb()
+    _seed_doc(DOC)
+    _seed_rev("c-1", content="x")
+    client = ReadbackClient()
+    _install_real_vector_write(client, dual_write=True, shadow="",
+                               field_map={V2: False, V3: True})
     _run(_payload([{"chunk_id": "c-1", "target_revision": 1}]))
     print("__SIDE_EFFECTS__" + json.dumps({
         "ensure_collection_calls": client.ensure_collection_calls,
@@ -959,6 +991,7 @@ SCENARIOS = {
     "readback_shadow_mismatch": scenario_readback_shadow_mismatch,
     "readback_unavailable": scenario_readback_unavailable,
     "scope_guard_before_side_effects": scenario_scope_guard_before_side_effects,
+    "dual_config_guard_before_side_effects": scenario_dual_config_guard_before_side_effects,
     "current_moved": scenario_current_moved,
     "current_deleted_race": scenario_current_deleted_race,
     "idempotent_rerun": scenario_idempotent_rerun,

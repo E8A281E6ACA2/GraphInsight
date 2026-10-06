@@ -143,6 +143,58 @@ def main() -> int:
          probe_ok is False and "NETGUARD" in probe_out and "probe_silent_connect" in case.name,
          f"ok={probe_ok} rc={probe_rc} out={probe_out[-200:]}")
 
+    # N6 损坏的违规留痕（坏 JSON 行）不得折为空后放行（复核反例：跳过坏行 → runner 判绿）
+    with tempfile.TemporaryDirectory(prefix="netguard-corrupt-") as corrupt_dir:
+        corrupt_file = Path(corrupt_dir) / "violations.jsonl"
+        corrupt_file.write_text(
+            '{"event": "blocked_connect", "host": "127.0.0.1", "port": 7687\n'  # 半截写入（截断）
+            '{bad json line\n',
+            encoding="utf-8",
+        )
+        read = runner._read_netguard_records(corrupt_file)
+        problems = runner._netguard_problems(
+            {"exists": True, "records": [{"event": "guard_loaded"}], "bad_lines": 0, "error": None},
+            read, "",
+        )
+    step("N6 损坏的违规留痕 → 判红（坏行不折为空）",
+         read.get("bad_lines", 0) >= 1 and any("损坏" in p for p in problems),
+         f"read={read} problems={problems}")
+
+    # N7 留痕读取失败（文件不可读）同样不得构成通过
+    problems = runner._netguard_problems(
+        {"exists": True, "records": [{"event": "guard_loaded"}], "bad_lines": 0, "error": None},
+        {"exists": True, "records": [], "bad_lines": 0, "error": "PermissionError: denied"},
+        "",
+    )
+    step("N7 留痕读取失败 → 判红（证据不可用）",
+         any("读取失败" in p for p in problems), f"problems={problems}")
+
+    # N8 留痕**写入失败**：违规文件指向不可写路径（目录），子进程静默吞异常 →
+    # 护栏回退 stderr 标记，runner 必须判红（不得因为"没写进去"就当没有违规）。
+    with tempfile.TemporaryDirectory(prefix="netguard-unwritable-") as unwritable_dir:
+        # 用"目录"当违规文件路径：open() 写入必然失败
+        probe = Path(unwritable_dir) / "probe_silent_connect.py"
+        probe.write_text(SILENT_CONNECT.format(host="127.0.0.1", port=7687), encoding="utf-8")
+        status_file = Path(unwritable_dir) / "status.jsonl"
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(NETGUARD_DIR) + os.pathsep + (env.get("PYTHONPATH") or "")
+        env["GUARD_NET_STATUS"] = str(status_file)
+        env["GUARD_NET_VIOLATIONS"] = str(Path(unwritable_dir))  # 目录：不可写
+        child = subprocess.run(  # noqa: S603
+            [PYTHON_EXE, str(probe)], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=env, timeout=60, check=False,
+        )
+        child_problems = runner._netguard_problems(
+            runner._read_netguard_records(status_file),
+            {"exists": False, "records": [], "bad_lines": 0, "error": None},
+            (child.stdout or "") + "\n" + (child.stderr or ""),
+        )
+    step("N8 违规留痕写入失败 → stderr 回退标记 + runner 判红",
+         "NEUTRALIZED_NETWORK" in (child.stderr or "")
+         and bool(child_problems) and child.returncode == 0,
+         f"rc={child.returncode} stderr={child.stderr!r} problems={child_problems}")
+
     print()
     print(f"RESULT: {len(PASSES)} passed, {len(FAILURES)} failed")
     if FAILURES:

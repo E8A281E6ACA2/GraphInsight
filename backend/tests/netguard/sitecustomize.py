@@ -36,15 +36,16 @@ _VIOLATION_FILE = (os.environ.get("GUARD_NET_VIOLATIONS") or "").strip()
 _STATUS_FILE = (os.environ.get("GUARD_NET_STATUS") or "").strip()
 
 
-def _append_record(path: str, record: dict) -> None:
-    """追加一条 JSON 行；留痕失败不得影响拦截动作本身（拦截优先）。"""
+def _append_record(path: str, record: dict) -> bool:
+    """追加一条 JSON 行；返回是否成功。留痕失败不得影响拦截动作本身（拦截优先）。"""
     if not path:
-        return
+        return False
     try:
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
     except Exception:  # noqa: BLE001
-        pass
+        return False
 
 
 
@@ -91,13 +92,22 @@ def _blocked(address) -> "NeutralizedNetworkError":
     host, port = _host_port(address)
     # **拦截即留痕**（独立文件，先写再抛）：即使调用方把异常 try/except 掉且不打印，
     # 违规依然可被 runner 检出——"捕获异常且不打印"不能构成假绿。
-    _append_record(_VIOLATION_FILE, {
+    written = _append_record(_VIOLATION_FILE, {
         "event": "blocked_connect",
         "host": host,
         "port": port,
         "pid": os.getpid(),
         "time": time.time(),
     })
+    if not written:
+        # 留痕写不进去（路径不可写等）：回退到 stderr 标记。runner 会把
+        # "出标记但无留痕"判红——留痕写入失败不得构成通过。
+        try:
+            import sys as _sys
+
+            _sys.stderr.write(f"{_MARKER}:{host}:{port} (violation_record_write_failed)\n")
+        except Exception:  # noqa: BLE001
+            pass
     return NeutralizedNetworkError(f"{_MARKER}:{host}:{port}")
 
 

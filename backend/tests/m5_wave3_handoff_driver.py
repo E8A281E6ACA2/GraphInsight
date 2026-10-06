@@ -299,6 +299,18 @@ class LegacyV2NoShadowClient:
     def has_collection(self, name):
         return True
 
+    def describe_collection(self, name):
+        # Milvus 默认开启动态字段；本假体行不带 $meta（无动态残留）
+        return {"fields": [
+            {"name": "chunk_id", "data_type": "VARCHAR"},
+            {"name": "doc_id", "data_type": "VARCHAR"},
+            {"name": "text", "data_type": "VARCHAR"},
+            {"name": "kb_id", "data_type": "VARCHAR"},
+            {"name": "tenant_id", "data_type": "VARCHAR"},
+            {"name": "project_id", "data_type": "VARCHAR"},
+            {"name": "vector", "data_type": "FLOAT_VECTOR", "params": {"dim": 2}},
+        ], "enable_dynamic_field": True}
+
     def upsert(self, *, collection_name, data):  # noqa: A002 - 匹配 pymilvus 关键字签名
         self.upserts.setdefault(collection_name, []).append(data)
         return {"upsert_count": len(data)}

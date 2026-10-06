@@ -44,23 +44,73 @@ def _utf8_env(base: dict[str, str], *, status_file: Path, violations_file: Path)
 NETGUARD_MARKER = "NEUTRALIZED_NETWORK"
 
 
-def _read_netguard_records(path: Path) -> list[dict]:
-    """读取护栏 JSONL 留痕；不存在/不可解析一律返回空列表（缺失由调用方判失败）。"""
-    records: list[dict] = []
+def _read_netguard_records(path: Path) -> dict:
+    """读取护栏 JSONL 留痕，**区分"合法空记录"与"证据损坏"**。
+
+    返回 `{"exists": bool, "records": [...], "bad_lines": int, "error": str|None}`：
+    - 文件不存在 → `exists=False`（合法空：护栏加载后确实没有违规）；
+    - 坏 JSON 行 → `bad_lines>0`（**证据损坏**：可能是半截写入，绝不能当"没有违规"读）；
+    - 读取异常 → `error`（同样按损坏处理）。
+    """
+    result: dict = {"exists": False, "records": [], "bad_lines": 0, "error": None}
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                records.append(item)
+        content = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return []
-    return records
+        return result
+    except OSError as exc:
+        result["exists"] = True
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    result["exists"] = True
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            result["bad_lines"] += 1
+            continue
+        if isinstance(item, dict):
+            result["records"].append(item)
+        else:
+            result["bad_lines"] += 1
+    return result
+
+
+def _netguard_problems(status: dict, violations: dict, combined_output: str) -> list[str]:
+    """护栏判定（纯函数，供自检复用）：返回问题清单，非空即判红。
+
+    判据（相互独立）：
+      1. **加载留痕存在**——没有它 = 隔离根本没生效；
+      2. 留痕**不得损坏**（坏行/读取失败都算证据损坏，不得折为空后放行）；
+      3. 违规留痕必须为空；
+      4. stdout/stderr 出现拦截标记但无违规留痕 = 护栏状态异常（含"留痕写入失败"的回退信号）。
+    """
+    problems: list[str] = []
+    if not status.get("exists"):
+        problems.append("[NETGUARD] 未发现护栏加载留痕：隔离未生效（PYTHONPATH/sitecustomize 注入失败）")
+    if status.get("error"):
+        problems.append(f"[NETGUARD] 加载留痕读取失败（证据不可用）：{status['error']}")
+    if status.get("bad_lines"):
+        problems.append(f"[NETGUARD] 加载留痕存在 {status['bad_lines']} 行损坏记录（证据损坏，不得判通过）")
+    if violations.get("error"):
+        problems.append(f"[NETGUARD] 违规留痕读取失败（证据不可用）：{violations['error']}")
+    if violations.get("bad_lines"):
+        problems.append(
+            f"[NETGUARD] 违规留痕存在 {violations['bad_lines']} 行损坏记录（证据损坏，不得折为空）"
+        )
+    if violations.get("records"):
+        detail = "; ".join(
+            f"{item.get('host')}:{item.get('port')}" for item in violations["records"][:5]
+        )
+        problems.append(
+            f"[NETGUARD] 检测到 {len(violations['records'])} 次真实网络连接尝试（持久留痕，"
+            f"不依赖子进程输出）：{detail}"
+        )
+    if NETGUARD_MARKER in combined_output and not violations.get("records"):
+        problems.append("[NETGUARD] 输出现拦截标记但无违规留痕（护栏状态异常或留痕写入失败）")
+    return problems
 
 
 @dataclass(frozen=True)
@@ -142,7 +192,6 @@ def _resolve_python() -> Path:
 
 def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str, int]:
     started = time.perf_counter()
-    problems: list[str] = []
     with tempfile.TemporaryDirectory(prefix=f"netguard-{case.name}-") as guard_dir_name:
         guard_dir = Path(guard_dir_name)
         status_file = guard_dir / "load_status.jsonl"
@@ -167,22 +216,9 @@ def _run_case(python_bin: Path, case: GuardCase) -> tuple[bool, float, str, int]
     if err:
         combined = f"{combined}\n[stderr]\n{err}".strip()
 
-    # 判红依据（三条独立信号，任一命中即失败；不因为退出码为 0 就放行）：
-    #   1) 护栏**确实加载**（加载留痕存在）——否则"隔离"根本没生效；
-    #   2) 违规留痕为空——**即使子项把拦截异常静默 try/except 掉、stdout 无任何标记**；
-    #   3) stdout 标记（次要信号，便于定位）。
-    if not status_records:
-        problems.append("[NETGUARD] 未发现护栏加载留痕：隔离未生效（PYTHONPATH/sitecustomize 注入失败）")
-    if violation_records:
-        detail = "; ".join(
-            f"{item.get('host')}:{item.get('port')}" for item in violation_records[:5]
-        )
-        problems.append(
-            f"[NETGUARD] 检测到 {len(violation_records)} 次真实网络连接尝试（持久留痕，"
-            f"不依赖子进程输出）：{detail}"
-        )
-    if NETGUARD_MARKER in combined and not violation_records:
-        problems.append("[NETGUARD] 输出现拦截标记但无留痕（护栏状态异常）")
+    # 判红依据见 _netguard_problems：加载留痕必须存在、留痕不得损坏、违规留痕必须为空、
+    # 输出标记与留痕状态必须自洽。**不因为退出码为 0 就放行**。
+    problems = _netguard_problems(status_records, violation_records, combined)
     if problems:
         combined = f"{combined}\n" + "\n".join(problems)
         return False, duration, combined, proc.returncode

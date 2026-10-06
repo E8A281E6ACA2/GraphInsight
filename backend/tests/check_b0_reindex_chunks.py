@@ -665,6 +665,25 @@ def section_e4(h: Harness) -> None:
         f"row={row} counts={counts}",
     )
 
+    # E6 双写配置守卫同样必须早于副作用：目标 KB 合法但 dual_write=true、shadow=''
+    out = scenario(h, "s1_dual_bad_config.db", "dual_config_guard_before_side_effects")
+    side = obj_marker(out, "__SIDE_EFFECTS__")
+    revs = rev_map(out)
+    counts = counts_of(out)
+    row = revs.get("c-1", {})
+    step(
+        "P1 [E6] 非法双写配置（dual_write=true、shadow=''）→ 未调用 ensure_collection",
+        side.get("ensure_collection_calls") == [],
+        f"side={side}",
+    )
+    step("P1 [E6] 非法双写配置 → 零建集合、零向量写入",
+         side.get("create_calls") == [] and (side.get("upserts") or {}) == {}, f"side={side}")
+    step(
+        "P1 [E6] 该 chunk 如实记 failed（配置非法不降级为 pending）",
+        row.get("vector_status") == "failed" and counts.get("vector_indexed") == 0,
+        f"row={row} counts={counts}",
+    )
+
 
 def main() -> int:
     print("=" * 60)

@@ -75,7 +75,8 @@ class FakeClient:
     V3_FIELDS = V2_FIELDS + [{"name": "content_revision", "data_type": "INT64"}]
 
     def __init__(self, collections: Dict[str, List[Dict[str, Any]]],
-                 strict_fields: bool = False) -> None:
+                 strict_fields: bool = False, dynamic_field: Any = True,
+                 dynamic_meta: Dict[str, Dict[str, Any]] = None) -> None:
         self.cols = {name: {"fields": fields, "rows": []} for name, fields in collections.items()}
         self.upsert_calls: List[str] = []
         self.fail_upsert_on: set = set()
@@ -86,6 +87,13 @@ class FakeClient:
         # 严格模式：output_fields 里出现 schema 之外（或不存在）的字段 → 像真实 Milvus 一样报错。
         # 用于证明"读回按实际 schema 校验"，而不是靠宽松夹具（忽略 output_fields）放行。
         self.strict_fields = strict_fields
+        # 动态字段（Milvus 默认开启）：schema 之外的键落在 `$meta`。`dynamic_field=None`
+        # 模拟"describe 不告诉是否开启"（此时读回必须按不可校验处理）。
+        self.dynamic_field = dynamic_field
+        # 动态字段里的键（如残留的 content_revision）：读回必须能观察到，否则不可校验。
+        self.dynamic_meta = dict(dynamic_meta or {})
+        # 注入：`$meta` 查询本身失败（非"字段不存在"类错误）→ 读回必须按不可校验处理
+        self.fail_query_on_meta = False
         self.delete_calls: List[Dict[str, str]] = []
 
     # --- schema 探针 ---
@@ -93,7 +101,10 @@ class FakeClient:
         return name in self.cols
 
     def describe_collection(self, name: str) -> Dict[str, Any]:
-        return {"fields": self.cols[name]["fields"]}
+        description: Dict[str, Any] = {"fields": self.cols[name]["fields"]}
+        if self.dynamic_field is not None:
+            description["enable_dynamic_field"] = bool(self.dynamic_field)
+        return description
 
     def create_schema(self, auto_id: bool = False, enable_dynamic_field: bool = True) -> FakeSchema:
         return FakeSchema("__pending__")
@@ -174,8 +185,12 @@ class FakeClient:
     def query(self, collection_name: str, filter: str, output_fields: List[str], limit: int = None,
               **_kw: Any) -> List[Dict[str, Any]]:
         rows = list(self.cols.get(collection_name, {}).get("rows", []))
+        if self.fail_query_on_meta and DYN_META in (output_fields or []):
+            raise RuntimeError("injected meta query failure")
         if self.strict_fields:
             known = {str(f.get("name") or "") for f in (self.cols.get(collection_name, {}).get("fields") or [])}
+            if self.dynamic_field:
+                known.add(DYN_META)
             for field in output_fields or []:
                 if field not in known:
                     raise RuntimeError(f"field {field} not exist in collection {collection_name}")
@@ -186,6 +201,8 @@ class FakeClient:
         for row in rows[: (limit or len(rows))]:
             item = {key: row.get(key) for key in output_fields if key in row}
             cid = str(row.get("chunk_id") or "")
+            if DYN_META in (output_fields or []) and cid in self.dynamic_meta:
+                item[DYN_META] = dict(self.dynamic_meta[cid])
             if cid in self.tamper_revision:
                 item["content_revision"] = self.tamper_revision[cid]
             out.append(item)
@@ -222,6 +239,8 @@ def chunk(cid: str, revision: int | None, kb: str = "kb-a", tenant: str = "t1", 
 
 
 VEC = [0.1, 0.2, 0.3, 0.4]
+# Milvus 动态字段名（schema 之外的键放在这里）——与 services.vector_store.DYN_META_FIELD 同义
+DYN_META = "$meta"
 
 
 def seed_row(cid: str, kb: str = "kb-a", tenant: str = "t1", project: str = "p1", doc: str = "d1",
@@ -654,6 +673,50 @@ def main() -> int:
     strict_verdict = store.verify_write_targets(expected_map)
     check("C24 严格 schema 下 legacy primary 读回仍通过（字段缺失=结构化 absent）",
           strict_verdict["ok"] is True)
+
+    # ---- C25：显式字段不存在 ≠ 没有版本（动态字段残留必须被观察到） ----
+    # C25a 复核组合反例：严格查询（显式版本字段报缺失）+ 动态字段里残留 content_revision=99
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS},
+                        strict_fields=True, dynamic_field=True,
+                        dynamic_meta={"c1": {"content_revision": 99}})
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([chunk("c1", 1)], [VEC])
+    verdict = store.verify_write_targets(expected_map)
+    check("C25 严格查询 + 动态残留 99 → ok=False（显式字段缺失≠无版本）",
+          verdict["ok"] is False,
+          )
+    check("C25 残留失败定位到 primary 集合",
+          (verdict.get("results") or {}).get("graphinsight_chunks_v2") is False)
+
+    # C25b 动态字段开启但确实无残留 → absent 成立（不能因为"要保守"就一律拒绝）
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS},
+                        strict_fields=True, dynamic_field=True)
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([chunk("c1", 1)], [VEC])
+    check("C25 动态渠道已确认且无残留 → ok=True（正向对照）",
+          store.verify_write_targets(expected_map)["ok"] is True)
+
+    # C25c 动态开关未知、且 `$meta` 不可查询 → **不可校验**（不得判 absent 成立）
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS},
+                        strict_fields=True, dynamic_field=None)
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([chunk("c1", 1)], [VEC])
+    unknown_verdict = store.verify_write_targets(expected_map)
+    check("C25 动态渠道无法观察 → 不可校验（ok=False，不判 absent）",
+          unknown_verdict["ok"] is False)
+
+    # C25d $meta 查询本身失败（非"字段不存在"）→ 不可校验
+    client = FakeClient({"graphinsight_chunks_v2": FakeClient.V2_FIELDS,
+                         "graphinsight_chunks_v3": FakeClient.V3_FIELDS},
+                        strict_fields=True, dynamic_field=True)
+    client.fail_query_on_meta = True
+    store, vs_one = make_store(cfg(dual=True, shadow="graphinsight_chunks_v3"), client)
+    store.upsert_chunks([chunk("c1", 1)], [VEC])
+    check("C25 $meta 查询不可用 → 不可校验（ok=False）",
+          store.verify_write_targets(expected_map)["ok"] is False)
 
     print()
     print(f"RESULT: {len(PASSES)} passed, {len(FAILURES)} failed")
