@@ -186,6 +186,12 @@ CASES: tuple[GuardCase, ...] = (
         "M5 非空 disposable 真实执行暴露的四个缺陷离线回归（建索引后 load / 确定性 embedding 不外连 / flush+load 后读回 / 端口占用 fail-closed）",
     ),
     GuardCase(
+        "m5_c3_sources_contract",
+        "check_m5_c3_sources_contract.py",
+        120,
+        "C3 四来源探测判定负向回归（任一子查询失败即 UNVERIFIED，禁 Milvus code!=0 / Neo4j 分组失败的 fail-open）",
+    ),
+    GuardCase(
         "m5_archive_contract",
         "check_m5_archive_contract.py",
         180,
