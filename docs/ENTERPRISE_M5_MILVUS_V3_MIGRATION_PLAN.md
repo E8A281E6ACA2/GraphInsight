@@ -1172,7 +1172,7 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
 CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
 6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
-`check_seed_shared_v2_contract.py`（167 项，假体零真实连接）已注册统一门禁
+`check_seed_shared_v2_contract.py`（180 项，假体零真实连接）已注册统一门禁
 `m5_seed_shared_v2_contract`。
 
 | 模式 | 命令 | 行为 | 退出码 |
@@ -1247,9 +1247,20 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
     conflicts，record 标 `verified: true`（PARTIAL）；读回也失败 → status=
     `PARTIAL_UNVERIFIED`、`verified: false`，deleted/pending 仅为发出删除前的账本估计，
     不伪装成精确状态；重跑同一 manifest 幂等收敛。
-19. **URI 逐字符精确**（R4）：`--milvus-uri` 必须与 `http://127.0.0.1:19531` 逐字符
-    相等——https、尾斜杠路径、query、大小写变体一律 exit 2（与本文档"仅接受"表述
-    对齐，消灭合同与实现的偏差）。
+19. **URI 逐字符精确**（R4/R5）：`--milvus-uri` 必须与 `http://127.0.0.1:19531`
+    逐字符相等且**不 strip**——https、尾斜杠路径、query、大小写变体、首尾空格一律
+    exit 2（与本文档"仅接受"表述对齐，消灭合同与实现的偏差）。
+20. **journal 未处置守卫**（R5）：同 `--out` 存在未处置的
+    `seed-shared-journal.json`（上次运行可能中断于写入阶段）→ 拒绝开始新写入
+    （exit 2，failed_step=journal_pending，零写入）；先 `--rollback <该 journal>`
+    收敛（收敛后自动清理该 journal）或人工核验后删除，方可开始新写入——旧运行的
+    恢复依据不得被新执行覆盖或删除。
+21. **superseded 副本读回校验**（R5）：`_preserve_superseded` 留存副本写后必须读回
+    与原内容比较，不一致/读回失败 → 拒绝覆盖原 manifest（exit 2）——杜绝"原样
+    留存"因副本静默损坏而失效。
+22. **journal 对账清理**（R5）：基于 journal 的回滚收敛（全部键已删除或确认不存在、
+    零冲突）后自动删除该 journal；manifest 基回滚不清理 journal（可能覆盖其它
+    运行的在途写入），由 journal 基回滚或人工处置闭环。
 
 #### 四、执行计划（授权后按序执行）
 

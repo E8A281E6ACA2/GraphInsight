@@ -52,12 +52,17 @@ dispatched 期望行（超集收录安全）+ 完整运行上下文，保证"响
 
 恢复边界加固（2026-10-07 二次复核后）：⑥ 同目录重跑不毁证据——覆盖 run manifest 前
 若既有文件持有所有权证据（executed=true 且 rows 非空）或内容损坏不可判定，先原样
-留存 `.superseded.<ts>.json`（新 record 记录 supersedes），留存失败拒绝覆盖；⑦
-mutation journal——首次 upsert 前把 mutation 目标期望行 + 完整上下文持久化为
-`seed-shared-journal.json`，进程硬中断后可用 `--rollback <journal>` 以读回为准恢复
-（成功落盘 manifest 后删除）；⑧ 删除响应丢失 → 立即读回按实际状态入账（verified
-PARTIAL），读回也失败 → 明确 PARTIAL_UNVERIFIED（账本估计，不伪装精确）；⑨ milvus
-uri 逐字符精确匹配（拒绝 https/路径/query 等变体）。
+留存 `.superseded.<ts>.json`（新 record 记录 supersedes，**副本写后读回比较**，损坏
+拒绝覆盖）；⑦ mutation journal——首次 upsert 前把 mutation 目标期望行 + 完整上下文
+持久化为 `seed-shared-journal.json`，进程硬中断后可用 `--rollback <journal>` 以读回
+为准恢复（成功落盘 manifest 后删除）；⑧ 删除响应丢失 → 立即读回按实际状态入账
+（verified PARTIAL），读回也失败 → 明确 PARTIAL_UNVERIFIED（账本估计，不伪装精确）；
+⑨ milvus uri **逐字符精确**匹配（不 strip：拒绝 https/路径/query/首尾空格等一切变体）。
+
+三次复核补强（⑩⑪）：⑩ 同 --out 存在未处置 journal（上次运行可能中断于写入阶段）
+→ 拒绝开始新写入 exit 2（journal_pending），先 `--rollback <该 journal>` 收敛（收敛
+后自动清理）或人工核验后删除；⑪ superseded 副本写后读回与原内容比较，不一致/读回
+失败 → 拒绝覆盖原 manifest（杜绝"原样留存"静默失效）。
 
 硬禁止（脚本内无入口）：建 v3 集合、回填写入、入队、修改共享配置、push、删除
 manifest 之外的任何数据。
@@ -131,7 +136,7 @@ def validate_milvus_target(uri: str, collection: str) -> Optional[str]:
     19530 属其它项目（data-stellarls-milvus-1），任何端口/主机/集合偏离都拒绝，
     防止受控写入落到错误实例或非 v2 集合（v3 / canary / 其它项目库）。返回 None = 通过。
     """
-    uri_s = str(uri or "").strip()
+    uri_s = str(uri or "")  # 不 strip：逐字符精确含首尾空格（R5）
     if uri_s != ENFORCED_MILVUS_URI:
         # 逐字符精确（P1 复核：https / 尾斜杠路径 / query 等变体一律拒绝）。
         try:
@@ -141,7 +146,7 @@ def validate_milvus_target(uri: str, collection: str) -> Optional[str]:
             detail = "uri 无法解析"
         return (f"milvus uri 必须精确为 {ENFORCED_MILVUS_URI}（实际 {uri_s!r}：{detail}；"
                 f"严禁 19530：属其它项目；不接受 https/路径/query 等变体）")
-    if str(collection or "").strip() != ENFORCED_COLLECTION:
+    if str(collection or "") != ENFORCED_COLLECTION:
         return (f"collection 必须是 {ENFORCED_COLLECTION}（v2-only 硬约束，"
                 f"禁 v3/canary/其它集合）: {collection!r}")
     return None
@@ -542,10 +547,20 @@ def _preserve_superseded(out_dir: Path, filename: str) -> Tuple[Optional[str], O
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     dest = out_dir / f"{Path(filename).stem}.superseded.{ts}.json"
     try:
-        _write_text(dest, path.read_text(encoding="utf-8"))
+        original = path.read_text(encoding="utf-8")
+        _write_text(dest, original)
     except Exception as exc:  # noqa: BLE001
         return None, (f"既有 manifest 疑似持有所有权证据且留存失败"
                       f"（{type(exc).__name__}: {exc}"[:160] + f"），拒绝覆盖: {dest}")
+    # R5：副本写后必须读回比较——静默损坏视同留存失败，拒绝覆盖原 manifest
+    # （否则"原样留存"名存实亡，原所有权证据仍会丢失）。
+    try:
+        if dest.read_text(encoding="utf-8") != original:
+            return None, (f"superseded 副本读回与原内容不一致（疑似静默损坏），"
+                          f"拒绝覆盖原 manifest: {dest}")
+    except Exception as exc:  # noqa: BLE001
+        return None, (f"superseded 副本读回失败（{type(exc).__name__}: {exc}"[:160]
+                      + f"），拒绝覆盖原 manifest: {dest}")
     return str(dest), None
 
 
@@ -727,6 +742,25 @@ def run_execute(args: argparse.Namespace) -> int:
         print(f"✗ fail-closed @ {step}: {json.dumps(detail, ensure_ascii=False)[:400]}",
               file=sys.stderr)
         return EXIT_FAIL_CLOSED
+
+    # R5：同 --out 存在未处置的 journal = 上次运行可能中断于写入阶段、在途写入未对账
+    # → 拒绝开始新写入（旧 journal 是其唯一恢复依据，不得覆盖/删除）。
+    journal_path = out_dir / "seed-shared-journal.json"
+    if journal_path.is_file():
+        pending = ""
+        try:
+            j = json.loads(journal_path.read_text(encoding="utf-8"))
+            if isinstance(j, dict) and j.get("schema") == JOURNAL_SCHEMA:
+                pending = (f"kb={j.get('kb_id')!r} collection={j.get('collection')!r} "
+                           f"keys={j.get('planned_keys')}")
+        except Exception:  # noqa: BLE001
+            pending = "（内容不可解析，需人工检查）"
+        return fail("journal_pending", {
+            "reason": "存在未处置的 seed-shared-journal.json（上次运行可能中断于写入阶段）",
+            "pending": pending,
+            "action": "先 `--rollback <该 journal>` 收敛（收敛后自动清理）；"
+                      "或人工核验已无在途写入后删除该文件",
+        })
 
     # ① 解析产物逐行归属校验（fail-closed：任何无效行都阻止授权执行）
     rows, issues, stats = collect_parsed(kb, Path(args.parsed_root))
@@ -1137,6 +1171,15 @@ def run_rollback(args: argparse.Namespace) -> int:
         _announce_evidence(where, errors)
         return EXIT_FAIL_CLOSED
     _announce_evidence(where, errors)
+    # R5：基于 journal 的回滚收敛（全部键已删除或确认不存在、零冲突）→ 该 journal
+    # 的在途写入已全部对账，安全清理；清理失败则残留 journal 继续阻止同 --out
+    # 新写入（fail-closed 方向）。
+    if manifest.get("schema") == JOURNAL_SCHEMA:
+        try:
+            Path(args.rollback).unlink()
+            print(f"  journal 已对账清理：{args.rollback}")
+        except OSError as exc:
+            print(f"  journal 清理失败（残留将阻止同 --out 新写入）：{exc}", file=sys.stderr)
     return EXIT_OK
 
 
