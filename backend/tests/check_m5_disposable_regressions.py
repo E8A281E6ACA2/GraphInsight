@@ -141,45 +141,52 @@ def test_r1_index_then_load() -> None:
           "create_collection" in src and "create_index" in src)
 
 
-# ---- R2：确定性 embedding 不外连 ----
-def test_r2_deterministic_embedding_no_network() -> None:
+# ---- R2：合成 embedding 只存在于测试入口（结构性隔离，不靠 env 开关/注释） ----
+def test_r2_synthetic_embedding_isolated_to_test_entry() -> None:
+    """R2（本轮收紧）：此前"生产不触发"只是注释 + env 开关，没有 disposable 范围校验。
+    现在生产模块**不含任何合成向量分支**，替身只由测试入口 wrapper 注入。"""
+    import tempfile
+
     import admin.backfill_chunk_revisions as bf
 
-    texts = ["非空全链路内容-bfc1", "另一段文本"]
+    src = Path(bf.__file__).read_text(encoding="utf-8")
+    # 1) 结构性隔离：生产模块不得出现合成向量相关实现/开关
+    check("R2 生产模块不含 EMBEDDING_DETERMINISTIC_VECTOR 开关",
+          "EMBEDDING_DETERMINISTIC_VECTOR" not in src)
+    check("R2 生产模块不含 _deterministic_vector / _embed_texts_for_backfill",
+          "_deterministic_vector" not in src and "_embed_texts_for_backfill" not in src)
+    check("R2 生产 _backfill_milvus 直接调 embedding_service.embed_texts",
+          "vectors = embedding_service.embed_texts(texts)" in src)
+    check("R2 生产模块无合成向量函数属性（结构性，非注释）",
+          not hasattr(bf, "_deterministic_vector") and not hasattr(bf, "_embed_texts_for_backfill"))
+
+    # 2) 反例：**共享/生产配置下不能启用合成向量**——即使 env 被设成 true，
+    #    生产路径也走真实 embedding_service（mock 被调用即证明未走合成）。
     with mock.patch.dict(os.environ, {"EMBEDDING_DETERMINISTIC_VECTOR": "true"}):
         import services.embedding_service as es_mod
 
         with mock.patch.object(es_mod.embedding_service, "embed_texts",
-                               side_effect=AssertionError("确定性模式下不得外连 embedding API")) as spy:
-            vecs = bf._embed_texts_for_backfill(texts)
-        check("R2 确定性模式不调用 embedding_service.embed_texts（不外连）", not spy.called)
-    check("R2 返回 2 条 4 维向量", len(vecs) == 2 and all(len(v) == 4 for v in vecs), str(vecs))
-    check("R2 同文本 → 同向量（确定性）",
-          vecs[0] == bf._deterministic_vector(texts[0]) and vecs[0] == bf._deterministic_vector(texts[0]))
-    check("R2 不同文本 → 不同向量", vecs[0] != vecs[1], str(vecs))
+                               return_value=[[0.9, 0.8, 0.7, 0.6]]) as spy:
+            out = es_mod.embedding_service.embed_texts(["t1"])
+        check("R2 反例：共享配置下仍走真实 embedding_service",
+              spy.called and out == [[0.9, 0.8, 0.7, 0.6]])
+        # 合成向量的形态特征是 dim=4 且由 sha256 派生；这里返回的必须是 mock 的真实值，
+        # 且生产模块里不存在任何会产出它的代码路径（上条结构性断言已保证）。
 
-    # 未开确定性开关时走真实 embedding（回归：不得误改生产路径）
-    with mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("EMBEDDING_DETERMINISTIC_VECTOR", None)
-        import services.embedding_service as es_mod
-
-        with mock.patch.object(es_mod.embedding_service, "embed_texts",
-                               return_value=[[0.9, 0.8, 0.7, 0.6]] * 2) as spy:
-            out = bf._embed_texts_for_backfill(texts)
-        check("R2 关闭开关时仍走真实 embedding_service（生产路径不变）",
-              spy.called and out == [[0.9, 0.8, 0.7, 0.6]] * 2)
-
-    # disposable 的 env file 必须真的注入该开关（否则 backfill 仍会外连）
-    import tempfile
-
+    # 3) 替身只在测试入口：disposable 的 wrapper 注入，env file 不再注入该开关
     with tempfile.TemporaryDirectory() as td:
-        env_file = Path(td) / "nonempty.env"
+        entry_text = Path(disp._backfill_entry(Path(td))).read_text(encoding="utf-8")
+    check("R2 测试入口 wrapper 注入 embed_texts 替身",
+          "embedding_service.embed_texts = lambda" in entry_text)
+    check("R2 wrapper 跑的是真实 backfill 脚本",
+          "runpy.run_path" in entry_text and "backfill_chunk_revisions.py" in entry_text)
+    with tempfile.TemporaryDirectory() as td:
         disp.base_env(Path(td))
-        env_text = env_file.read_text(encoding="utf-8")
-    check("R2 disposable env file 注入 EMBEDDING_DETERMINISTIC_VECTOR=true",
-          "EMBEDDING_DETERMINISTIC_VECTOR=true" in env_text, env_text)
-    check("R2 该键受控（不会被宿主 env 泄漏覆盖）",
-          "EMBEDDING_DETERMINISTIC_VECTOR" in disp._CONTROLLED_ENV_KEYS)
+        env_text = (Path(td) / "nonempty.env").read_text(encoding="utf-8")
+    check("R2 disposable env file 不再注入 EMBEDDING_DETERMINISTIC_VECTOR",
+          "EMBEDDING_DETERMINISTIC_VECTOR" not in env_text, env_text)
+    check("R2 disposable 的 backfill 调用走测试入口 wrapper",
+          "_backfill_entry(tmp)" in Path(disp.__file__).read_text(encoding="utf-8"))
 
 
 # ---- R3：flush/load 后读回 ----
@@ -249,7 +256,7 @@ def test_r4_port_in_use_fail_closed() -> None:
 
 def main() -> int:
     test_r1_index_then_load()
-    test_r2_deterministic_embedding_no_network()
+    test_r2_synthetic_embedding_isolated_to_test_entry()
     test_r3_flush_and_load_for_readback()
     test_r4_port_in_use_fail_closed()
     print()

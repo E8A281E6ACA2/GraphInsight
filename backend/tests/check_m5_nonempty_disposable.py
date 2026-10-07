@@ -198,7 +198,6 @@ _CONTROLLED_ENV_KEYS = (
     "MILVUS_METRIC_TYPE", "MILVUS_INDEX_TYPE", "MILVUS_SEARCH_NPROBE",
     "VECTOR_STORE_ENABLED", "VECTOR_STORE_PROVIDER",
     "LLM_ENABLED", "EMBEDDING_ENABLED", "EMBEDDING_API_KEY", "EMBEDDING_PROVIDER", "EMBEDDING_BASE_URL",
-    "EMBEDDING_DETERMINISTIC_VECTOR",
     "AI_SERVICE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
     "PARSED_DOCUMENT_STORAGE_PATH", "BACKFILL_MANIFEST_DIR",
 )
@@ -215,7 +214,6 @@ def base_env(tmp: Path, *, neo4j_uri: str = NEO4J_URI, milvus_uri: str = MILVUS_
         "LLM_ENABLED=true",                       # graph 能力开启
         "EMBEDDING_ENABLED=true",                 # vector 能力：embedding 已配置
         "EMBEDDING_API_KEY=nonempty-disposable-local",  # 能力判定要求非空 api_key（确定性本地向量，不外发）
-        "EMBEDDING_DETERMINISTIC_VECTOR=true",    # backfill 用确定性本地向量，禁止回外部模型
         "VECTOR_STORE_ENABLED=true",              # vector 能力：vector_store 开启
         f"MILVUS_URI={milvus_uri}",
         f"MILVUS_COLLECTION={PRIMARY_COLLECTION}",
@@ -415,6 +413,34 @@ SEED_BF_DRIVER = (
 )
 
 
+# backfill **测试入口 wrapper**：在测试入口注入确定性 embedding 替身，再跑真实 backfill 脚本。
+# 生产模块 admin/backfill_chunk_revisions.py 不含任何合成向量分支（结构性隔离，不靠 env 开关），
+# 因此共享/生产配置下不存在"合成向量被启用"的可能。
+BACKFILL_ENTRY = (
+    "import sys, hashlib, runpy\n"
+    "sys.path.insert(0, {backend!r})\n"
+    "from services.embedding_service import embedding_service\n"
+    "def _det(t, dim=4):\n"
+    "    d = hashlib.sha256((t or '').encode('utf-8')).digest()\n"
+    "    return [round(((d[i % len(d)] / 255.0) - 0.5) * 2.0, 6) for i in range(dim)]\n"
+    "embedding_service.embed_texts = lambda texts: [_det(t) for t in texts]\n"
+    "runpy.run_path({script!r}, run_name='__main__')\n"
+)
+
+
+def _backfill_entry(tmp: Path) -> str:
+    """生成 backfill 测试入口 wrapper 并返回其绝对路径（替身**只在测试入口**注入）。"""
+    entry = tmp / "_backfill_entry.py"
+    entry.write_text(
+        BACKFILL_ENTRY.format(
+            backend=str(BACKEND),
+            script=str(BACKEND / "admin" / "backfill_chunk_revisions.py"),
+        ),
+        encoding="utf-8",
+    )
+    return str(entry)
+
+
 # backfill 对账：读回 primary/shadow 的 bf_chunk 字段+向量快照（前后/重跑对比用）
 BACKFILL_RECON_DRIVER = (
     "from pymilvus import MilvusClient\n"
@@ -609,7 +635,7 @@ def verify_backfill(tmp: Path, kb: str, bf_chunk: str) -> None:
 
     before_primary, before_shadow = _snapshot()
 
-    code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
+    code, out = run_py(tmp, _backfill_entry(tmp),
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
     add_step("单向回填：backfill 技术迁移完成（退出 0/3，1/2 才失败）",
              _backfill_ok(code), f"exit={code} {out[-200:]}")
@@ -625,7 +651,7 @@ def verify_backfill(tmp: Path, kb: str, bf_chunk: str) -> None:
     add_step("单向回填：shadow 新增显式 content_revision=1（整数相等）",
              _snap_ok(after_shadow) and after_shadow.get("rev") == 1, str(after_shadow))
 
-    code2, out2 = run_py(tmp, "admin/backfill_chunk_revisions.py",
+    code2, out2 = run_py(tmp, _backfill_entry(tmp),
                          ["--kb", kb, "--manifest-dir", str(tmp / "mf")], dual_write=True)
     add_step("单向回填：重跑 rows_new=0（整数相等）",
              _backfill_ok(code2) and _parse_int(out2, "rows_new") == 0, f"exit={code2} {out2[-400:]}")
@@ -658,7 +684,7 @@ def verify_readback(tmp: Path, kb: str, s1_chunk: str, bf_chunk: str) -> None:
 
 
 def inject_failure(tmp: Path, kb: str, before: int) -> None:
-    code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
+    code, out = run_py(tmp, _backfill_entry(tmp),
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")],
                        neo4j_uri="bolt://127.0.0.1:29999")
     add_step("失败重放：不可达 Neo4j → 非零退出（fail-closed）", code != 0, f"exit={code}")
@@ -670,7 +696,7 @@ def inject_failure(tmp: Path, kb: str, before: int) -> None:
 
 
 def verify_idempotent(tmp: Path, kb: str, before: int) -> None:
-    code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
+    code, out = run_py(tmp, _backfill_entry(tmp),
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")])
     add_step("幂等：恢复后重跑技术迁移完成（退出 0/3）", _backfill_ok(code), f"exit={code} {out[-200:]}")
     add_step("幂等：rows_new=0", _parse_int(out, "rows_new") == 0, out[-300:])
@@ -701,7 +727,7 @@ def verify_rollback(tmp: Path, kb: str) -> None:
     add_step("再迁移 chunk_revisions 退出 0", code == 0, out[-200:])
     code, out = run_py(tmp, "admin/migrate_jobs_targets_hash.py", ["--action", "migrate"])
     add_step("再迁移 targets_hash 退出 0", code == 0, out[-200:])
-    code, out = run_py(tmp, "admin/backfill_chunk_revisions.py",
+    code, out = run_py(tmp, _backfill_entry(tmp),
                        ["--kb", kb, "--manifest-dir", str(tmp / "mf")])
     add_step("回滚重建后 backfill 可再跑（rows_new=2）",
              _backfill_ok(code) and _parse_int(out, "rows_new") == 2, f"exit={code} {out[-300:]}")
