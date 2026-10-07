@@ -1,0 +1,627 @@
+{
+  "vectors": [
+    {
+      "name": "basic_2",
+      "input": [
+        {
+          "chunk_id": "c1",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c2",
+          "target_revision": 2
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"c1\",\"target_revision\":1},{\"chunk_id\":\"c2\",\"target_revision\":2}]",
+      "hash": "f14c8c06d7558f774602ee0280e78c3fbfbed5314b9d601f8b5709533d17736c"
+    },
+    {
+      "name": "order_swapped",
+      "input": [
+        {
+          "chunk_id": "c2",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c1",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"c1\",\"target_revision\":1},{\"chunk_id\":\"c2\",\"target_revision\":2}]",
+      "hash": "f14c8c06d7558f774602ee0280e78c3fbfbed5314b9d601f8b5709533d17736c"
+    },
+    {
+      "name": "same_chunk_multi_rev",
+      "input": [
+        {
+          "chunk_id": "c1",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c1",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"c1\",\"target_revision\":1},{\"chunk_id\":\"c1\",\"target_revision\":2}]",
+      "hash": "e8b4a1a6a4381c326d2bbc928d7169c8e9b955633ef563920e92f25ffb7995bc"
+    },
+    {
+      "name": "single",
+      "input": [
+        {
+          "chunk_id": "x",
+          "target_revision": 7
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"x\",\"target_revision\":7}]",
+      "hash": "3a8b0834ad2a55670165341294822798fff96eb692112035f3f70476b7109a4a"
+    },
+    {
+      "name": "unicode_id",
+      "input": [
+        {
+          "chunk_id": "区块A",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "chunk",
+          "target_revision": 9
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"chunk\",\"target_revision\":9},{\"chunk_id\":\"\\u533a\\u5757A\",\"target_revision\":3}]",
+      "hash": "6af2d169d44a34eb4442558a2af0fb2c9864e8cdb4ed8b530fe66aadef8fda44"
+    },
+    {
+      "name": "html_chars",
+      "input": [
+        {
+          "chunk_id": "a<b>c&d",
+          "target_revision": 5
+        },
+        {
+          "chunk_id": "e/f",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"a<b>c&d\",\"target_revision\":5},{\"chunk_id\":\"e/f\",\"target_revision\":1}]",
+      "hash": "069dfd3b57a6e065a961f174a9bb35edbcedcd0294c9c82a460ab0fc30492a54"
+    },
+    {
+      "name": "quote_backslash",
+      "input": [
+        {
+          "chunk_id": "q\"z",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "bs\\",
+          "target_revision": 3
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"bs\\\\\",\"target_revision\":3},{\"chunk_id\":\"q\\\"z\",\"target_revision\":2}]",
+      "hash": "12be8ad34b349879c37fdf31df645af18e2a72c5a79a0983895581b29a043b22"
+    },
+    {
+      "name": "control_nl",
+      "input": [
+        {
+          "chunk_id": "l\nm",
+          "target_revision": 4
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"l\\nm\",\"target_revision\":4}]",
+      "hash": "ef47bb5178aeb1c809b77c88d05ba184643d00f5376bd1a716404cd1831fc68c"
+    },
+    {
+      "name": "big_rev",
+      "input": [
+        {
+          "chunk_id": "z",
+          "target_revision": 123456789
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"z\",\"target_revision\":123456789}]",
+      "hash": "73f028b97652cc0770c6c616541d29f2d02c1a5d71d3863648f9f9fc9f660408"
+    },
+    {
+      "name": "dup_exact",
+      "input": [
+        {
+          "chunk_id": "d1",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "d1",
+          "target_revision": 1
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"d1\",\"target_revision\":1},{\"chunk_id\":\"d1\",\"target_revision\":1}]",
+      "hash": "fb10d4b3cf8f3e1aa4fca7b36206ab42d5aadeaa1397b41bfc99ec1faddf0018"
+    },
+    {
+      "name": "emptyish_min",
+      "input": [
+        {
+          "chunk_id": "0",
+          "target_revision": 0
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"0\",\"target_revision\":0}]",
+      "hash": "e065c34f28a2d4d7d38fc30a72abd4d928b8a7183e6de9350bfba297378250dc"
+    },
+    {
+      "name": "empty_list",
+      "input": [],
+      "canonical": "[]",
+      "hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "name": "numeric_string_order",
+      "input": [
+        {
+          "chunk_id": "2",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "10",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "1",
+          "target_revision": 3
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"1\",\"target_revision\":3},{\"chunk_id\":\"10\",\"target_revision\":2},{\"chunk_id\":\"2\",\"target_revision\":1}]",
+      "hash": "f83eeab49de722dd57b7730e5824e943aaf38fba944adcd7bc9476c29c858a11"
+    },
+    {
+      "name": "case_and_prefix_order",
+      "input": [
+        {
+          "chunk_id": "B",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "a",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "ab",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "A",
+          "target_revision": 4
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"A\",\"target_revision\":4},{\"chunk_id\":\"B\",\"target_revision\":1},{\"chunk_id\":\"a\",\"target_revision\":2},{\"chunk_id\":\"ab\",\"target_revision\":3}]",
+      "hash": "53911bf0468725cafa22ef9a782f087d27b1e9fb9f4f0c2aa6588200246a8978"
+    },
+    {
+      "name": "cjk_vs_latin_order",
+      "input": [
+        {
+          "chunk_id": "z",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "中",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "A",
+          "target_revision": 3
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"A\",\"target_revision\":3},{\"chunk_id\":\"z\",\"target_revision\":1},{\"chunk_id\":\"\\u4e2d\",\"target_revision\":2}]",
+      "hash": "a20d1c48d9a99963b3fdccc7957af91657069b0cf6bc6dfd50f5d6b468452d75"
+    },
+    {
+      "name": "ascii_boundary_tilde_del",
+      "input": [
+        {
+          "chunk_id": "~",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": " ",
+          "target_revision": 3
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\" \",\"target_revision\":3},{\"chunk_id\":\"~\",\"target_revision\":1},{\"chunk_id\":\"\\u007f\",\"target_revision\":2}]",
+      "hash": "4d51b56a86a22ad3d350d6e87cce81125e99dfeecbc8ebd27632004f71098088"
+    },
+    {
+      "name": "nul_and_low_controls",
+      "input": [
+        {
+          "chunk_id": "\u0000\u0001\u001f",
+          "target_revision": 4
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"\\u0000\\u0001\\u001f\",\"target_revision\":4}]",
+      "hash": "11b3780ca25c1ff8add37b4a838fd00b62bbb98f327f6473fc78592341e34c36"
+    },
+    {
+      "name": "short_escapes",
+      "input": [
+        {
+          "chunk_id": "\b",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "\f",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "\t",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "\r",
+          "target_revision": 4
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"\\b\",\"target_revision\":1},{\"chunk_id\":\"\\t\",\"target_revision\":3},{\"chunk_id\":\"\\f\",\"target_revision\":2},{\"chunk_id\":\"\\r\",\"target_revision\":4}]",
+      "hash": "9fedc118ba038b07595b13004c3230b80e4cfe21dbf516ede3dd66f8189958be"
+    },
+    {
+      "name": "star_plane_emoji",
+      "input": [
+        {
+          "chunk_id": "😀",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "𠀋",
+          "target_revision": 2
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"\\ud83d\\ude00\",\"target_revision\":1},{\"chunk_id\":\"\\ud840\\udc0b\",\"target_revision\":2}]",
+      "hash": "bb212f1b1e6f30396549187090947e280b47652df3cbc5f7fc9c21b3343e25ed"
+    },
+    {
+      "name": "nfc_vs_nfd_acutes",
+      "input": [
+        {
+          "chunk_id": "é",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "é",
+          "target_revision": 2
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"e\\u0301\",\"target_revision\":2},{\"chunk_id\":\"\\u00e9\",\"target_revision\":1}]",
+      "hash": "d554d30f03e02679975d6ea4c367a81769d80be975a1aa1bbb06cd1d57c08a65"
+    },
+    {
+      "name": "hebrew_rtl",
+      "input": [
+        {
+          "chunk_id": "א",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "ב",
+          "target_revision": 2
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"\\u05d0\",\"target_revision\":1},{\"chunk_id\":\"\\u05d1\",\"target_revision\":2}]",
+      "hash": "d6b3d09b692926f1da0675d759cebf59b5981c8cedc7e759e7fe7af70780c679"
+    },
+    {
+      "name": "slash_lt_gt_amp",
+      "input": [
+        {
+          "chunk_id": "/",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "<",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": ">",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "&",
+          "target_revision": 4
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"&\",\"target_revision\":4},{\"chunk_id\":\"/\",\"target_revision\":1},{\"chunk_id\":\"<\",\"target_revision\":2},{\"chunk_id\":\">\",\"target_revision\":3}]",
+      "hash": "c2440c987bc187eeacacf692a2afdb4c4fdab582a72444041c090d66de126469"
+    },
+    {
+      "name": "quote_backslash_mix",
+      "input": [
+        {
+          "chunk_id": "\\",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "\\\"",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "\\\\",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "'",
+          "target_revision": 4
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"'\",\"target_revision\":4},{\"chunk_id\":\"\\\\\",\"target_revision\":1},{\"chunk_id\":\"\\\\\\\"\",\"target_revision\":2},{\"chunk_id\":\"\\\\\\\\\",\"target_revision\":3}]",
+      "hash": "105b51fc57beb3be8617e67c7bb6001d6952acb58146b967c3891518f0f40dc7"
+    },
+    {
+      "name": "line_separators_2028",
+      "input": [
+        {
+          "chunk_id": " ",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": " ",
+          "target_revision": 2
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"\\u2028\",\"target_revision\":1},{\"chunk_id\":\"\\u2029\",\"target_revision\":2}]",
+      "hash": "cea2132383a5053e118b1202fb3fc181cc874d986217d8203641d44ffc16af8f"
+    },
+    {
+      "name": "negative_revision",
+      "input": [
+        {
+          "chunk_id": "n",
+          "target_revision": -5
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"n\",\"target_revision\":-5}]",
+      "hash": "e17bff56525342d0facc0cf819decd8f11417eac5fa5dbae72fd635962baca3a"
+    },
+    {
+      "name": "i64_max_revision",
+      "input": [
+        {
+          "chunk_id": "m",
+          "target_revision": 9223372036854775807
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"m\",\"target_revision\":9223372036854775807}]",
+      "hash": "b10de98b9ea42e6675cb1a0d785c88c2a4c0ac56681707eac32a4829ef79663e"
+    },
+    {
+      "name": "same_chunk_rev_tie",
+      "input": [
+        {
+          "chunk_id": "t1",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "t1",
+          "target_revision": -1
+        },
+        {
+          "chunk_id": "t1",
+          "target_revision": 0
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"t1\",\"target_revision\":-1},{\"chunk_id\":\"t1\",\"target_revision\":0},{\"chunk_id\":\"t1\",\"target_revision\":0}]",
+      "hash": "07005b6418257bf054d638fc9fdc3e8664fe74869249ee9ea16c95c11ac2ea73"
+    },
+    {
+      "name": "fifty_targets_unpadded",
+      "input": [
+        {
+          "chunk_id": "c49",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c48",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c47",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c46",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c45",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c44",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c43",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c42",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c41",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c40",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c39",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c38",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c37",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c36",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c35",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c34",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c33",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c32",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c31",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c30",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c29",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c28",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c27",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c26",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c25",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c24",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c23",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c22",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c21",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c20",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c19",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c18",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c17",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c16",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c15",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c14",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c13",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c12",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c11",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c10",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c9",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c8",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c7",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c6",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c5",
+          "target_revision": 0
+        },
+        {
+          "chunk_id": "c4",
+          "target_revision": 4
+        },
+        {
+          "chunk_id": "c3",
+          "target_revision": 3
+        },
+        {
+          "chunk_id": "c2",
+          "target_revision": 2
+        },
+        {
+          "chunk_id": "c1",
+          "target_revision": 1
+        },
+        {
+          "chunk_id": "c0",
+          "target_revision": 0
+        }
+      ],
+      "canonical": "[{\"chunk_id\":\"c0\",\"target_revision\":0},{\"chunk_id\":\"c1\",\"target_revision\":1},{\"chunk_id\":\"c10\",\"target_revision\":0},{\"chunk_id\":\"c11\",\"target_revision\":1},{\"chunk_id\":\"c12\",\"target_revision\":2},{\"chunk_id\":\"c13\",\"target_revision\":3},{\"chunk_id\":\"c14\",\"target_revision\":4},{\"chunk_id\":\"c15\",\"target_revision\":0},{\"chunk_id\":\"c16\",\"target_revision\":1},{\"chunk_id\":\"c17\",\"target_revision\":2},{\"chunk_id\":\"c18\",\"target_revision\":3},{\"chunk_id\":\"c19\",\"target_revision\":4},{\"chunk_id\":\"c2\",\"target_revision\":2},{\"chunk_id\":\"c20\",\"target_revision\":0},{\"chunk_id\":\"c21\",\"target_revision\":1},{\"chunk_id\":\"c22\",\"target_revision\":2},{\"chunk_id\":\"c23\",\"target_revision\":3},{\"chunk_id\":\"c24\",\"target_revision\":4},{\"chunk_id\":\"c25\",\"target_revision\":0},{\"chunk_id\":\"c26\",\"target_revision\":1},{\"chunk_id\":\"c27\",\"target_revision\":2},{\"chunk_id\":\"c28\",\"target_revision\":3},{\"chunk_id\":\"c29\",\"target_revision\":4},{\"chunk_id\":\"c3\",\"target_revision\":3},{\"chunk_id\":\"c30\",\"target_revision\":0},{\"chunk_id\":\"c31\",\"target_revision\":1},{\"chunk_id\":\"c32\",\"target_revision\":2},{\"chunk_id\":\"c33\",\"target_revision\":3},{\"chunk_id\":\"c34\",\"target_revision\":4},{\"chunk_id\":\"c35\",\"target_revision\":0},{\"chunk_id\":\"c36\",\"target_revision\":1},{\"chunk_id\":\"c37\",\"target_revision\":2},{\"chunk_id\":\"c38\",\"target_revision\":3},{\"chunk_id\":\"c39\",\"target_revision\":4},{\"chunk_id\":\"c4\",\"target_revision\":4},{\"chunk_id\":\"c40\",\"target_revision\":0},{\"chunk_id\":\"c41\",\"target_revision\":1},{\"chunk_id\":\"c42\",\"target_revision\":2},{\"chunk_id\":\"c43\",\"target_revision\":3},{\"chunk_id\":\"c44\",\"target_revision\":4},{\"chunk_id\":\"c45\",\"target_revision\":0},{\"chunk_id\":\"c46\",\"target_revision\":1},{\"chunk_id\":\"c47\",\"target_revision\":2},{\"chunk_id\":\"c48\",\"target_revision\":3},{\"chunk_id\":\"c49\",\"target_revision\":4},{\"chunk_id\":\"c5\",\"target_revision\":0},{\"chunk_id\":\"c6\",\"target_revision\":1},{\"chunk_id\":\"c7\",\"target_revision\":2},{\"chunk_id\":\"c8\",\"target_revision\":3},{\"chunk_id\":\"c9\",\"target_revision\":4}]",
+      "hash": "a32d17bcbdd0ee86756bc3414f876bcaf89a4faa89ead5117e5d0407851591eb"
+    }
+  ]
+}

@@ -51,13 +51,59 @@ STATUS_SUCCEEDED = "succeeded"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 
-OUTCOME_ENQUEUED = "enqueued"
+OUTCOME_CREATED = "created"
 OUTCOME_REUSED = "reused"
 OUTCOME_RETRIED = "retried"
 OUTCOME_RESET = "reset"
 OUTCOME_REJECTED = "rejected"
 
 REJECT_REASON_RETRY_EXHAUSTED = "retry_exhausted"
+
+# 留痕口径的唯一来源：action 映射与 details 键名都由本模块给出。提交路径（job_service）与
+# CLI 路径（backfill）必须调这两个函数，否则同一个 outcome 会在两张审计行里长成两种形状。
+AUDIT_ACTION_CREATED = "job_created"
+AUDIT_ACTION_REUSED = "job_reused"
+AUDIT_ACTION_REJECTED = "kb_chunk_reindex_failed"
+
+AGGREGATE_KEYS = ("created", "reused", "retried", "reset", "rejected")
+
+
+def audit_action_for_outcome(outcome: Optional[str]) -> str:
+    """§16.3 outcome → admin_logs.action（created 建行、rejected 单独告警、其余都是复用）。"""
+    if outcome == OUTCOME_CREATED:
+        return AUDIT_ACTION_CREATED
+    if outcome == OUTCOME_REJECTED:
+        return AUDIT_ACTION_REJECTED
+    return AUDIT_ACTION_REUSED
+
+
+def audit_details(
+    entry: Mapping[str, Any],
+    *,
+    job_type: str,
+    kb_id: str,
+    status: str,
+    source: str,
+    report: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """§16.3 jobs 条目 → admin_logs.details 的冻结形状（child_job_id/targets_hash 为规范键名）。
+
+    `report` 给出时附带聚合计数，让一条审计行既能定位到具体 child job，也能看出本轮总量。
+    """
+    details: Dict[str, Any] = {
+        "job_type": job_type,
+        "kb_id": kb_id,
+        "status": status,
+        "outcome": entry.get("outcome"),
+        "targets_hash": entry.get("targets_hash"),
+        "child_job_id": entry.get("child_job_id"),
+        "target_count": entry.get("target_count"),
+        "source": source,
+    }
+    if report is not None:
+        for key in AGGREGATE_KEYS:
+            details[key] = report.get(key)
+    return details
 
 
 def _engine_default():
@@ -110,7 +156,7 @@ def _lock_existing_job(conn, *, kb_id: str, targets_hash: str) -> Optional[Dict[
     if row is None:
         return None
     return {
-        "job_id": int(row[0]),
+        "child_job_id": int(row[0]),
         "status": str(row[1] or ""),
         "retry_count": int(row[2] or 0),
         "max_retries": int(row[3] or 0),
@@ -179,7 +225,7 @@ def _group_targets(targets: Iterable[Mapping[str, Any]]) -> Dict[tuple, List[Dic
 
 def _empty_report() -> Dict[str, Any]:
     return {
-        "enqueued": 0,
+        "created": 0,
         "reused": 0,
         "retried": 0,
         "reset": 0,
@@ -297,9 +343,9 @@ def enqueue_on_connection(
                 ),
                 {"job_type": JOB_TYPE, "kb_id": kb_id, "targets_hash": targets_hash},
             ).fetchone()
-            report["enqueued"] += 1
-            entry["outcome"] = OUTCOME_ENQUEUED
-            entry["job_id"] = int(new_id[0]) if new_id else None
+            report["created"] += 1
+            entry["outcome"] = OUTCOME_CREATED
+            entry["child_job_id"] = int(new_id[0]) if new_id else None
             report["jobs"].append(entry)
             continue
 
@@ -308,18 +354,18 @@ def enqueue_on_connection(
             # 唯一索引拦了新增却读不到行：历史 NULL hash 行不参与唯一性，正常不该发生。
             report["reused"] += 1
             entry["outcome"] = OUTCOME_REUSED
-            entry["job_id"] = None
+            entry["child_job_id"] = None
             report["jobs"].append(entry)
             continue
 
-        entry["job_id"] = existing["job_id"]
+        entry["child_job_id"] = existing["child_job_id"]
         status = existing["status"]
         if status in (STATUS_PENDING, STATUS_RUNNING, STATUS_SUCCEEDED):
             report["reused"] += 1
             entry["outcome"] = OUTCOME_REUSED
         elif status == STATUS_FAILED:
             if existing["retry_count"] < existing["max_retries"]:
-                _reset_failed_job(conn, job_id=existing["job_id"], trace_id=trace_id)
+                _reset_failed_job(conn, job_id=existing["child_job_id"], trace_id=trace_id)
                 report["retried"] += 1
                 entry["outcome"] = OUTCOME_RETRIED
             else:
@@ -327,7 +373,7 @@ def enqueue_on_connection(
                 entry["outcome"] = OUTCOME_REJECTED
                 report["rejected_detail"].append(
                     {
-                        "job_id": existing["job_id"],
+                        "child_job_id": existing["child_job_id"],
                         "kb_id": kb_id,
                         "doc_id": doc_id,
                         "targets_hash": targets_hash,
@@ -338,7 +384,7 @@ def enqueue_on_connection(
                     }
                 )
         elif status == STATUS_CANCELLED:
-            _reset_cancelled_job(conn, job_id=existing["job_id"], trace_id=trace_id)
+            _reset_cancelled_job(conn, job_id=existing["child_job_id"], trace_id=trace_id)
             report["reset"] += 1
             entry["outcome"] = OUTCOME_RESET
         else:
@@ -360,8 +406,9 @@ def enqueue_reindex_jobs(
     """§16.3 幂等入队：新 targets_hash 建行，冲突则回读既有行按状态分支。
 
     `targets` 每条需要 `kb_id/chunk_id/target_revision`，可带 `doc_id/tenant_id/project_id`。
-    返回 `{enqueued, reused, retried, reset, rejected, targets, jobs, rejected_detail}`；
-    `jobs` 逐组给 `{kb_id, doc_id, targets_hash, outcome, job_id}`，调用方据此写审计。
+    返回 `{created, reused, retried, reset, rejected, targets, jobs, rejected_detail}`；
+    `jobs` 逐组给 `{kb_id, doc_id, targets_hash, target_count, outcome, child_job_id}`，
+    调用方用 `audit_action_for_outcome` + `audit_details` 把它落成审计留痕。
     `admin_jobs` 不存在时抛 RuntimeError（不静默跳过转交）。
     """
     conn_engine = engine or _engine_default()

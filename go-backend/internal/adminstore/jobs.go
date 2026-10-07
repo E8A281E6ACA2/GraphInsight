@@ -632,6 +632,13 @@ func getJobForUpdate(ctx context.Context, tx *sql.Tx, jobID int) (JobItem, error
 }
 
 func insertJobAuditLog(ctx context.Context, tx *sql.Tx, action string, job JobItem, operatorID *int, traceID *string, ipAddress *string, userAgent *string, details map[string]interface{}) error {
+	return insertJobAuditLogEntry(ctx, tx, action, job, operatorID, traceID, ipAddress, userAgent, details, "success", nil)
+}
+
+// insertJobAuditLogEntry 是 admin_logs 的唯一写入点。status / error_message 单独成参
+// 是因为 §16.3 的超限拒绝留痕必须是 failed（Python 侧 _write_job_log 同口径），
+// 而"成功留痕"是其余分支的默认。
+func insertJobAuditLogEntry(ctx context.Context, tx *sql.Tx, action string, job JobItem, operatorID *int, traceID *string, ipAddress *string, userAgent *string, details map[string]interface{}, status string, errorMessage *string) error {
 	encodedDetails, err := json.Marshal(details)
 	if err != nil {
 		return fmt.Errorf("encode job audit details failed: %w", err)
@@ -653,10 +660,11 @@ func insertJobAuditLog(ctx context.Context, tx *sql.Tx, action string, job JobIt
 			details,
 			ip_address,
 			user_agent,
-			status
+			status,
+			error_message
 		)
-		VALUES ($1, $1, $2, $3, $4, 'job', $5, $6, $7, $8, 'success')
-	`, userID, tenantID, traceIDOrJobTrace(traceID, job.TraceID), action, fmt.Sprintf("%d", job.ID), string(encodedDetails), ipAddress, userAgent); err != nil {
+		VALUES ($1, $1, $2, $3, $4, 'job', $5, $6, $7, $8, $9, $10)
+	`, userID, tenantID, traceIDOrJobTrace(traceID, job.TraceID), action, fmt.Sprintf("%d", job.ID), string(encodedDetails), ipAddress, userAgent, status, errorMessage); err != nil {
 		return fmt.Errorf("insert job audit log failed: %w", err)
 	}
 	return nil

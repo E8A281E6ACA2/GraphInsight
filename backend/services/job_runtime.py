@@ -156,7 +156,7 @@ def execute_build_graph(*, job_id: int, payload: Dict[str, Any]) -> Dict[str, An
     if vector_failures or vector_failed_chunks:
         handoff = stats.get("reindex_handoff") or {}
         handoff_note = (
-            f"，已转交 reindex job：enqueued={handoff.get('enqueued', 0)} reused={handoff.get('reused', 0)}"
+            f"，已转交 reindex job：created={handoff.get('created', 0)} reused={handoff.get('reused', 0)}"
             if handoff
             else ""
         )

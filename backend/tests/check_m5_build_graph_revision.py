@@ -293,28 +293,57 @@ def _scenario_real_build_graph(check: "Check", tmp: Path) -> None:
             },
         )
 
-    def rows() -> dict:
+    _ROW_COLUMNS = (
+        "chunk_id",
+        "content_revision",
+        "revision_status",
+        "graph_status",
+        "vector_status",
+        "graph_content_revision",
+        "vector_content_revision",
+        "reason",
+    )
+
+    def _select_rows(where_status: str) -> list[dict]:
+        """按 revision_status 分离读取，绝不把同一 chunk 的多条 revision 折进同一个键。
+
+        原实现只有 `ORDER BY chunk_id` 并以 chunk_id 作字典键：内容变更后同一 chunk 会有
+        rev1(superseded) + rev2(current) 两行，存活者由 SQLite 未定义返回顺序决定——本地
+        返回顺序恰好让 rev2 存活（绿），CI 上 rev1 存活（红）。数据库层已有部分唯一索引
+        保证每 (kb_id, chunk_id) 至多一个 current 行，所以按 status 过滤本身就是唯一键。
+        """
         with default_engine.connect() as conn:
             found = conn.execute(
                 sqltext(
-                    "SELECT chunk_id, content_revision, revision_status, graph_status, vector_status, "
-                    "graph_content_revision, vector_content_revision, reason FROM chunk_revisions "
-                    "WHERE kb_id = :kb AND doc_id = :doc ORDER BY chunk_id"
+                    f"SELECT {', '.join(_ROW_COLUMNS)} FROM chunk_revisions "
+                    "WHERE kb_id = :kb AND doc_id = :doc AND revision_status = :status "
+                    "ORDER BY chunk_id, content_revision"
                 ),
-                {"kb": kb_w2, "doc": doc_w2},
+                {"kb": kb_w2, "doc": doc_w2, "status": where_status},
             ).fetchall()
-        return {
-            str(row[0]): {
-                "rev": row[1],
-                "status": row[2],
-                "graph": row[3],
-                "vector": row[4],
-                "graph_rev": row[5],
-                "vector_rev": row[6],
-                "reason": row[7],
-            }
-            for row in found
-        }
+        return [dict(zip(("chunk_id", "rev", "status", "graph", "vector", "graph_rev", "vector_rev", "reason"),
+                         [str(r[0]), r[1], r[2], r[3], r[4], r[5], r[6], r[7]])) for r in found]
+
+    def rows() -> dict:
+        """current 行按 chunk_id 建键（数据库保证每 chunk 至多一条），供既有单行断言复用。"""
+        current = _select_rows("current")
+        by_chunk: dict = {}
+        for item in current:
+            assert item["chunk_id"] not in by_chunk, f"同一 chunk 出现两条 current：{item['chunk_id']}"
+            by_chunk[item["chunk_id"]] = item
+        return by_chunk
+
+    def history_rows() -> list[dict]:
+        return _select_rows("superseded")
+
+    def raw_row_count() -> int:
+        with default_engine.connect() as conn:
+            return int(
+                conn.execute(
+                    sqltext("SELECT COUNT(*) FROM chunk_revisions WHERE kb_id = :kb AND doc_id = :doc"),
+                    {"kb": kb_w2, "doc": doc_w2},
+                ).scalar_one()
+            )
 
     captured: list = []
     doc_store: dict = {}
@@ -502,15 +531,37 @@ def _scenario_real_build_graph(check: "Check", tmp: Path) -> None:
                 stack.enter_context(ctx)
             result3 = service.build_graph(kb_id=kb_w2, doc_ids=[doc_w2], force=False)
         final = rows()
-        bumped = {cid for cid, item in final.items() if item["status"] == "current" and item["rev"] == 2}
+        history = history_rows()
+        raw_n = raw_row_count()
         third_map = vector_calls[0].get("content_revisions") if vector_calls else {}
+        current_rev2 = {item["chunk_id"] for item in final.values() if item["rev"] == 2}
+        bumped = sorted({cid for cid, item in final.items() if item["rev"] == 2})
+        rev1_superseded = sorted(
+            item["chunk_id"] for item in history if item["rev"] == 1 and item["status"] == "superseded"
+        )
+        aligned = all(
+            item["graph_rev"] == 2 and item["vector_rev"] == 2 and item["graph"] == "indexed" and item["vector"] == "indexed"
+            for item in final.values()
+        )
         check.ok(
             "content_change_bumps_revision_in_real_build_graph",
             result3.get("documents") == 1
             and bool(bumped)
             and set(third_map or {}) == set(vector_calls[0]["chunk_ids"])
-            and all(value == 2 for value in (third_map or {}).values()),
-            f"docs={result3.get('documents')} bumped={sorted(bumped)} map={third_map} rows={final}",
+            and all(value == 2 for value in (third_map or {}).values())
+            and len(final) == 1
+            and current_rev2 == set(final)
+            and rev1_superseded == bumped
+            and len(history) == 1
+            and raw_n == 2
+            and aligned,
+            f"docs={result3.get('documents')} bumped={bumped} map={third_map} current={final} "
+            f"history={history} raw={raw_n} aligned={aligned}",
+        )
+        check.ok(
+            "content_change_projection_versions_align_with_new_revision",
+            aligned and raw_n == 2 and len(history) == 1 and history[0]["rev"] == 1,
+            f"current={final} history={history} raw={raw_n} aligned={aligned}",
         )
     finally:
         dgs.settings.parsed_document_storage_path = old_parsed_path

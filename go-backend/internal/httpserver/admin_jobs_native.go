@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,6 +24,7 @@ type adminJobStore interface {
 	GetJob(ctx context.Context, jobID int) (adminstore.JobItem, error)
 	ListJobLogs(ctx context.Context, jobID int, page int, pageSize int) (adminstore.JobLogListResult, error)
 	CreateJob(ctx context.Context, req adminstore.JobCreateRequest) (adminstore.JobItem, error)
+	EnqueueReindexChunks(ctx context.Context, req adminstore.ReindexEnqueueRequest) (adminstore.ReindexEnqueueReport, error)
 	RetryJob(ctx context.Context, req adminstore.JobRetryRequest) (adminstore.JobItem, error)
 	CancelJob(ctx context.Context, req adminstore.JobCancelRequest) (adminstore.JobItem, error)
 }
@@ -226,6 +228,10 @@ func buildAdminJobsWriteNativeHandler(
 		}
 
 		switch r.URL.Path {
+		case "/api/v1/admin/jobs/reindex-chunks":
+			// §16.3 的提交链刻意不走上面的 CreateJob 分支：CreateJob 是裸 INSERT，
+			// 同批 targets 重复提交会各建一行 pending，去重/复用/原地 retry 全部失效。
+			submitReindexChunksJob(w, r, logger, jobStore, kbStore, pythonWakeClient)
 		case "/api/v1/admin/jobs/build-graph", "/api/v1/admin/jobs/clear-kb", "/api/v1/admin/jobs/reindex":
 			var payload adminJobCreatePayload
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -278,6 +284,190 @@ func buildAdminJobsWriteNativeHandler(
 			WriteJSON(w, http.StatusNotFound, "资源不存在", map[string]string{"error_code": "NOT_FOUND"})
 		}
 	}))
+}
+
+// submitReindexChunksJob 是 §16.3 的 Go 写侧提交入口：KB 作用域强制 → targets 解析 →
+// 共享去重入队（EnqueueReindexChunks）→ 按 outcome 映射响应。
+//
+// 成功响应体是 entry.Job（含 id / targets_hash / status / retry_count），所以"复用"与
+// "原地重试"到底落在哪一行，调用方和集成测试都能靠 child_job_id 回读直接判定，
+// 不需要相信任何计数。
+//
+// 超限拒绝用既有码 JOB_MAX_RETRIES_REACHED + HTTP 400。设计文档 §16.3 写的 409 JOB_409
+// 在 Go 控制面没有实现（NOT-IMPLEMENTED：错误映射表里不存在该分支），这里不假造状态码。
+func submitReindexChunksJob(
+	w http.ResponseWriter,
+	r *http.Request,
+	logger *slog.Logger,
+	jobStore adminJobStore,
+	kbStore adminKBStore,
+	pythonWakeClient *proxy.Client,
+) {
+	var payload adminJobCreatePayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		WriteJSON(w, http.StatusBadRequest, "请求体错误", map[string]string{"error_code": "INVALID_BODY"})
+		return
+	}
+	kbItem, ok := requireJobKnowledgeBase(w, r, logger, kbStore, adminstore.ReindexChunksJobType, &payload)
+	if !ok {
+		return
+	}
+	freezeJobPayloadScope(&payload, kbItem, adminstore.ReindexChunksJobType)
+	targets, err := reindexTargetsFromPayload(payload.Payload)
+	if err != nil {
+		writeScopeError(w, &scope.Error{
+			Code:    scope.CodeReindexScopeRequired,
+			Message: err.Error(),
+			Status:  http.StatusBadRequest,
+		})
+		return
+	}
+	maxRetries := 3
+	if payload.MaxRetries != nil {
+		maxRetries = *payload.MaxRetries
+	}
+	report, err := jobStore.EnqueueReindexChunks(r.Context(), adminstore.ReindexEnqueueRequest{
+		Targets:    targets,
+		Source:     "admin_api",
+		TraceID:    optionalStringValue(optionalStringHeader(r, traceHeader)),
+		MaxRetries: maxRetries,
+		OperatorID: optionalIntHeader(r, "x-auth-user-id"),
+		IPAddress:  optionalString(firstRemoteAddr(r)),
+		UserAgent:  optionalString(r.UserAgent()),
+	})
+	if err != nil {
+		writeReindexEnqueueError(w, logger, err)
+		return
+	}
+	if len(report.Jobs) != 1 {
+		// kb/doc 作用域冻结自服务端 KB 行，一次提交只可能有一个分组。分组数不是 1
+		// 说明入队实现与作用域冻结脱节（例如 target 自带作用域被采信），不能返回"成功"。
+		logger.Error("reindex_chunks enqueue returned unexpected group count", "groups", len(report.Jobs))
+		WriteJSON(w, http.StatusServiceUnavailable, "reindex_chunks 入队结果异常", map[string]string{"error_code": "ADMIN_STORE_UNAVAILABLE"})
+		return
+	}
+	entry := report.Jobs[0]
+	if entry.Outcome == adminstore.ReindexOutcomeRejected {
+		writeReindexRetriesExhausted(w, logger, entry, report)
+		return
+	}
+	nudgePythonJobWorker(r, logger, pythonWakeClient)
+	status, message := http.StatusOK, "任务已复用"
+	if entry.Outcome == adminstore.ReindexOutcomeCreated {
+		status, message = http.StatusCreated, "任务已创建"
+	}
+	WriteJSON(w, status, message, entry.Job)
+}
+
+// reindexTargetsFromPayload 把 §8.2 冻结的 payload 形状 `{kb_id, tenant_id, project_id,
+// doc_id?, targets:[{chunk_id, target_revision}]}` 展开成入队 targets。
+//
+// 作用域四元组一律取自 freezeJobPayloadScope 后的 payload：target 自带 kb_id/tenant_id
+// 直接忽略，否则一次提交可以夹带跨 KB 的 chunk 绕开 KB 鉴权。
+// 空 targets 必须拒绝（§15.7）：入队成功后 worker 会"成功"消费掉一个什么都不重建的任务。
+func reindexTargetsFromPayload(payload map[string]interface{}) ([]adminstore.ReindexTarget, error) {
+	rawTargets, ok := payload["targets"].([]interface{})
+	if !ok || len(rawTargets) == 0 {
+		return nil, errors.New("reindex_chunks payload.targets 不能为空")
+	}
+	kbID := strings.TrimSpace(stringValue(payload["kb_id"]))
+	docID := strings.TrimSpace(stringValue(payload["doc_id"]))
+	tenantID := strings.TrimSpace(stringValue(payload["tenant_id"]))
+	projectID := strings.TrimSpace(stringValue(payload["project_id"]))
+	targets := make([]adminstore.ReindexTarget, 0, len(rawTargets))
+	for _, raw := range rawTargets {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, errors.New("reindex_chunks payload.targets 必须是对象列表")
+		}
+		chunkID := strings.TrimSpace(stringValue(item["chunk_id"]))
+		if chunkID == "" {
+			return nil, errors.New("reindex_chunks 需要每条 target 都带 kb_id 与 chunk_id")
+		}
+		revision, ok := targetRevisionFromJSON(item["target_revision"])
+		if !ok {
+			return nil, fmt.Errorf("target_revision 非法: chunk_id=%s", chunkID)
+		}
+		if revision < 1 {
+			return nil, fmt.Errorf("target_revision 必须 >= 1: chunk_id=%s", chunkID)
+		}
+		targets = append(targets, adminstore.ReindexTarget{
+			KBID:           kbID,
+			DocID:          docID,
+			TenantID:       tenantID,
+			ProjectID:      projectID,
+			ChunkID:        chunkID,
+			TargetRevision: revision,
+		})
+	}
+	return targets, nil
+}
+
+// maxTargetRevision 是 float64 仍能精确表示的最大整数（2^53）。超过它的 JSON 数字
+// 在 encoding/json 解出来时就已经是四舍五入值，拿它算 targets_hash 等于对不存在
+// 的 revision 建索引，所以在入口拒绝。
+const maxTargetRevision = 1 << 53
+
+// targetRevisionFromJSON 只接受整数语义的 JSON 数字。encoding/json 把所有数字解成
+// float64，而 Python 侧 `int(raw["target_revision"])` 会静默把 1.9 截断成 1、把 True 当 1；
+// 两端不一致就会算出不同 targets_hash，所以小数/字符串/布尔一律在入口拒绝。
+func targetRevisionFromJSON(value interface{}) (int, bool) {
+	typed, ok := value.(float64)
+	if !ok || typed < -maxTargetRevision || typed > maxTargetRevision {
+		return 0, false
+	}
+	exact := int(typed)
+	if float64(exact) != typed {
+		return 0, false
+	}
+	return exact, true
+}
+
+func writeReindexEnqueueError(w http.ResponseWriter, logger *slog.Logger, err error) {
+	switch {
+	case errors.Is(err, adminstore.ErrReindexScopeRequired):
+		writeScopeError(w, &scope.Error{
+			Code:    scope.CodeReindexScopeRequired,
+			Message: "reindex_chunks targets 作用域不完整",
+			Status:  http.StatusBadRequest,
+		})
+	case errors.Is(err, adminstore.ErrJobValidation):
+		WriteJSON(w, http.StatusBadRequest, "任务参数错误", map[string]string{"error_code": "INVALID_BODY"})
+	case errors.Is(err, adminstore.ErrReindexEnqueueAnomaly):
+		// 命中去重索引却读不到既有行：存储层处于我们无法服务的关系。判据只写在 message 与
+		// Error 日志里，不降级成"参数错误"诱导调用方去改请求体。
+		logger.Error("reindex_chunks enqueue anomaly", "error", err.Error())
+		WriteJSON(w, http.StatusServiceUnavailable, "reindex_chunks 入队失败：命中去重索引但读不到既有任务行", map[string]string{"error_code": "ADMIN_STORE_UNAVAILABLE"})
+	default:
+		// 其余存储层故障（外键违例、连接断开、列不存在……）不得复用上一条文案：Wave 8 第一次
+		// 实跑就是夹具缺 admin_users 行导致 requested_by 外键违例，却被回成"命中去重索引"，
+		// 把排障方向整个带偏。文案只说它确定知道的那件事。
+		logger.Error("reindex_chunks enqueue failed", "error", err.Error())
+		WriteJSON(w, http.StatusServiceUnavailable, "reindex_chunks 入队失败：存储层不可用", map[string]string{"error_code": "ADMIN_STORE_UNAVAILABLE"})
+	}
+}
+
+// writeReindexRetriesExhausted 把 §16.3 的超限拒绝回给调用方，并原样带出人工介入需要的
+// 三件事：哪一行（child_job_id）、哪批目标（targets_hash）、额度还剩多少。
+func writeReindexRetriesExhausted(w http.ResponseWriter, logger *slog.Logger, entry adminstore.ReindexEnqueueEntry, report adminstore.ReindexEnqueueReport) {
+	data := map[string]interface{}{
+		"error_code":   "JOB_MAX_RETRIES_REACHED",
+		"child_job_id": entry.Job.ID,
+		"targets_hash": entry.TargetsHash,
+		"retry_count":  entry.Job.RetryCount,
+		"max_retries":  entry.Job.MaxRetries,
+		"reason":       "retry_exhausted",
+	}
+	for _, detail := range report.RejectedDetail {
+		if detail.TargetsHash != entry.TargetsHash || detail.KBID != entry.KBID {
+			continue
+		}
+		data["retry_count"] = detail.RetryCount
+		data["max_retries"] = detail.MaxRetries
+		data["chunk_ids"] = detail.ChunkIDs
+	}
+	logger.Warn("reindex_chunks rejected: retry quota exhausted", "child_job_id", entry.Job.ID, "targets_hash", entry.TargetsHash)
+	WriteJSON(w, http.StatusBadRequest, "reindex_chunks 重试额度已用尽，需人工介入后再提交", data)
 }
 
 func enrichAdminJobPayloadWithScenarioDefaults(
