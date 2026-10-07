@@ -1209,6 +1209,37 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
   不得据此表述为可启动 canary。
 - Shared Gate **OPEN**，M5-B1 **冻结**；本阶段未写共享环境、未建集合、未入队、未启用 S1、未 push。
 
+### 9.25 本地分支整合与合并后验证（2026-10-07）
+
+本轮仅整合 Git 历史与验证代码，不执行共享数据准备、迁移或服务重启。
+
+- `main` 从 `13303dc` 快进至 `integration/m5-phase3-4-p6` 的 `8323871`，包含原有
+  87 个集成提交以及上一轮未提交修复的独立提交 `8323871`。
+- 随后以 `a519b9d` 合入 `m5/dual-write` 的剩余 10 个提交；无文本冲突，保留两条开发线的历史。
+- `audit/m5-gate0-completion`、`audit/m5-gate0-coverage`、
+  `audit/m5-gate0-coverage-clean`、`codex/eol-normalization` 均已被 `main` 完整包含。
+- 只删除未被工作树占用且已合入的三个本地分支：`audit/m5-gate0-coverage`、
+  `codex/eol-normalization`、`m5/dual-write`。本地分支由 7 个减至 4 个；保留被工作树占用的
+  两个审计分支和 integration 分支。其它工作树的未提交修改未移动或提交。
+- 主工作树原有内容在合并前临时保存、合并后恢复；原八个 Go 文件与保存快照的内容一致，
+  `output/` 保留，未纳入提交。既有两条 stash 记录保留。
+
+合并后的隔离验证：
+
+| 入口 | 结果与边界 |
+|---|---|
+| `python -u backend/tests/run_unified_boundary_guards.py` | exit 0，`SUMMARY total=28 failed=0`；SQLite/进程内替身，Python socket 护栏留痕判据生效 |
+| `go test ./...`（Linux） | exit 0；`golang:1.24.13-bookworm`，整个仓库与依赖缓存只读挂载、`--network none`、`GOPROXY=off`；未注入 `GI_P6_PG_DSN`，真实 PG 集成用例跳过 |
+| `npm run build` | exit 0；Windows 当前 Node `v24.20.0`，TypeScript 与 Vite 构建通过；本轮未验证 nvm 管理的 Node `22.22.2` |
+| `git diff --check` | exit 0 |
+
+Windows 原生 `go test ./...` 因既有监控代码依赖 Linux `syscall.Statfs` 编译失败；本轮未修改
+平台支持范围。第一次 Linux 测试只挂载 Go 子目录，RBAC 对账缺少 Python 源码而失败，
+改为整个仓库只读挂载后全套通过。
+
+真实 Neo4j/Milvus/PG 与 Go/Python 服务运行态本轮未取证，未写共享 dev、未 push；
+共享 Gate 保持 **OPEN**、M5-B1 **冻结**。本地合并与隔离测试不构成生产闭环。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
