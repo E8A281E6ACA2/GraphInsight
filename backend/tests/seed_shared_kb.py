@@ -30,10 +30,23 @@ PK 冲突防覆盖：chunk_id 是 v2 主键，upsert 按 PK 覆盖。占用检�
 （不带 kb/tenant 过滤）——任何属性不一致（含跨 KB / 跨 tenant 同键）都判 CONFLICT，
 绝不静默覆盖外域数据；删除时 filter 仍叠加 kb/tenant/project 守卫。
 
+共享写目标**强制**：`--milvus-uri`/`--collection`（含 env 覆盖）统一预校验，仅接受
+`http://127.0.0.1:19531` + `graphinsight_chunks_v2`（19530 属其它项目，严禁）。
+
+回滚部分删除语义：删除按批次推进账本，批次中断即落 **PARTIAL** record（executed=true
++ deleted/pending 清单，读回为准），重跑同一 manifest 幂等收敛；绝不把部分删除谎报为
+零删除 FAIL_CLOSED。
+
+紧急证据链：manifest 落盘 = 主路径 → 同目录 `.emergency.<ts>.json` → 系统临时目录 →
+stderr（BEGIN/END 包裹完整 JSON）；manifest 写盘失败的运行**不得 exit 0**（seed 成功
+但证据丢失 = exit 2，在 manifest 可用前不得进入后续阶段）。
+
 硬禁止（脚本内无入口）：建 v3 集合、回填写入、入队、修改共享配置、push、删除
 manifest 之外的任何数据。
 
-退出码：0 成功（含幂等 no-op）；2 fail-closed（零写入或零删除）；3 仅方案/计划。
+退出码：0 成功（含幂等 no-op）；2 fail-closed（零写入/零删除；或写入/删除已发生但
+证据链降级、部分删除 PARTIAL、manifest 落盘失败——以 record 的 status/executed 为准）；
+3 仅方案/计划。
 """
 from __future__ import annotations
 
@@ -44,9 +57,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -54,9 +69,13 @@ if hasattr(sys.stdout, "reconfigure"):
 
 AUTHORIZE_TOKEN = "SEED-SHARED-AUTHORIZED"
 DEFAULT_PARSED_ROOT = "E:/projects/GraphInsight/backend/parsed_documents"
-# 严禁 19530：属其它项目（data-stellarls-milvus-1）。默认走宿主映射端口 19531。
-DEFAULT_MILVUS_URI = "http://127.0.0.1:19531"
-DEFAULT_COLLECTION = "graphinsight_chunks_v2"
+# 共享写目标**强制**（validate_milvus_target，任何偏离 fail-closed）：
+# 19530 属其它项目（data-stellarls-milvus-1），严禁；集合必须恰为 v2 primary。
+ENFORCED_MILVUS_URI = "http://127.0.0.1:19531"
+ENFORCED_COLLECTION = "graphinsight_chunks_v2"
+# 兼容旧名（已改为强制口径，不再提供默认之外的自由度）。
+DEFAULT_MILVUS_URI = ENFORCED_MILVUS_URI
+DEFAULT_COLLECTION = ENFORCED_COLLECTION
 DEFAULT_PG_CONTAINER = "graphinsight-postgres"
 
 PLAN_SCHEMA = "seed-shared-plan-v2"
@@ -85,6 +104,29 @@ def safe_id(value: Any) -> Optional[str]:
     if not v or not _SAFE_ID_RE.match(v):
         return None
     return v
+
+
+def validate_milvus_target(uri: str, collection: str) -> Optional[str]:
+    """共享写目标强制校验：仅 `http://127.0.0.1:19531` + `graphinsight_chunks_v2`。
+
+    19530 属其它项目（data-stellarls-milvus-1），任何端口/主机/集合偏离都拒绝，
+    防止受控写入落到错误实例或非 v2 集合（v3 / canary / 其它项目库）。返回 None = 通过。
+    """
+    try:
+        parsed = urlparse(str(uri or "").strip())
+        host = (parsed.hostname or "").strip()
+        port = parsed.port  # 端口非法时 urlparse 抛 ValueError
+    except ValueError:
+        return f"milvus uri 无法解析: {uri!r}"
+    if parsed.scheme not in ("http", "https"):
+        return f"milvus uri scheme 非法（期望 http/https）: {uri!r}"
+    if host != "127.0.0.1" or port != 19531:
+        return (f"milvus uri 必须是 {ENFORCED_MILVUS_URI}（严禁 19530：属其它项目；"
+                f"实际 host={host or '(empty)'} port={port}）: {uri!r}")
+    if str(collection or "").strip() != ENFORCED_COLLECTION:
+        return (f"collection 必须是 {ENFORCED_COLLECTION}（v2-only 硬约束，"
+                f"禁 v3/canary/其它集合）: {collection!r}")
+    return None
 
 
 def deterministic_vector(text: str, dim: int) -> List[float]:
@@ -399,13 +441,57 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+EMERGENCY_BEGIN = "-----BEGIN SEED-SHARED EMERGENCY MANIFEST-----"
+EMERGENCY_END = "-----END SEED-SHARED EMERGENCY MANIFEST-----"
+
+
+def _write_text(path: Path, text: str) -> None:
+    """实际落盘点（唯一磁盘写入口，测试在此注入故障）。"""
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_record(out_dir: Path, filename: str,
+                  record: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+    """manifest 落盘，带**紧急证据链**：主路径 → 同目录 `.emergency.<ts>.json` →
+    系统临时目录；全部失败时把完整 JSON 包裹在 BEGIN/END 标记间打到 stderr。
+
+    manifest 是回滚的唯一依据：落盘失败绝不允许静默吞掉（旧实现 `except: pass`
+    会造成"已写入共享但无任何证据"的不可回滚状态）。
+    返回 (实际落盘路径 | None, 各后备失败原因清单)。
+    """
+    payload = json.dumps(record, ensure_ascii=False, indent=1) + "\n"
+    stem = Path(filename).stem
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    candidates = [
+        out_dir / filename,
+        out_dir / f"{stem}.emergency.{ts}.json",
+        Path(tempfile.gettempdir()) / f"{stem}.emergency.{ts}.json",
+    ]
+    errors: List[str] = []
+    for cand in candidates:
+        try:
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            _write_text(cand, payload)
+            return str(cand), errors
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{cand}: {type(exc).__name__}: {exc}"[:200])
+    print(f"{EMERGENCY_BEGIN}\n{payload}{EMERGENCY_END}", file=sys.stderr)
+    print("✗ 紧急证据：manifest 主路径与全部后备写盘均失败，完整 JSON 已输出到 stderr；"
+          "无落盘 manifest 则无法回滚，请立即手工保存上述 JSON。", file=sys.stderr)
+    return None, errors
+
+
+def _announce_evidence(where: Optional[str], errors: List[str]) -> None:
+    if where:
+        print(f"  归档：{where}")
+    else:
+        for e in errors:
+            print(f"  落盘失败：{e}", file=sys.stderr)
 
 
 def _fail_record(out_dir: Path, *, mode: str, kb: str, step: str, detail: Any,
-                 executed: bool = False, rows: Optional[List[Dict[str, Any]]] = None) -> None:
-    """fail-closed 留痕：尽力写本地 record（写失败不影响退出码判定）。"""
+                 executed: bool = False, rows: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    """fail-closed 留痕：走紧急证据链落盘，返回实际路径（None = 全部失败，已 dump stderr）。"""
     record: Dict[str, Any] = {
         "schema": RUN_SCHEMA, "mode": mode, "generated_at": _now(), "kb_id": kb,
         "executed": executed, "status": "FAIL_CLOSED", "failed_step": step,
@@ -414,10 +500,9 @@ def _fail_record(out_dir: Path, *, mode: str, kb: str, step: str, detail: Any,
     if rows is not None:
         # 已发生写入时的失败：manifest 必须带全量键，供回滚使用。
         record["rows"] = rows
-    try:
-        _write_json(out_dir / "seed-shared-run.json", record)
-    except Exception:  # noqa: BLE001
-        pass
+    where, errors = _write_record(out_dir, "seed-shared-run.json", record)
+    _announce_evidence(where, errors)
+    return where
 
 
 def _print_plan(plan: Dict[str, Any], out_file: Path) -> None:
@@ -497,6 +582,10 @@ def run_plan(args: argparse.Namespace) -> int:
             preflight["milvus"] = {"status": "UNVERIFIED", "detail": f"{type(exc).__name__}: {exc}"[:300]}
 
     pg_probe = preflight.get("pg") or {}
+    # 提案里的 tenant/project 仅在 PG 核验 OK **且**过安全校验时回填。
+    pg_ok = pg_probe.get("status") == "OK"
+    prop_tenant = str(pg_probe.get("tenant_id") or "") if pg_ok and safe_id(pg_probe.get("tenant_id")) else ""
+    prop_project = str(pg_probe.get("project_id") or "") if pg_ok and safe_id(pg_probe.get("project_id")) else ""
     plan: Dict[str, Any] = {
         "schema": PLAN_SCHEMA,
         "generated_at": _now(),
@@ -510,11 +599,7 @@ def run_plan(args: argparse.Namespace) -> int:
             for r in rows
         ],
         "preflight": preflight or {"status": "SKIPPED", "detail": "未加 --probe，未做实时预检"},
-        "write_scope_proposal": _write_scope_proposal(
-            kb or args.kb,
-            str(pg_probe.get("tenant_id") or "") if pg_probe.get("status") == "OK" else "",
-            str(pg_probe.get("project_id") or "") if pg_probe.get("status") == "OK" else "",
-        ),
+        "write_scope_proposal": _write_scope_proposal(kb or args.kb, prop_tenant, prop_project),
         "authorization_ladder": AUTHORIZATION_LADDER,
         "rollback_contract": {
             "manifest_file": "seed-shared-run.json",
@@ -527,9 +612,14 @@ def run_plan(args: argparse.Namespace) -> int:
         "executed": False,
         "result": "PLAN_ONLY",
     }
-    out_file = out_dir / "seed-shared-plan.json"
-    _write_json(out_file, plan)
-    _print_plan(plan, out_file)
+    where, errors = _write_record(out_dir, "seed-shared-plan.json", plan)
+    if where is None or errors:
+        # 主路径落盘失败 = 归档合同破坏：即便 emergency 后备接住也必须 exit 2，
+        # 绝不允许 exit 3 假装"已归档"。
+        print("✗ fail-closed: plan 落盘失败/降级（证据位置见下）", file=sys.stderr)
+        _announce_evidence(where, errors)
+        return EXIT_FAIL_CLOSED
+    _print_plan(plan, Path(where))
     return EXIT_PLAN_ONLY
 
 
@@ -563,6 +653,11 @@ def run_execute(args: argparse.Namespace) -> int:
     if pg.get("status") != "OK":
         return fail("pg_kb_check", pg)
     tenant, project = pg["tenant_id"], pg["project_id"]
+    # tenant/project 会进入 v2 行数据、run manifest 与（回滚侧）delete filter ——
+    # 必须过安全校验，PG 出现异常值时 fail-closed 而不是把脏值写进共享。
+    if safe_id(tenant) is None or safe_id(project) is None:
+        return fail("pg_kb_check", {"reason": "kb tenant/project 非安全标识符，拒绝写入",
+                                    "tenant_id": tenant, "project_id": project})
     for r in rows:
         r["tenant_id"], r["project_id"] = tenant, project
 
@@ -598,7 +693,7 @@ def run_execute(args: argparse.Namespace) -> int:
     to_write = decision["to_write"]
     written_keys: List[str] = []
     try:
-        for part in batched([r["chunk_id"] for r in to_write]):
+        for part in batched([r["chunk_id"] for r in to_write], BATCH):
             if not part:
                 continue
             data = [dict({f: r[f] for f in ROW_FIELDS},
@@ -646,11 +741,19 @@ def run_execute(args: argparse.Namespace) -> int:
         "status": "OK",
         "result": "SEEDED" if written_keys else "ALREADY_SEEDED",
     }
-    _write_json(out_dir / "seed-shared-run.json", record)
+    where, errors = _write_record(out_dir, "seed-shared-run.json", record)
     print(f"✓ SEED-SHARED 完成：planned={len(rows)} written={len(written_keys)} "
           f"already_seeded={len(decision['skipped'])} dim={dim} "
           f"collection={args.collection}（v2-only，未触碰 PG/Neo4j/v3）")
-    print(f"  归档：{out_dir / 'seed-shared-run.json'}（含回滚 manifest）")
+    if where is None or errors:
+        # 数据已写入且读回通过，但回滚依据（manifest）落盘失败或降级 —— 必须大张旗鼓
+        # 地失败，绝不允许 exit 0 假装"有证据"；manifest 可用前不得进入后续阶段。
+        print("✗ fail-closed: run manifest 落盘失败/降级（写入已发生；证据位置见下）；"
+              "在 manifest 可用前不得进行任何后续阶段。", file=sys.stderr)
+        _announce_evidence(where, errors)
+        return EXIT_FAIL_CLOSED
+    _announce_evidence(where, errors)
+    print("  （manifest 含回滚依据：--rollback <上述文件>）")
     return EXIT_OK
 
 
@@ -677,13 +780,14 @@ def _load_run_manifest(path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
     for r in rows:
         if not isinstance(r, dict) or safe_id(r.get("chunk_id")) is None:
             return None, "manifest rows 含非法 chunk_id"
-    # kb/tenant/project 会进入 Milvus delete filter —— 必须全部过安全校验（防篡改注入）。
+    # kb/tenant/project 会进入 Milvus delete filter —— 必须非空且全部过安全校验
+    # （防篡改注入；合法 manifest 由 seed 写出，tenant/project 必然存在）。
     if safe_id(manifest.get("kb_id")) is None:
         return None, "manifest kb_id 非法或不安全"
     for f in ("tenant_id", "project_id"):
         v = str(manifest.get(f) or "")
-        if v and safe_id(v) is None:
-            return None, f"manifest {f} 非法或不安全"
+        if not v or safe_id(v) is None:
+            return None, f"manifest {f} 缺失或非安全标识符"
     return manifest, ""
 
 
@@ -723,14 +827,16 @@ def run_rollback(args: argparse.Namespace) -> int:
             ],
             "executed": False, "result": "PLAN_ONLY",
         }
-        out_file = out_dir / "seed-shared-rollback-plan.json"
-        _write_json(out_file, plan)
+        where, errors = _write_record(out_dir, "seed-shared-rollback-plan.json", plan)
+        if where is None:
+            print("✗ fail-closed: rollback plan 落盘失败（紧急证据已 dump stderr）", file=sys.stderr)
+            return EXIT_FAIL_CLOSED
         print("SEED-SHARED 回滚方案（**仅方案，未删除任何数据**）")
         print(f"  依据 manifest : {args.rollback}")
         print(f"  目标 KB       : {kb}")
         print(f"  collection    : {collection}")
         print(f"  将核验键数    : {len(manifest_rows)}")
-        print(f"  归档：{out_file}")
+        _announce_evidence(where, errors)
         return EXIT_PLAN_ONLY
 
     # 模式 4：回滚执行（fail-closed + 全有或全无 + 幂等）。
@@ -738,12 +844,31 @@ def run_rollback(args: argparse.Namespace) -> int:
         record = {"schema": ROLLBACK_SCHEMA, "mode": "rollback", "generated_at": _now(),
                   "kb_id": kb, "collection": collection, "executed": False,
                   "status": "FAIL_CLOSED", "failed_step": step, "detail": detail}
-        try:
-            _write_json(out_dir / "seed-shared-rollback.json", record)
-        except Exception:  # noqa: BLE001
-            pass
+        where, errors = _write_record(out_dir, "seed-shared-rollback.json", record)
         print(f"✗ fail-closed @ {step}: {json.dumps(detail, ensure_ascii=False)[:400]}",
               file=sys.stderr)
+        _announce_evidence(where, errors)
+        return EXIT_FAIL_CLOSED
+
+    def partial_fail(step: str, detail: Any, deleted_keys: List[str],
+                     pending_keys: List[str]) -> int:
+        """删除已部分发生：如实记录 PARTIAL（executed=true + deleted/pending 清单），
+        绝不谎报 FAIL_CLOSED（零删除）；重跑同一 manifest 可幂等收敛。"""
+        record = {"schema": ROLLBACK_SCHEMA, "mode": "rollback", "generated_at": _now(),
+                  "kb_id": kb, "collection": collection,
+                  "executed": True, "status": "PARTIAL", "failed_step": step, "detail": detail,
+                  "counts": {"deleted": len(deleted_keys),
+                             "already_absent": len(decision["already_absent"]),
+                             "pending": len(pending_keys)},
+                  "deleted_keys": deleted_keys,
+                  "pending_keys": pending_keys,
+                  "already_absent_keys": decision["already_absent"]}
+        where, errors = _write_record(out_dir, "seed-shared-rollback.json", record)
+        print(f"✗ PARTIAL @ {step}: deleted={len(deleted_keys)} pending={len(pending_keys)} "
+              f"{json.dumps(detail, ensure_ascii=False)[:300]}", file=sys.stderr)
+        print("  重跑同一 --rollback 命令可幂等收敛（已删键视为 already_absent）。",
+              file=sys.stderr)
+        _announce_evidence(where, errors)
         return EXIT_FAIL_CLOSED
 
     if not collection:
@@ -770,18 +895,30 @@ def run_rollback(args: argparse.Namespace) -> int:
 
     deletable = decision["deletable"]
     deleted: List[str] = []
+    pending: List[str] = list(deletable)
     if deletable:
         try:
-            for part in batched(deletable):
+            for part in batched(deletable, BATCH):
                 mv.delete(collection, guarded_delete_filter(part, kb, tenant, project))
+                # 批次成功才推进账本：中途异常时 deleted/pending 精确反映已发生状态。
+                deleted.extend(part)
+                done = set(part)
+                pending = [k for k in pending if k not in done]
             after = query_live_rows(mv, collection, [r["chunk_id"] for r in manifest_rows])
         except Exception as exc:  # noqa: BLE001
-            return fail("milvus_delete", f"{type(exc).__name__}: {exc}"[:300])
+            return partial_fail("milvus_delete", f"{type(exc).__name__}: {exc}"[:300]
+                                + "（读回未执行，以账本为准）", deleted, pending)
         remaining = [r["chunk_id"] for r in manifest_rows
                      if r["chunk_id"] in deletable and after.get(r["chunk_id"]) is not None]
         if remaining:
-            return fail("rollback_verify", {"remaining_after_delete": remaining[:20]})
+            # 读回为准：仍在库中的键按"未删除"如实入账，不得计入 deleted。
+            deleted = [k for k in deleted if k not in set(remaining)]
+            pending = remaining
+            return partial_fail("rollback_verify",
+                                {"remaining_after_delete": remaining[:20]},
+                                deleted, pending)
         deleted = deletable
+        pending = []
 
     record = {
         "schema": ROLLBACK_SCHEMA, "mode": "rollback", "generated_at": _now(),
@@ -795,10 +932,15 @@ def run_rollback(args: argparse.Namespace) -> int:
         "status": "OK",
         "result": "ROLLED_BACK" if deleted else "ALREADY_ROLLED_BACK",
     }
-    _write_json(out_dir / "seed-shared-rollback.json", record)
+    where, errors = _write_record(out_dir, "seed-shared-rollback.json", record)
     print(f"✓ 回滚完成：deleted={len(deleted)} already_absent={len(decision['already_absent'])} "
           f"collection={collection}（v2-only；PG/Neo4j/v3 未触碰）")
-    print(f"  归档：{out_dir / 'seed-shared-rollback.json'}")
+    if where is None or errors:
+        print("✗ fail-closed: rollback manifest 落盘失败/降级（删除已发生；证据位置见下）",
+              file=sys.stderr)
+        _announce_evidence(where, errors)
+        return EXIT_FAIL_CLOSED
+    _announce_evidence(where, errors)
     return EXIT_OK
 
 
@@ -811,11 +953,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--rollback", default="", help="回滚模式：run manifest JSON 路径")
     ap.add_argument("--probe", action="store_true", help="plan 模式追加只读实时预检（PG/Milvus）")
     ap.add_argument("--milvus-uri",
-                    default=os.environ.get("MILVUS_URI") or DEFAULT_MILVUS_URI)
+                    default=os.environ.get("MILVUS_URI") or ENFORCED_MILVUS_URI,
+                    help=f"必须为 {ENFORCED_MILVUS_URI}（强制，偏离即 fail-closed）")
     ap.add_argument("--collection",
-                    default=os.environ.get("MILVUS_COLLECTION") or DEFAULT_COLLECTION)
+                    default=os.environ.get("MILVUS_COLLECTION") or ENFORCED_COLLECTION,
+                    help=f"必须为 {ENFORCED_COLLECTION}（强制，v2-only）")
     ap.add_argument("--pg-container", default=DEFAULT_PG_CONTAINER)
     args = ap.parse_args(argv)
+
+    # 共享写目标强制：所有模式统一预校验（防 --milvus-uri/--collection/env 把
+    # 受控写入引到 19530 / 其它项目实例 / v3 集合）。
+    target_err = validate_milvus_target(args.milvus_uri, args.collection)
+    if target_err:
+        print(f"✗ fail-closed: {target_err}，零写入零删除", file=sys.stderr)
+        return EXIT_FAIL_CLOSED
 
     if args.rollback:
         return run_rollback(args)

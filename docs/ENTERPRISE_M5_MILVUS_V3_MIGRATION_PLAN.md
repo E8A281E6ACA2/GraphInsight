@@ -1172,7 +1172,7 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
 CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
 6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
-`check_seed_shared_v2_contract.py`（89 项，假体零真实连接）已注册统一门禁
+`check_seed_shared_v2_contract.py`（121 项，假体零真实连接）已注册统一门禁
 `m5_seed_shared_v2_contract`。
 
 | 模式 | 命令 | 行为 | 退出码 |
@@ -1195,7 +1195,24 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
 5. **归属校验来源**：tenant/project 来自 PG `knowledge_bases`（授权执行时核验），解析产物
    行内 kb_id/doc_id 与目录结构交叉核验；kb/doc/chunk 标识符全部过安全校验（防 Milvus
    filter 注入与路径逃逸）。
-6. **退出码**：0 成功（含幂等 no-op）；2 fail-closed（零写入或零删除）；3 仅方案/计划。
+6. **退出码**：0 成功（含幂等 no-op）；2 fail-closed（零写入/零删除；或写入/删除已
+   发生但证据链降级、PARTIAL、manifest 落盘失败——以 record 的 `status`/`executed` 为准）；
+   3 仅方案/计划。
+7. **共享写目标强制**（2026-10-07 fix）：`--milvus-uri`/`--collection`（含 env 覆盖）
+   在**所有模式**统一预校验，仅接受 `http://127.0.0.1:19531` + `graphinsight_chunks_v2`；
+   19530（属其它项目 `data-stellarls-milvus-1`）、localhost/其它端口、v3/canary/其它集合
+   一律 exit 2 零写入。
+8. **tenant/project 安全校验**（fix）：授权执行侧（PG 核验结果写入 v2 行与 manifest 前）
+   与回滚侧（`_load_run_manifest`，tenant/project 必须非空且过安全标识符校验——它们会
+   进入 delete filter）双侧 fail-closed；`--probe` 提案只在安全时回填，不写脏值。
+9. **回滚部分删除语义**（fix）：删除按批次推进账本（deleted/pending），批次中断即落
+   **PARTIAL** record（`executed=true` + `deleted_keys`/`pending_keys`，读回为准），绝不
+   把部分删除谎报为零删除 FAIL_CLOSED；重跑同一 manifest 幂等收敛（已删键 →
+   `already_absent`，pending 键重新核验后删除）。
+10. **紧急证据链**（fix）：manifest 落盘 = 主路径 → 同目录 `.emergency.<ts>.json` →
+    系统临时目录 → stderr（`-----BEGIN/END SEED-SHARED EMERGENCY MANIFEST-----` 包裹
+    完整 JSON）。主路径失败即 exit 2（即便 emergency 后备接住也算证据降级），绝不允许
+    exit 0 假装"有证据"；全路径失败时 stderr 含可解析完整 JSON，须手工保存。
 
 #### 四、执行计划（授权后按序执行）
 
