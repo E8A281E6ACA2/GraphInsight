@@ -141,6 +141,131 @@ def test_r1_index_then_load() -> None:
           "create_collection" in src and "create_index" in src)
 
 
+def test_r1b_s1_driver_build_order() -> None:
+    """R1 加强：**实际执行** S1_DRIVER（mock 掉服务），断言 建集合→建索引→load 的真实顺序。
+
+    此前只检查源码含 `create_index`（弱）；这里跑真实 driver 代码路径。
+    """
+    import contextlib
+    import types
+
+    calls: List[Tuple[str, str]] = []
+
+    class _Schema:
+        def add_field(self, **_kw: Any) -> None:
+            return None
+
+    class _IndexParams:
+        def add_index(self, **_kw: Any) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, uri: str = "", **_kw: Any) -> None:
+            return None
+
+        @staticmethod
+        def prepare_index_params() -> _IndexParams:
+            return _IndexParams()
+
+        def has_collection(self, name: str) -> bool:
+            return False
+
+        def drop_collection(self, name: str) -> None:
+            return None
+
+        def create_schema(self, **_kw: Any) -> _Schema:
+            return _Schema()
+
+        def create_collection(self, collection_name: str = "", **_kw: Any) -> None:
+            calls.append(("create_collection", collection_name))
+
+        def create_index(self, collection_name: str = "", **_kw: Any) -> None:
+            calls.append(("create_index", collection_name))
+
+        def load_collection(self, collection_name: str = "", **_kw: Any) -> None:
+            calls.append(("load", collection_name))
+            # 真实 Milvus 语义：无索引时 load 失败（本测试因此能抓到"漏建索引"）
+            if not any(k == "create_index" and v == collection_name for k, v in calls):
+                raise RuntimeError(f"index not found[collection={collection_name}]")
+
+        def query(self, **_kw: Any) -> List[dict]:
+            return []
+
+        def upsert(self, **_kw: Any) -> dict:
+            return {"upsert_count": 1}
+
+    fake_pymilvus = types.ModuleType("pymilvus")
+    fake_pymilvus.MilvusClient = FakeClient
+
+    class _DT:
+        VARCHAR = 21
+        INT64 = 5
+        FLOAT_VECTOR = 101
+
+    fake_pymilvus.DataType = _DT
+
+    fake_admin_db = types.ModuleType("admin.database")
+
+    class _Conn:
+        def execute(self, *_a: Any, **_k: Any) -> None:
+            return None
+
+    class _Engine:
+        def begin(self):
+            return contextlib.nullcontext(_Conn())
+
+    fake_admin_db.engine = _Engine()
+
+    fake_jr = types.ModuleType("services.job_runtime")
+    fake_jr.execute_job = lambda **_kw: {"execution_status": "completed"}
+
+    fake_es = types.ModuleType("services.embedding_service")
+
+    class _ES:
+        def embed_texts(self, texts):
+            return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+    fake_es.embedding_service = _ES()
+
+    # 真实 vector_store 会牵出 PyO3 native 模块（同进程二次初始化会 ImportError），
+    # 这里用假模块隔离：本测试只关心 建集合→建索引→load 的顺序。
+    fake_vs = types.ModuleType("services.vector_store")
+
+    class _VS:
+        def __init__(self) -> None:
+            self._revision_field: dict = {}
+
+        def config(self) -> Dict[str, Any]:
+            return {"enabled": True, "provider": "milvus", "collection": "p_r1",
+                    "dual_write": True, "shadow_collection": "s_r1",
+                    "uri": "http://127.0.0.1:19532"}
+
+    fake_vs.vector_store = _VS()
+
+    code = disp.S1_DRIVER.format(
+        backend=str(disp.BACKEND), kb="kb-r1", doc="d1", chunk="c1",
+        primary="p_r1", shadow="s_r1", uri="http://127.0.0.1:19532",
+    )
+    with mock.patch.dict(sys.modules, {
+        "pymilvus": fake_pymilvus,
+        "admin.database": fake_admin_db,
+        "services.job_runtime": fake_jr,
+        "services.embedding_service": fake_es,
+        "services.vector_store": fake_vs,
+    }):
+        exec(compile(code, "S1_DRIVER", "exec"), {"__name__": "__s1_driver__"})
+
+    check("R1 实际 driver：跑通并发生建集合", any(k == "create_collection" for k, _ in calls), str(calls))
+    for coll in ("p_r1", "s_r1"):
+        idx_cc = next((i for i, (k, v) in enumerate(calls) if k == "create_collection" and v == coll), None)
+        idx_ci = next((i for i, (k, v) in enumerate(calls) if k == "create_index" and v == coll), None)
+        idx_ld = next((i for i, (k, v) in enumerate(calls) if k == "load" and v == coll), None)
+        check(f"R1 实际 driver：{coll} 建集合→建索引→load 顺序正确",
+              idx_cc is not None and idx_ci is not None and idx_ld is not None
+              and idx_cc < idx_ci < idx_ld,
+              f"cc={idx_cc} ci={idx_ci} load={idx_ld} calls={calls}")
+
+
 # ---- R2：合成 embedding 只存在于测试入口（结构性隔离，不靠 env 开关/注释） ----
 def test_r2_synthetic_embedding_isolated_to_test_entry() -> None:
     """R2（本轮收紧）：此前"生产不触发"只是注释 + env 开关，没有 disposable 范围校验。
@@ -248,14 +373,29 @@ def test_r4_port_in_use_fail_closed() -> None:
         busy = disp._port_in_use(55433)
     check("R4 端口空闲 → _port_in_use=False", busy is False, f"busy={busy}")
 
-    # 预检把占用端口变成 exit 2（源码级 pin：main 里占用分支设 exit_code=2）
-    src = Path(disp.__file__).read_text(encoding="utf-8")
-    check("R4 预检占用端口分支设 exit_code=2",
-          "被占用端口" in src and "exit_code = 2" in src)
+    # R4 加强：**实际执行** main 的授权路径（端口占用）→ 不得调用 ensure_containers，且返回 2。
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        with mock.patch.object(sys, "argv", ["prog", "--authorize", disp.AUTHORIZE_TOKEN,
+                                             "--evidence-dir", td]), \
+             mock.patch.object(disp, "_docker_names", return_value=set()), \
+             mock.patch.object(disp, "_docker_networks", return_value=set()), \
+             mock.patch.object(disp, "_docker_volumes", return_value=set()), \
+             mock.patch.object(disp, "_port_in_use", return_value=True), \
+             mock.patch.object(disp, "ensure_containers") as mock_ensure, \
+             mock.patch.object(disp, "archive_manifests"), \
+             mock.patch.object(disp, "cleanup"), \
+             mock.patch.object(disp, "write_evidence", return_value=0):
+            code = disp.main()
+    check("R4 实际 main：端口占用 → 不调用 ensure_containers（零容器创建）",
+          not mock_ensure.called)
+    check("R4 实际 main：端口占用 → 返回 2", code == 2, f"code={code}")
 
 
 def main() -> int:
     test_r1_index_then_load()
+    test_r1b_s1_driver_build_order()
     test_r2_synthetic_embedding_isolated_to_test_entry()
     test_r3_flush_and_load_for_readback()
     test_r4_port_in_use_fail_closed()
