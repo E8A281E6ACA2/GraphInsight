@@ -185,6 +185,12 @@ CASES: tuple[GuardCase, ...] = (
         120,
         "M5 非空 disposable 真实执行暴露的四个缺陷离线回归（建索引后 load / 确定性 embedding 不外连 / flush+load 后读回 / 端口占用 fail-closed）",
     ),
+    GuardCase(
+        "m5_archive_contract",
+        "check_m5_archive_contract.py",
+        180,
+        "M5 证据归档合同负向回归（每步布尔 ok / 三方身份一致 / 重复字段拒绝 / skip-docker 不记 residue_ok / 归档后读回 / 明确清单关联 manifests）",
+    ),
 )
 
 
