@@ -84,6 +84,26 @@ def host_tcp(port: int) -> Dict[str, Any]:
         s.close()
 
 
+def host_listener(port: int) -> Dict[str, Any]:
+    """① 宿主端口监听进程（谁在宿主侧持有该端口）。"""
+    ps = (
+        f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue; "
+        f"if (-not $c) {{ Write-Output 'NO_LISTENER' }} else {{ "
+        f"foreach ($x in $c) {{ $p = Get-Process -Id $x.OwningProcess -ErrorAction SilentlyContinue; "
+        f"Write-Output ($x.LocalAddress + ':' + $x.LocalPort + ' pid=' + $x.OwningProcess + "
+        f"' proc=' + $p.ProcessName) }} }}"
+    )
+    rc, out = run(["powershell", "-NoProfile", "-Command", ps], timeout=90)
+    detail = out.strip()[:400]
+    return {"ok": bool(detail) and "NO_LISTENER" not in detail, "rc": rc, "detail": detail}
+
+
+def docker_port_mapping(container: str) -> Dict[str, Any]:
+    """② Docker 端口映射（容器端口 → 宿主绑定），只读 inspect。"""
+    rc, out = run(["docker", "inspect", container, "--format", "{{json .NetworkSettings.Ports}}"], timeout=60)
+    return {"ok": rc == 0, "rc": rc, "detail": out.strip()[:400]}
+
+
 def host_business(service: str, info: Dict[str, Any]) -> Dict[str, Any]:
     """宿主业务握手（只读）。"""
     try:
@@ -156,28 +176,50 @@ def main() -> int:
                 path = "/healthz" if name == "milvus" else "/"
                 svc["same_network"] = same_network(_http_probe(info["container"], http_port, path))
                 svc["same_network_probe"] = f"http {info['container']}:{http_port}{path}"
-        # C 宿主
+        # ① 宿主端口监听进程 + ② Docker 端口映射（只读）
+        svc["host_listener"] = host_listener(host_port)
+        svc["docker_port_mapping"] = docker_port_mapping(info["container"])
+        # ⑤ 宿主业务客户端（含裸 TCP 对照）
         svc["host_mapped_port"] = host_business(name, info)
         svc["host_tcp"] = host_tcp(host_port)
+        # 分层：服务健康 / 业务协议 / 裸 TCP —— 三者必须分开陈述，不得混为一谈
+        svc["layers"] = {
+            "service_healthy": bool(svc["in_container"]["ok"] or svc["same_network"]["ok"]),
+            "business_in_container": svc["in_container"]["ok"],
+            "business_same_network": svc["same_network"]["ok"],
+            "business_host": svc["host_mapped_port"]["ok"],
+            "tcp_host": svc["host_tcp"]["ok"],
+        }
         result["services"][name] = svc
-        a = svc["in_container"]["ok"]
-        b = svc["same_network"]["ok"]
-        c = svc["host_mapped_port"]["ok"]
-        print(f"  {name}: in_container={a} same_network={b} host_business={c} "
-              f"host_tcp={svc['host_tcp']['ok']}")
+        ly = svc["layers"]
+        print(f"  {name}: healthy={ly['service_healthy']} "
+              f"business(in/same/host)={ly['business_in_container']}/"
+              f"{ly['business_same_network']}/{ly['business_host']} "
+              f"tcp_host={ly['tcp_host']}")
 
-    # 结论：只描述现象，根因未定不臆断
-    any_host_fail = any(not s["host_mapped_port"]["ok"] for s in result["services"].values())
-    all_inner_ok = all(s["in_container"]["ok"] for s in result["services"].values())
-    if any_host_fail and all_inner_ok:
-        conclusion = ("容器内可访问、宿主映射端口业务握手失败 → 观测为「宿主访问路径异常」，"
-                      "根因未定（可能涉及端口转发/代理/防火墙等，需进一步定位）")
+    # 结论：**分层陈述**（服务健康 / 业务协议 / 裸 TCP），根因未定绝不臆断具体组件
+    svcs = result["services"].values()
+    all_healthy = all(s["layers"]["service_healthy"] for s in svcs)
+    all_host_biz_fail = all(not s["layers"]["business_host"] for s in svcs)
+    all_host_tcp_ok = all(s["layers"]["tcp_host"] for s in svcs)
+    result["layers_summary"] = {
+        "all_services_healthy": all_healthy,
+        "all_host_business_fail": all_host_biz_fail,
+        "all_host_tcp_ok": all_host_tcp_ok,
+    }
+    if all_healthy and all_host_biz_fail and all_host_tcp_ok:
+        conclusion = (
+            "分层观测：① 服务健康（容器内/同网络业务层可达）；② 宿主裸 TCP 可建连；"
+            "③ 宿主业务协议握手失败。→ 现象为「宿主访问路径的业务协议层异常」，"
+            "根因未定（可能涉及端口转发、代理/防火墙、协议中间件等；"
+            "本探测不足以定位到具体组件，不得据此断言某一组件故障）。"
+        )
         root_cause = "UNDETERMINED"
-    elif not any_host_fail:
-        conclusion = "三条路径业务握手均成功"
+    elif all_healthy and not all_host_biz_fail:
+        conclusion = "服务健康且部分/全部宿主业务握手成功：宿主访问路径未见异常"
         root_cause = "NONE"
     else:
-        conclusion = "容器内亦失败：可能是服务本身异常，需先看服务状态"
+        conclusion = "服务健康性本身存疑（容器内/同网络亦失败）：需先确认服务状态，再谈宿主路径"
         root_cause = "UNDETERMINED"
     result["conclusion"] = conclusion
     result["root_cause"] = root_cause
