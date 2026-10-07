@@ -1114,33 +1114,54 @@ rows_new=2）严格通过。
 
 #### 一、四来源只读统计（目标 KB `34905f75-38ca-4cfa-bf22-c89c96107fa8`）
 
+**解析产物路径以受控 `local-live.env` 为准**：`PARSED_DOCUMENT_STORAGE_PATH=
+E:/projects/GraphInsight/backend/parsed_documents`（**不是** integration 仓库的
+`backend/parsed_documents` 默认路径；首版报告取错路径，已更正）。
+证据：`gate0-evidence/2026-10-07/c3-sources-controlled-root/c3-sources-report.json`。
+
 | 来源 | 统计结果 | 可读性 |
 |---|---|---|
 | PG `chunk_revisions` | 全局 **0** 行；目标 KB `current` **0** | OK |
 | Neo4j `(:Chunk)` | 全局 **0**；目标 KB **0** | OK |
-| Milvus | collections=`[graphinsight_chunks_v2]`（**无 v3**）；v2 `rowCount=0`；按 kb 查询空 | OK |
-| 解析产物 `parsed_documents` | 目录仅 `README.md`，**无 KB 子目录**，目标 KB chunks **0** | OK |
+| Milvus v2 | `graphinsight_chunks_v2` 存在，`rowCount=0`；按 kb 查询空 | OK |
+| Milvus v3 | **不存在**（collections 仅 v2） | OK |
+| 解析产物 | **2 个文档目录 / 2 条有效 `chunks.jsonl`**（JSON 可解析、`chunk_id` 与文本存在） | OK |
 
-四来源**全部可读**（无 `UNVERIFIED`），且**全部为 0 / 空**。解析产物已按工单要求单独核对——
-确认为空，故可陈述"目标 KB 四来源均为空"，而非凭前三者推断。
+四来源**全部可读**（无 `UNVERIFIED`）。当前真实状态：**PG current 0 / Neo4j Chunk 0 /
+Milvus v2 0 / Milvus v3 不存在 / 解析产物 2 条**。
 
 #### 二、回填对象核验（逐 chunk）
 
 - v2（`graphinsight_chunks_v2`）`rowCount=0` → **无任何 chunk**，因此不存在"已有向量"，
   也不存在 KB / doc / tenant / project 归属可供逐 chunk 核验。
-- 解析产物为空 → 无可恢复证据。
-- **结论：不满足现有单向回填合同**。回填需要可恢复证据（`admin/backfill_chunk_revisions.py`：
-  parsed 产物 **或** v2 已有向量）；且 §16.1 读源不变量要求 **primary(v2) 已持有该 chunk**
-  ——"只有解析产物、没有 v2 向量"同样不满足。当前两者皆空。
+- 解析产物有 2 条（可恢复证据存在），但 **v2 为空**。
+- **结论：当前不能执行 `backfill_versioned`**。单向回填合同要求 **primary(v2) 已持有该
+  chunk 的向量**（§16.1 读源不变量）；现在 v2 是空的，"只有解析产物、没有 v2 向量"不满足合同。
+  因此下一步是**数据准备**（建立 v2 向量），而非直接回填。
 
-#### 三、非空数据准备方案（**不自行播种**，需授权）
+#### 二·补：四来源探测器的 fail-open 修复
+
+首版 `probe_c3_sources.py` 存在 fail-open：Milvus 返回 `code != 0` 的**业务错误 JSON**时
+容器进程退出码仍为 0，被误标 `OK`；Neo4j 的分组查询 / 目标 KB 查询失败也只看总数查询的 rc。
+本轮把判定抽成纯函数 `classify_pg / classify_neo4j / classify_milvus`，**任一子查询失败即整来源
+`UNVERIFIED`**（Milvus 逐个校验 `collections` / 每个 `stats` / 每个 `by_kb` 的 `code`，
+含 `error` 或非 dict 亦判失败）。负向回归 `check_m5_c3_sources_contract.py`（20 项）已接入门禁。
+
+#### 三、`SEED-SHARED` 数据准备方案（**不自行播种**，需单独授权）
+
+目标：为目标 KB 建立**受控**的
+- PG `chunk_revisions` current 行（revision=1，vector_status 待回填）；
+- Neo4j `(:Chunk)` 节点（带 `kb_id` / `doc_id` / `tenant_id` / `project_id` / `text`）；
+- Milvus **v2 primary 向量**（`graphinsight_chunks_v2`，与解析产物 2 条 chunk 一一对应）；
+- 配置**单 KB write scope**（`MILVUS_WRITE_SCOPE_KB_IDS` 仅目标 KB，并核对 tenant/project）。
 
 | 方案 | 内容 | 影响 |
 |---|---|---|
-| A（推荐前置） | 在 disposable 环境（已跑通：S1 双写 + 单向回填 + 读回 + 幂等 + 回滚）复用同一流程，先确认回填合同在真实引擎上成立 | 仅独立容器，无共享影响 |
-| B（共享） | 目标 KB 走一次**真实解析入库**，产出 parsed 产物 + v2 向量 + Neo4j 节点 + PG current 行，使四来源满足"至少一处非空" | **写共享环境**，需单独授权 |
+| A（已完成前置） | disposable 环境同流程已跑通（S1 双写 + 单向回填 + 读回 + 幂等 + 回滚，`checks=41 failed=0`） | 仅独立容器，无共享影响 |
+| B（本阶段申请） | 目标 KB 受控数据准备：PG current + Neo4j Chunk + **v2 向量** + 单 KB write scope | **写共享环境**，需 `SEED-SHARED` 授权 |
 
-建议顺序：A 已完成（第十一轮 `checks=41 failed=0`）→ 申请 B → 再申请回填写入。
+**顺序（严格按序，不得跳步）**：修探测器（已完成）→ `SEED-SHARED`（本阶段；暂不写共享）
+→ 数据准备完成后申请 `CREATE-V3` / `CONFIG-SHARED` → 最后申请 `BACKFILL-WRITE`。
 
 #### 四、执行计划（授权后按序执行）
 
@@ -1174,10 +1195,16 @@ rows_new=2）严格通过。
 - **v3 数据正确**：目标 chunk 写入 v3 且显式 `content_revision` 读回一致（写后读回，非"写入即算"）。
 - **v2 零写入**：per-chunk 前后快照比对，v2 字段与向量**完全不变**；任何 v2 变更即判失败。
 
-#### 七、当前状态
+#### 七、当前状态（2026-10-07 更正）
 
-宿主业务协议路径仍异常（服务健康、宿主裸 TCP 通、宿主业务握手失败，`root_cause=UNDETERMINED`），
-共享 C3 预检与回填写入均需在该路径恢复后执行。Shared Gate **OPEN**，M5-B1 **冻结**。
+- **Docker Desktop 重启已执行**；最新复验：PG / Neo4j / Milvus 的**宿主业务协议全部恢复**
+  （`ROOT_CAUSE: NONE`）。此前"宿主路径仍异常 / 重启尚未确认"的表述已过期，不再适用。
+- 四来源：PG current **0** / Neo4j Chunk **0** / Milvus v2 **0** / v3 **不存在** /
+  解析产物 **2 条**（见 §一，路径以受控 `local-live.env` 为准）。
+- **当前不能执行 `backfill_versioned`**：v2 primary 仍为空，不满足单向回填合同（要求 v2 已有向量）。
+- **口径纠正**：C3 的 `candidate=true` **只表示 C3 五类阻断为零**，**不代表** "canary ready"；
+  不得据此表述为可启动 canary。
+- Shared Gate **OPEN**，M5-B1 **冻结**；本阶段未写共享环境、未建集合、未入队、未启用 S1、未 push。
 
 ## 10. 与既有章节的对应
 
