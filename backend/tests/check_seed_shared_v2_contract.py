@@ -42,13 +42,17 @@ class FakeMilvus:
                  fail_query_after_upsert: bool = False,
                  fail_delete_after_n: int = 0,
                  delete_drops_only_first: bool = False,
-                 fail_upsert_after_rows: int = 0):
+                 fail_upsert_after_rows: int = 0,
+                 fail_delete_after_apply: bool = False,
+                 fail_query_after_delete: bool = False):
         self.collections = collections          # name -> {"dim": int, "fields": [...], "rows": {pk: row}}
         self.fail_upsert = fail_upsert
         self.fail_query_after_upsert = fail_query_after_upsert
         self.fail_delete_after_n = fail_delete_after_n
         self.delete_drops_only_first = delete_drops_only_first
         self.fail_upsert_after_rows = fail_upsert_after_rows
+        self.fail_delete_after_apply = fail_delete_after_apply
+        self.fail_query_after_delete = fail_query_after_delete
         self.deleted_filters: list = []
         self.upserted: list = []
 
@@ -70,6 +74,8 @@ class FakeMilvus:
 
     def query(self, name, filter_expr, output_fields, limit=200):
         c = self.collections[name]
+        if self.fail_query_after_delete and self.deleted_filters:
+            raise RuntimeError("injected query failure after delete")
         if self.fail_query_after_upsert and self.upserted:
             # 模拟"写入成功但读回丢失一行"（fail_query 注入只生效一次）
             rows = dict(c["rows"])
@@ -116,6 +122,9 @@ class FakeMilvus:
                         del c["rows"][pk]
                     continue
                 del c["rows"][pk]
+        if self.fail_delete_after_apply:
+            # 模拟"删除已应用但响应丢失"：行已删，客户端收到异常
+            raise RuntimeError("injected delete failure after applying deletions")
         return {"delete_count": 0}
 
 
@@ -650,17 +659,25 @@ def test_manifest_emergency_evidence() -> None:
               and json.loads(emergencies[0].read_text(encoding="utf-8"))["executed"] is True
               and json.loads(emergencies[0].read_text(encoding="utf-8"))["status"] == "OK")
 
-        # 场景 B：全部路径失败 → stderr BEGIN/END 包裹完整 JSON，exit 2
+        # 场景 B：run manifest 全部候选写后损坏（journal 放行，写入发生）→
+        # stderr BEGIN/END 包裹完整 JSON + exit 2 + journal 残留可恢复
         mv2 = FakeMilvus(fresh_collection())
         err_buf = io.StringIO()
-        s._write_text = lambda path, text: (_ for _ in ()).throw(OSError("disk full"))
+
+        def corrupt_run_manifest_everywhere(path, text):
+            if Path(path).name.startswith("seed-shared-run"):
+                return orig_write(path, text[:5] + "{corrupt")
+            return orig_write(path, text)
+
+        s._write_text = corrupt_run_manifest_everywhere
         try:
             with redirect_stderr(err_buf):
                 rc = run_seed(argv, milvus=mv2)
         finally:
             s._write_text = orig_write
         err_text = err_buf.getvalue()
-        check("fix4 B：全路径失败 → exit 2", rc == s.EXIT_FAIL_CLOSED and sorted(mv2.upserted) == ["c-1"])
+        check("fix4 B：run manifest 全候选损坏 → exit 2（写入已发生）",
+              rc == s.EXIT_FAIL_CLOSED and sorted(mv2.upserted) == ["c-1"], str(rc))
         check("fix4 B：stderr 含 BEGIN/END 紧急标记",
               s.EMERGENCY_BEGIN in err_text and s.EMERGENCY_END in err_text)
         try:
@@ -670,6 +687,8 @@ def test_manifest_emergency_evidence() -> None:
                   payload["executed"] is True and payload["counts"]["written"] == 1)
         except Exception as exc:  # noqa: BLE001
             check(f"fix4 B：stderr 内 JSON 可解析且 executed=true（解析失败 {exc}）", False)
+        check("fix4 B：journal 残留，崩溃/证据丢失后仍可恢复",
+              (out / "seed-shared-journal.json").is_file())
 
         # 场景 C：回滚成功 manifest 落盘失败 → exit 2 + emergency 接住
         run_seed(argv, milvus=FakeMilvus(fresh_collection()))
@@ -871,10 +890,12 @@ def test_p1d_manifest_readback_verify() -> None:
               len(emergencies) == 1
               and json.loads(emergencies[0].read_text(encoding="utf-8"))["executed"] is True)
 
-        # 全部候选写后损坏 → stderr 紧急 dump + exit 2
+        # 全候选（run manifest）写后损坏（journal 放行）→ stderr 紧急 dump + exit 2
         mv2 = FakeMilvus(fresh_collection())
         err_buf = io.StringIO()
-        s._write_text = lambda path, text: orig_write(path, text[:5] + "{corrupt")
+        s._write_text = lambda path, text: (
+            orig_write(path, text[:5] + "{corrupt")
+            if Path(path).name.startswith("seed-shared-run") else orig_write(path, text))
         try:
             with redirect_stderr(err_buf):
                 rc = run_seed(argv, milvus=mv2)
@@ -886,6 +907,192 @@ def test_p1d_manifest_readback_verify() -> None:
               s.EMERGENCY_BEGIN in err_text and s.EMERGENCY_END in err_text
               and json.loads(err_text.split(s.EMERGENCY_BEGIN, 1)[1]
                              .split(s.EMERGENCY_END, 1)[0])["executed"] is True)
+
+
+# ---------------------------------------------------------------- R1：同目录重跑不毁所有权证据
+def test_r1_rerun_preserves_ownership_evidence() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n"]})
+        argv = ["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                "--authorize", s.AUTHORIZE_TOKEN]
+        mv = FakeMilvus(fresh_collection())
+        run_seed(argv, milvus=mv)          # run1: c-1 owned（写入）
+        run_seed(argv, milvus=mv)          # run2 同目录同库 rerun：c-1 已在库一致
+        rec2 = json.loads((out / "seed-shared-run.json").read_text(encoding="utf-8"))
+        superseded = list(out.glob("seed-shared-run.superseded.*.json"))
+        check("R1：同目录 rerun 后 manifest 为 ALREADY_SEEDED 且记录 supersedes",
+              rec2["result"] == "ALREADY_SEEDED" and rec2["rows"] == []
+              and rec2.get("supersedes") and Path(rec2["supersedes"]).is_file(),
+              str(rec2.get("supersedes")))
+        check("R1：superseded 副本持有原 owned rows",
+              len(superseded) == 1
+              and [r["chunk_id"] for r in json.loads(
+                  superseded[0].read_text(encoding="utf-8"))["rows"]] == ["c-1"])
+        rc = run_seed(["--rollback", rec2["supersedes"], "--out", str(out),
+                       "--authorize", s.AUTHORIZE_TOKEN],
+                      milvus=FakeMilvus(fresh_collection()))
+        check("R1：首次写入的证据仍可回滚（superseded 副本）",
+              rc == s.EXIT_OK, str(rc))
+
+        # 留存失败 → 拒绝覆盖（原 manifest 原样保留）
+        out2 = Path(td) / "out2"
+        owned = {"schema": s.RUN_SCHEMA, "executed": True, "kb_id": KB,
+                 "tenant_id": TENANT, "project_id": PROJECT, "collection": COLL,
+                 "dim": DIM, "milvus_uri": s.ENFORCED_MILVUS_URI,
+                 "rows": [{"chunk_id": "z-1", "doc_id": "d1", "kb_id": KB,
+                           "tenant_id": TENANT, "project_id": PROJECT, "text": "z",
+                           "text_sha256": s.text_sha256("z")}]}
+        out2.mkdir(parents=True)
+        (out2 / "seed-shared-run.json").write_text(json.dumps(owned), encoding="utf-8")
+        orig_write = s._write_text
+
+        def block_superseded(path, text):
+            if ".superseded." in Path(path).name:
+                raise OSError("injected superseded preservation failure")
+            return orig_write(path, text)
+
+        s._write_text = block_superseded
+        try:
+            rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out2),
+                           "--authorize", s.AUTHORIZE_TOKEN],
+                          milvus=FakeMilvus(fresh_collection()))
+        finally:
+            s._write_text = orig_write
+        check("R1：留存失败 → exit 2 拒绝覆盖且原 owned manifest 原样保留",
+              rc == s.EXIT_FAIL_CLOSED
+              and json.loads((out2 / "seed-shared-run.json").read_text(encoding="utf-8")) == owned)
+
+
+# ---------------------------------------------------------------- R2：mutation journal 崩溃恢复
+def test_r2_journal_crash_recovery() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [
+            json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n",
+            json.dumps({"chunk_id": "c-2", "doc_id": "d1", "text": "t2"}) + "\n",
+        ]})
+
+        class HardCrash(FakeMilvus):
+            """模拟 upsert 部分应用后进程硬中断（SystemExit 绕过 except Exception）。"""
+
+            def upsert(self, name, data):
+                applied = 0
+                cc = self.collections[name]
+                for r in data:
+                    if applied >= self.fail_upsert_after_rows:
+                        raise SystemExit("simulated hard crash mid-upsert")
+                    cc["rows"][r["chunk_id"]] = dict(r)
+                    self.upserted.append(r["chunk_id"])
+                    applied += 1
+                return {"upsert_count": len(data)}
+
+        mv = HardCrash(fresh_collection(), fail_upsert_after_rows=1)
+        try:
+            run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                      "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+            crashed = False
+        except SystemExit:
+            crashed = True
+        check("R2：进程硬中断复现（journal 前置于写入）", crashed)
+        check("R2：崩溃后无 run manifest 但 journal 在盘",
+              not (out / "seed-shared-run.json").exists()
+              and (out / "seed-shared-journal.json").is_file())
+        jr = json.loads((out / "seed-shared-journal.json").read_text(encoding="utf-8"))
+        check("R2：journal 含完整上下文与 mutation 目标期望行",
+              jr["schema"] == s.JOURNAL_SCHEMA and jr["kb_id"] == KB
+              and jr["tenant_id"] == TENANT and jr["collection"] == COLL
+              and sorted(r["chunk_id"] for r in jr["rows"]) == ["c-1", "c-2"])
+        m, err = s._load_run_manifest(out / "seed-shared-journal.json")
+        check("R2：loader 接受 journal 作为回滚输入", m is not None, err)
+        rc = run_seed(["--rollback", str(out / "seed-shared-journal.json"), "--out", str(out),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+        rec = json.loads((out / "seed-shared-rollback.json").read_text(encoding="utf-8"))
+        check("R2：journal 回滚收敛（c-1 删除、c-2 已不存在）",
+              rc == s.EXIT_OK and rec["counts"] == {"deleted": 1, "already_absent": 1}
+              and not mv.collections[COLL]["rows"], str(rec.get("counts")))
+
+        # 成功路径：manifest 落盘后 journal 被清理
+        out2 = Path(td) / "out2"
+        run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out2),
+                  "--authorize", s.AUTHORIZE_TOKEN], milvus=FakeMilvus(fresh_collection()))
+        check("R2：成功运行后 journal 已清理",
+              (out2 / "seed-shared-run.json").is_file()
+              and not (out2 / "seed-shared-journal.json").is_file())
+
+
+# ---------------------------------------------------------------- R3：删除响应丢失按实际状态入账
+def test_r3_delete_response_loss_ledger() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [
+            json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n",
+            json.dumps({"chunk_id": "c-2", "doc_id": "d1", "text": "t2"}) + "\n",
+        ]})
+        run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                  "--authorize", s.AUTHORIZE_TOKEN], milvus=FakeMilvus(fresh_collection()))
+        rb_argv = ["--rollback", str(out / "seed-shared-run.json"), "--out", str(out),
+                   "--authorize", s.AUTHORIZE_TOKEN]
+
+        def two_rows():
+            return {"c-1": {"chunk_id": "c-1", "doc_id": "d1", "kb_id": KB,
+                            "tenant_id": TENANT, "project_id": PROJECT, "text": "t1",
+                            "vector": s.deterministic_vector("t1", DIM)},
+                    "c-2": {"chunk_id": "c-2", "doc_id": "d1", "kb_id": KB,
+                            "tenant_id": TENANT, "project_id": PROJECT, "text": "t2",
+                            "vector": s.deterministic_vector("t2", DIM)}}
+
+        # 场景 A：删除已应用但响应丢失 → 读回按实际状态入账 verified PARTIAL
+        mv = FakeMilvus(fresh_collection(), fail_delete_after_apply=True)
+        mv.collections[COLL]["rows"] = two_rows()
+        rc = run_seed(rb_argv, milvus=mv)
+        rec = json.loads((out / "seed-shared-rollback.json").read_text(encoding="utf-8"))
+        check("R3 A：删除响应丢失 → exit 2 PARTIAL（verified=true 按实际状态）",
+              rc == s.EXIT_FAIL_CLOSED and rec["status"] == "PARTIAL"
+              and rec["verified"] is True
+              and rec["deleted_keys"] == ["c-1", "c-2"] and rec["pending_keys"] == [],
+              str({k: rec.get(k) for k in ("status", "verified", "deleted_keys", "pending_keys")}))
+        check("R3 A：记录与实际存储一致（两行确已不在）", not mv.collections[COLL]["rows"])
+        rc = run_seed(rb_argv, milvus=mv)
+        rec = json.loads((out / "seed-shared-rollback.json").read_text(encoding="utf-8"))
+        check("R3 A：重跑收敛 ALREADY_ROLLED_BACK",
+              rc == s.EXIT_OK and rec["result"] == "ALREADY_ROLLED_BACK")
+
+        # 场景 B：删除已应用 + 读回也失败 → PARTIAL_UNVERIFIED（账本估计，不伪装精确）
+        mv2 = FakeMilvus(fresh_collection(), fail_delete_after_apply=True,
+                         fail_query_after_delete=True)
+        mv2.collections[COLL]["rows"] = two_rows()
+        rc = run_seed(rb_argv, milvus=mv2)
+        rec = json.loads((out / "seed-shared-rollback.json").read_text(encoding="utf-8"))
+        check("R3 B：读回失败 → PARTIAL_UNVERIFIED 且 verified=false",
+              rc == s.EXIT_FAIL_CLOSED and rec["status"] == "PARTIAL_UNVERIFIED"
+              and rec["verified"] is False, str(rec.get("status")))
+        check("R3 B：实际存储中两行确已删除（record 未声称精确）",
+              not mv2.collections[COLL]["rows"])
+        mv2.fail_query_after_delete = False  # 恢复读回能力
+        rc = run_seed(rb_argv, milvus=mv2)
+        check("R3 B：读回恢复后重跑收敛 exit 0", rc == s.EXIT_OK)
+
+
+# ---------------------------------------------------------------- R4：URI 逐字符精确
+def test_r4_strict_uri() -> None:
+    check("R4：精确 URI 通过",
+          s.validate_milvus_target("http://127.0.0.1:19531", "graphinsight_chunks_v2") is None)
+    for uri, label in (
+        ("https://127.0.0.1:19531", "https 变体拒绝"),
+        ("http://127.0.0.1:19531/", "尾斜杠路径拒绝"),
+        ("http://127.0.0.1:19531?x=1", "query 拒绝"),
+        ("HTTP://127.0.0.1:19531", "大小写变体拒绝"),
+    ):
+        check(f"R4：{label}", s.validate_milvus_target(uri, "graphinsight_chunks_v2") is not None)
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n"]})
+        rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                       "--milvus-uri", "http://127.0.0.1:19531/"],
+                      milvus=FakeMilvus(fresh_collection()))
+        check("R4 e2e：尾斜杠 URI → exit 2 且不产出 plan",
+              rc == s.EXIT_FAIL_CLOSED and not (out / "seed-shared-plan.json").exists())
 
 
 def main() -> int:
@@ -910,6 +1117,10 @@ def main() -> int:
     test_p1b_write_ledger_and_recoverable_fail_manifest()
     test_p1c_ownership()
     test_p1d_manifest_readback_verify()
+    test_r1_rerun_preserves_ownership_evidence()
+    test_r2_journal_crash_recovery()
+    test_r3_delete_response_loss_ledger()
+    test_r4_strict_uri()
 
     print(f"\n  passed={len(PASSES)} failed={len(FAILURES)}")
     if FAILURES:

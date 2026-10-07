@@ -50,6 +50,15 @@ dispatched 期望行（超集收录安全）+ 完整运行上下文，保证"响
 ④ 写入所有权——成功 manifest 只收本次实际写入的 owned rows，already_seeded 行不入
 回滚删除集合；⑤ manifest 落盘读回校验（见上）。
 
+恢复边界加固（2026-10-07 二次复核后）：⑥ 同目录重跑不毁证据——覆盖 run manifest 前
+若既有文件持有所有权证据（executed=true 且 rows 非空）或内容损坏不可判定，先原样
+留存 `.superseded.<ts>.json`（新 record 记录 supersedes），留存失败拒绝覆盖；⑦
+mutation journal——首次 upsert 前把 mutation 目标期望行 + 完整上下文持久化为
+`seed-shared-journal.json`，进程硬中断后可用 `--rollback <journal>` 以读回为准恢复
+（成功落盘 manifest 后删除）；⑧ 删除响应丢失 → 立即读回按实际状态入账（verified
+PARTIAL），读回也失败 → 明确 PARTIAL_UNVERIFIED（账本估计，不伪装精确）；⑨ milvus
+uri 逐字符精确匹配（拒绝 https/路径/query 等变体）。
+
 硬禁止（脚本内无入口）：建 v3 集合、回填写入、入队、修改共享配置、push、删除
 manifest 之外的任何数据。
 
@@ -90,6 +99,7 @@ DEFAULT_PG_CONTAINER = "graphinsight-postgres"
 PLAN_SCHEMA = "seed-shared-plan-v2"
 RUN_SCHEMA = "seed-shared-run-v1"
 ROLLBACK_SCHEMA = "seed-shared-rollback-v1"
+JOURNAL_SCHEMA = "seed-shared-journal-v1"
 
 # v2 行核心字段（与 MilvusVectorStore schema 的身份/作用域/内容字段一致；
 # 向量字段单独处理，schema 里其余扩展字段一律不写，避免对共享 schema 做隐式假设）。
@@ -121,17 +131,16 @@ def validate_milvus_target(uri: str, collection: str) -> Optional[str]:
     19530 属其它项目（data-stellarls-milvus-1），任何端口/主机/集合偏离都拒绝，
     防止受控写入落到错误实例或非 v2 集合（v3 / canary / 其它项目库）。返回 None = 通过。
     """
-    try:
-        parsed = urlparse(str(uri or "").strip())
-        host = (parsed.hostname or "").strip()
-        port = parsed.port  # 端口非法时 urlparse 抛 ValueError
-    except ValueError:
-        return f"milvus uri 无法解析: {uri!r}"
-    if parsed.scheme not in ("http", "https"):
-        return f"milvus uri scheme 非法（期望 http/https）: {uri!r}"
-    if host != "127.0.0.1" or port != 19531:
-        return (f"milvus uri 必须是 {ENFORCED_MILVUS_URI}（严禁 19530：属其它项目；"
-                f"实际 host={host or '(empty)'} port={port}）: {uri!r}")
+    uri_s = str(uri or "").strip()
+    if uri_s != ENFORCED_MILVUS_URI:
+        # 逐字符精确（P1 复核：https / 尾斜杠路径 / query 等变体一律拒绝）。
+        try:
+            parsed = urlparse(uri_s)
+            detail = f"host={parsed.hostname or '(empty)'} port={parsed.port}"
+        except ValueError:
+            detail = "uri 无法解析"
+        return (f"milvus uri 必须精确为 {ENFORCED_MILVUS_URI}（实际 {uri_s!r}：{detail}；"
+                f"严禁 19530：属其它项目；不接受 https/路径/query 等变体）")
     if str(collection or "").strip() != ENFORCED_COLLECTION:
         return (f"collection 必须是 {ENFORCED_COLLECTION}（v2-only 硬约束，"
                 f"禁 v3/canary/其它集合）: {collection!r}")
@@ -510,6 +519,46 @@ def _announce_evidence(where: Optional[str], errors: List[str]) -> None:
             print(f"  落盘失败：{e}", file=sys.stderr)
 
 
+def _preserve_superseded(out_dir: Path, filename: str) -> Tuple[Optional[str], Optional[str]]:
+    """覆盖前检查既有 run manifest 是否持有所有权证据（恢复边界 R1）。
+
+    同目录重跑**不得**覆盖掉仍是回滚依据的 owned manifest：executed=true 且 rows
+    非空的既有文件（或内容损坏、无法判定是否持有的文件）先原样留存为
+    `<stem>.superseded.<ts>.json` 再覆盖；留存失败 → 拒绝覆盖。
+    返回 (superseded 副本路径 | None, 拒绝原因 | None)。
+    """
+    path = out_dir / filename
+    if not path.exists():
+        return None, None
+    owned: Optional[bool]
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        owned = bool(isinstance(existing, dict) and existing.get("executed") is True
+                     and isinstance(existing.get("rows"), list) and existing["rows"])
+    except Exception:  # noqa: BLE001
+        owned = None  # 损坏不可判定：可能是被破坏的 owned 证据，按需留存
+    if owned is False:
+        return None, None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    dest = out_dir / f"{Path(filename).stem}.superseded.{ts}.json"
+    try:
+        _write_text(dest, path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return None, (f"既有 manifest 疑似持有所有权证据且留存失败"
+                      f"（{type(exc).__name__}: {exc}"[:160] + f"），拒绝覆盖: {dest}")
+    return str(dest), None
+
+
+def _write_run_manifest(out_dir: Path, record: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+    """写 run manifest 前先留存既有所有权证据（R1）；新 record 记录 supersedes。"""
+    superseded, refuse = _preserve_superseded(out_dir, "seed-shared-run.json")
+    if refuse:
+        return None, [refuse]
+    if superseded:
+        record["supersedes"] = superseded
+    return _write_record(out_dir, "seed-shared-run.json", record)
+
+
 def _fail_record(out_dir: Path, *, mode: str, kb: str, step: str, detail: Any,
                  executed: bool = False, rows: Optional[List[Dict[str, Any]]] = None,
                  ctx: Optional[Dict[str, Any]] = None,
@@ -534,7 +583,7 @@ def _fail_record(out_dir: Path, *, mode: str, kb: str, step: str, detail: Any,
         record["rows"] = rows
     if extra:
         record.update(extra)
-    where, errors = _write_record(out_dir, "seed-shared-run.json", record)
+    where, errors = _write_run_manifest(out_dir, record)
     _announce_evidence(where, errors)
     return where
 
@@ -735,6 +784,26 @@ def run_execute(args: argparse.Namespace) -> int:
     written_keys: List[str] = []
     dispatched: List[str] = []  # 已发出 upsert 的键（含响应丢失的批次——可能已部分落库）
 
+    # R2 mutation journal：首次 upsert **之前**持久化恢复依据——进程在写入阶段
+    # 硬中断（无任何 manifest/账本存活）时，可用 `--rollback <journal>` 以读回
+    # 为准恢复。journal rows 只含 mutation 目标（to_write）的期望行：这些键在
+    # 冲突检测时已被证实不在库，回滚侧 row_matches 保证"在库且一致 = 本次拥有"。
+    if to_write:
+        journal = {
+            "schema": JOURNAL_SCHEMA, "mode": "seed-intent", "generated_at": _now(),
+            "kb_id": kb, "tenant_id": tenant, "project_id": project,
+            "milvus_uri": args.milvus_uri, "collection": args.collection, "dim": dim,
+            "planned_keys": [r["chunk_id"] for r in to_write],
+            "rows": [_manifest_row(r, dim) for r in to_write],
+            "note": ("崩溃恢复输入：--rollback <本文件>。读回为准：在库且与期望一致"
+                     " = 本次拥有（删）；不存在 = 已回收；不一致 = CONFLICT 拒删。"
+                     "成功运行的 journal 在 manifest 落盘后删除。"),
+        }
+        jwhere, jerr = _write_record(out_dir, "seed-shared-journal.json", journal)
+        if jwhere is None:
+            # journal 落盘失败 = 中断后不可恢复 → 不开始任何写入。
+            return fail("journal_write", {"errors": jerr})
+
     def write_fail(step: str, detail: Any,
                    live_map: Optional[Dict[str, Dict[str, Any]]]) -> int:
         """写后失败留痕（P1-B 可恢复账本）：
@@ -817,7 +886,14 @@ def run_execute(args: argparse.Namespace) -> int:
         "status": "OK",
         "result": "SEEDED" if written_keys else "ALREADY_SEEDED",
     }
-    where, errors = _write_record(out_dir, "seed-shared-run.json", record)
+    where, errors = _write_run_manifest(out_dir, record)
+    if where is not None:
+        # 成功落盘后 journal 不再需要（manifest 是权威恢复/回滚依据）；尽力删除，
+        # 残留的 journal 仍可安全用于回滚（rows ⊆ owned rows）。
+        try:
+            (out_dir / "seed-shared-journal.json").unlink()
+        except OSError:
+            pass
     print(f"✓ SEED-SHARED 完成：planned={len(rows)} written={len(written_keys)} "
           f"already_seeded={len(decision['skipped'])} dim={dim} "
           f"collection={args.collection}（v2-only，未触碰 PG/Neo4j/v3）")
@@ -846,8 +922,12 @@ def _load_run_manifest(path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
         return None, f"manifest 不可读: {type(exc).__name__}: {exc}"[:300]
-    if not isinstance(manifest, dict) or manifest.get("schema") != RUN_SCHEMA:
-        return None, f"manifest schema 非法（期望 {RUN_SCHEMA}）"
+    if not isinstance(manifest, dict) or manifest.get("schema") not in (RUN_SCHEMA, JOURNAL_SCHEMA):
+        return None, f"manifest schema 非法（期望 {RUN_SCHEMA} 或 {JOURNAL_SCHEMA}）"
+    if manifest.get("schema") == JOURNAL_SCHEMA and manifest.get("executed") is not True:
+        # R2 崩溃恢复：journal 记录的是写入前意图，存在即意味着可能有在途写入；
+        # 回滚以读回为准（row_matches），journal rows 只含 mutation 目标。
+        manifest["executed"] = True
     if manifest.get("executed") is not True:
         return None, "manifest executed != true（该次运行未发生写入，无需回滚）"
     # P1-A：manifest 自带的写目标必须严格等于受控 v2 目标——CLI 侧校验不覆盖
@@ -936,14 +1016,22 @@ def run_rollback(args: argparse.Namespace) -> int:
         return EXIT_FAIL_CLOSED
 
     def partial_fail(step: str, detail: Any, deleted_keys: List[str],
-                     pending_keys: List[str]) -> int:
+                     pending_keys: List[str], verified: bool = True) -> int:
         """删除已部分发生：如实记录 PARTIAL（executed=true + deleted/pending 清单），
-        绝不谎报 FAIL_CLOSED（零删除）；重跑同一 manifest 可幂等收敛。"""
+        绝不谎报 FAIL_CLOSED（零删除）；重跑同一 manifest 可幂等收敛。
+
+        verified=True：deleted/pending 来自删除后读回（实际状态）；
+        verified=False：读回也失败 → status=PARTIAL_UNVERIFIED，deleted/pending
+        仅为发出删除前的账本估计，不得当作实际存储状态。
+        """
         record = {"schema": ROLLBACK_SCHEMA, "mode": "rollback", "generated_at": _now(),
                   "kb_id": kb, "collection": collection,
                   "tenant_id": tenant, "project_id": project,
                   "milvus_uri": args.milvus_uri, "dim": dim,
-                  "executed": True, "status": "PARTIAL", "failed_step": step, "detail": detail,
+                  "verified": verified,
+                  "executed": True,
+                  "status": "PARTIAL" if verified else "PARTIAL_UNVERIFIED",
+                  "failed_step": step, "detail": detail,
                   "counts": {"deleted": len(deleted_keys),
                              "already_absent": len(decision["already_absent"]),
                              "pending": len(pending_keys)},
@@ -993,8 +1081,29 @@ def run_rollback(args: argparse.Namespace) -> int:
                 pending = [k for k in pending if k not in done]
             after = query_live_rows(mv, collection, [r["chunk_id"] for r in manifest_rows])
         except Exception as exc:  # noqa: BLE001
-            return partial_fail("milvus_delete", f"{type(exc).__name__}: {exc}"[:300]
-                                + "（读回未执行，以账本为准）", deleted, pending)
+            # R3：删除响应丢失（可能已应用部分/全部删除）→ **立即读回全部目标键**
+            # 按实际状态入账；读回也失败 → 明确 PARTIAL_UNVERIFIED，不得伪装精确。
+            try:
+                after = query_live_rows(mv, collection, [r["chunk_id"] for r in manifest_rows])
+            except Exception as exc2:  # noqa: BLE001
+                return partial_fail(
+                    "milvus_delete",
+                    {"error": f"{type(exc).__name__}: {exc}"[:200],
+                     "readback_error": f"{type(exc2).__name__}: {exc2}"[:200],
+                     "note": "读回失败：deleted/pending 为发出删除前的账本估计（UNVERIFIED）"},
+                    deleted, pending, verified=False)
+            gone = [k for k in deletable if after.get(k) is None]
+            matching = {r["chunk_id"] for r in manifest_rows
+                        if after.get(r["chunk_id"]) is not None
+                        and row_matches(r, after[r["chunk_id"]], dim)}
+            still = [k for k in deletable if k in matching]
+            conflicts = [k for k in deletable
+                         if k not in set(gone) and k not in set(matching)]
+            return partial_fail(
+                "milvus_delete",
+                {"error": f"{type(exc).__name__}: {exc}"[:200], "verified": True,
+                 "conflicts_after_delete": conflicts[:20]},
+                gone, still)
         remaining = [r["chunk_id"] for r in manifest_rows
                      if r["chunk_id"] in deletable and after.get(r["chunk_id"]) is not None]
         if remaining:

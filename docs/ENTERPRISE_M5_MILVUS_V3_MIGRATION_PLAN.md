@@ -1172,7 +1172,7 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
 CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
 6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
-`check_seed_shared_v2_contract.py`（144 项，假体零真实连接）已注册统一门禁
+`check_seed_shared_v2_contract.py`（167 项，假体零真实连接）已注册统一门禁
 `m5_seed_shared_v2_contract`。
 
 | 模式 | 命令 | 行为 | 退出码 |
@@ -1231,6 +1231,25 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
 15. **落盘读回校验**（P1-D）：manifest 每个候选写入后必须重新读取、解析并逐字段
     比对（`json.loads(...) == record`）；静默损坏（截断/半截写/被覆写）视同写盘失败
     转入下一后备，全部失败走 stderr 紧急 dump 并 exit 2。
+16. **同目录重跑不毁证据**（R1）：覆盖 run manifest 前，若既有文件持有所有权证据
+    （executed=true 且 rows 非空）或内容损坏不可判定，先原样留存
+    `seed-shared-run.superseded.<ts>.json`（新 record 记录 `supersedes` 路径）再覆盖；
+    留存失败 → 拒绝覆盖 exit 2。首次写入 → 同目录 rerun → 仍可用 superseded 副本
+    回滚首次写入。
+17. **mutation journal**（R2）：首次 upsert **之前**把 mutation 目标（to_write）期望行
+    + 完整上下文持久化为 `seed-shared-journal.json`，journal 落盘失败 → 不开始任何
+    写入（fail-closed）；进程在写入阶段硬中断（无 manifest 存活）后，可用
+    `--rollback <journal>` 恢复——读回为准：在库且与期望一致 = 本次拥有（删）、不存在
+    = 已回收、不一致 = CONFLICT 拒删；成功落盘 manifest 后 journal 删除（残留 journal
+    仍可安全回滚，rows ⊆ owned rows）。
+18. **删除响应丢失按实际状态入账**（R3）：delete 批次异常（响应丢失，删除可能已应用）
+    → **立即读回全部目标键**：消失 = deleted、仍在且一致 = pending、仍在但不一致 =
+    conflicts，record 标 `verified: true`（PARTIAL）；读回也失败 → status=
+    `PARTIAL_UNVERIFIED`、`verified: false`，deleted/pending 仅为发出删除前的账本估计，
+    不伪装成精确状态；重跑同一 manifest 幂等收敛。
+19. **URI 逐字符精确**（R4）：`--milvus-uri` 必须与 `http://127.0.0.1:19531` 逐字符
+    相等——https、尾斜杠路径、query、大小写变体一律 exit 2（与本文档"仅接受"表述
+    对齐，消灭合同与实现的偏差）。
 
 #### 四、执行计划（授权后按序执行）
 
