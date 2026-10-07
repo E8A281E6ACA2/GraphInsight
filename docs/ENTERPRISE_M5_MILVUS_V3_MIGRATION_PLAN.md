@@ -1166,6 +1166,37 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 **顺序（严格按序，不得跳步）**：修探测器（已完成）→ `SEED-SHARED`（本阶段；暂不写共享）
 → 数据准备完成后申请 `CREATE-V3` / `CONFIG-SHARED` → 最后申请 `BACKFILL-WRITE`。
 
+##### 三·补：`seed_shared_kb.py` 脚本合同（2026-10-07 v2-only 重写）
+
+入口 `backend/tests/seed_shared_kb.py`，**唯一写入 = Milvus v2 primary 向量**（v2-only）；
+脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
+CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
+6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
+`check_seed_shared_v2_contract.py`（89 项，假体零真实连接）已注册统一门禁
+`m5_seed_shared_v2_contract`。
+
+| 模式 | 命令 | 行为 | 退出码 |
+|---|---|---|---|
+| plan（默认 dry-run） | `--kb <kb> --out <dir>` | **离线**：解析产物逐行归属校验（doc/kb 不一致、重复 chunk_id、不安全标识符、空产物全部拒绝）+ 生成 seed/rollback manifest；零网络零写入 | 3 |
+| plan + probe | 追加 `--probe` | 只读实时预检（PG `knowledge_bases` 单行 + Milvus collection/dim/占用），任一失败记 UNVERIFIED，仍零写入 | 3 |
+| execute | 追加 `--authorize SEED-SHARED-AUTHORIZED` | 前置全 fail-closed（KB 登记/active/tenant/project、collection 存在/核心字段/dim）→ PK 占用冲突检测 → 仅写待写行 → **逐 chunk 读回校验**；幂等重跑 written=0 | 0 / 2 |
+| rollback plan | `--rollback <run.json>` | 依据 run manifest 打印将删键与判据，零删除 | 3 |
+| rollback execute | 追加 `--authorize ...` | **全有或全无**：任一行现值与 manifest 不一致即整体拒绝零删除；manifest 键已不存在视为已回滚（幂等）；删除 filter 叠加 kb/tenant/project 守卫 | 0 / 2 |
+
+关键合同（fail-closed 口径）：
+
+1. **错误令牌不降级**：`--authorize` 令牌不正确直接 exit 2 零写入，绝不静默落回 dry-run。
+2. **PK 冲突绝不覆盖**：占用检测只按 `chunk_id`（PK）查询、不带 kb/tenant 过滤——跨 KB /
+   跨 tenant 同键一律 CONFLICT 拒绝；upsert 按 PK 覆盖，因此该检测是防覆盖外域数据的唯一防线。
+3. **半截数据可回滚**：写后读回失败时 run manifest 仍记录全部已写入键
+   （chunk_id/doc_id/kb/tenant/project/text/text_sha256/vector_sha256），回滚可精确删除。
+4. **回滚判据**：只删"六字段 + 确定性向量与 manifest 完全一致"的行；确定性向量可由 text
+   重算，manifest 不存全量向量。
+5. **归属校验来源**：tenant/project 来自 PG `knowledge_bases`（授权执行时核验），解析产物
+   行内 kb_id/doc_id 与目录结构交叉核验；kb/doc/chunk 标识符全部过安全校验（防 Milvus
+   filter 注入与路径逃逸）。
+6. **退出码**：0 成功（含幂等 no-op）；2 fail-closed（零写入或零删除）；3 仅方案/计划。
+
 #### 四、执行计划（授权后按序执行）
 
 1. **vector 能力配置**：`VECTOR_STORE_ENABLED=true`、`MILVUS_URI=http://127.0.0.1:19531`

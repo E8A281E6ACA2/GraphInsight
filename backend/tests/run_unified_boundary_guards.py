@@ -203,6 +203,12 @@ CASES: tuple[GuardCase, ...] = (
         180,
         "M5 证据归档合同负向回归（每步布尔 ok / 三方身份一致 / 重复字段拒绝 / skip-docker 不记 residue_ok / 归档后读回 / 明确清单关联 manifests）",
     ),
+    GuardCase(
+        "m5_seed_shared_v2_contract",
+        "check_seed_shared_v2_contract.py",
+        120,
+        "SEED-SHARED v2-only 数据准备离线契约（归属校验 fail-closed / dry-run 零写入 / 错误令牌不降级 / PK 冲突不覆盖 / 幂等重跑 / 回滚全有或全无）",
+    ),
 )
 
 
