@@ -38,8 +38,17 @@ PK 冲突防覆盖：chunk_id 是 v2 主键，upsert 按 PK 覆盖。占用检�
 零删除 FAIL_CLOSED。
 
 紧急证据链：manifest 落盘 = 主路径 → 同目录 `.emergency.<ts>.json` → 系统临时目录 →
-stderr（BEGIN/END 包裹完整 JSON）；manifest 写盘失败的运行**不得 exit 0**（seed 成功
-但证据丢失 = exit 2，在 manifest 可用前不得进入后续阶段）。
+stderr（BEGIN/END 包裹完整 JSON）；**每个候选写入后必须读回校验**（可读 + JSON 可解析
++ 内容一致），静默损坏视同写盘失败转入下一后备；manifest 写盘/校验失败的运行**不得
+exit 0**（seed 成功但证据丢失 = exit 2，在 manifest 可用前不得进入后续阶段）。
+
+P1 加固（2026-10-07 独立复核后）：① 授权令牌校验**先于一切模式分发**（错误令牌不得
+进入回滚删除流程）；② 回滚 manifest 自带的 milvus_uri/collection 必须严格等于受控
+v2 目标（篡改 manifest 不得把删除引向 v3/其它实例）；③ 可恢复写入账本——upsert 发出
+即入账 dispatched，异常后读回区分 confirmed/unknown/pending，失败 manifest 收录
+dispatched 期望行（超集收录安全）+ 完整运行上下文，保证"响应丢失已落库"的键可清理；
+④ 写入所有权——成功 manifest 只收本次实际写入的 owned rows，already_seeded 行不入
+回滚删除集合；⑤ manifest 落盘读回校验（见上）。
 
 硬禁止（脚本内无入口）：建 v3 集合、回填写入、入队、修改共享配置、push、删除
 manifest 之外的任何数据。
@@ -472,9 +481,21 @@ def _write_record(out_dir: Path, filename: str,
         try:
             cand.parent.mkdir(parents=True, exist_ok=True)
             _write_text(cand, payload)
-            return str(cand), errors
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{cand}: {type(exc).__name__}: {exc}"[:200])
+            continue
+        # P1-D：写后必须读回校验（可读 + JSON 可解析 + 内容一致）——静默损坏
+        # （截断 / 半截写 / 被并发覆写）视同写盘失败，转入下一后备；全部失败走
+        # stderr 紧急 dump。
+        try:
+            back = json.loads(cand.read_text(encoding="utf-8"))
+            if back != record:
+                errors.append(f"{cand}: 读回校验失败（内容与期望不一致/被截断）")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{cand}: 读回校验异常 {type(exc).__name__}: {exc}"[:200])
+            continue
+        return str(cand), errors
     print(f"{EMERGENCY_BEGIN}\n{payload}{EMERGENCY_END}", file=sys.stderr)
     print("✗ 紧急证据：manifest 主路径与全部后备写盘均失败，完整 JSON 已输出到 stderr；"
           "无落盘 manifest 则无法回滚，请立即手工保存上述 JSON。", file=sys.stderr)
@@ -490,16 +511,29 @@ def _announce_evidence(where: Optional[str], errors: List[str]) -> None:
 
 
 def _fail_record(out_dir: Path, *, mode: str, kb: str, step: str, detail: Any,
-                 executed: bool = False, rows: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
-    """fail-closed 留痕：走紧急证据链落盘，返回实际路径（None = 全部失败，已 dump stderr）。"""
+                 executed: bool = False, rows: Optional[List[Dict[str, Any]]] = None,
+                 ctx: Optional[Dict[str, Any]] = None,
+                 extra: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """fail-closed 留痕：走紧急证据链落盘，返回实际路径（None = 全部失败，已 dump stderr）。
+
+    ctx 携带运行上下文（tenant_id/project_id/collection/dim/milvus_uri）：失败
+    manifest 必须能被 `_load_run_manifest` 接受，否则"写后失败"的证据不可回滚
+    （P1-B）。extra 合并附加字段（如 write_ledger）。
+    """
     record: Dict[str, Any] = {
         "schema": RUN_SCHEMA, "mode": mode, "generated_at": _now(), "kb_id": kb,
         "executed": executed, "status": "FAIL_CLOSED", "failed_step": step,
         "detail": detail,
     }
+    for k in ("tenant_id", "project_id", "collection", "dim", "milvus_uri"):
+        if ctx and ctx.get(k) is not None:
+            record[k] = ctx[k]
     if rows is not None:
-        # 已发生写入时的失败：manifest 必须带全量键，供回滚使用。
+        # 已发生（或可能已发生）写入时的失败：manifest 必须带 dispatched 期望行，
+        # 供回滚清理（超集收录安全：未写入 → already_absent；被外域覆盖 → 拒删）。
         record["rows"] = rows
+    if extra:
+        record.update(extra)
     where, errors = _write_record(out_dir, "seed-shared-run.json", record)
     _announce_evidence(where, errors)
     return where
@@ -635,8 +669,12 @@ def run_execute(args: argparse.Namespace) -> int:
         print(f"✗ fail-closed: kb id 非法或不安全: {args.kb!r}", file=sys.stderr)
         return EXIT_FAIL_CLOSED
 
+    # 运行上下文（P1-B）：失败 manifest 必须带全，否则 _load_run_manifest 拒收、
+    # "写后失败"的证据不可回滚。
+    ctx: Dict[str, Any] = {"milvus_uri": args.milvus_uri, "collection": args.collection}
+
     def fail(step: str, detail: Any) -> int:
-        _fail_record(out_dir, mode="seed", kb=kb, step=step, detail=detail)
+        _fail_record(out_dir, mode="seed", kb=kb, step=step, detail=detail, ctx=ctx)
         print(f"✗ fail-closed @ {step}: {json.dumps(detail, ensure_ascii=False)[:400]}",
               file=sys.stderr)
         return EXIT_FAIL_CLOSED
@@ -660,6 +698,7 @@ def run_execute(args: argparse.Namespace) -> int:
                                     "tenant_id": tenant, "project_id": project})
     for r in rows:
         r["tenant_id"], r["project_id"] = tenant, project
+    ctx["tenant_id"], ctx["project_id"] = tenant, project
 
     # ③ Milvus collection 前置核验（存在 + 核心字段 + dim）
     try:
@@ -674,6 +713,7 @@ def run_execute(args: argparse.Namespace) -> int:
         return fail("milvus_schema", {"reason": "无法解析 vector dim", "fields": fields})
     if missing:
         return fail("milvus_schema", {"reason": f"collection 缺核心字段: {missing}", "fields": fields})
+    ctx["dim"] = dim
     try:
         mv.load(args.collection)
     except Exception as exc:  # noqa: BLE001
@@ -689,9 +729,46 @@ def run_execute(args: argparse.Namespace) -> int:
     if decision["conflicts"]:
         return fail("conflict_check", {"conflicts": decision["conflicts"][:20]})
 
-    # ⑤ 写入 v2（仅待写行）+ ⑥ 读回校验（覆盖写入行与幂等跳过行的全集）
+    # ⑤ 写入 v2（仅待写行，按批次推进**可恢复账本**）+ ⑥ 读回校验（全集）
     to_write = decision["to_write"]
+    planned_keys = [r["chunk_id"] for r in rows]
     written_keys: List[str] = []
+    dispatched: List[str] = []  # 已发出 upsert 的键（含响应丢失的批次——可能已部分落库）
+
+    def write_fail(step: str, detail: Any,
+                   live_map: Optional[Dict[str, Dict[str, Any]]]) -> int:
+        """写后失败留痕（P1-B 可恢复账本）：
+        - 读回区分 confirmed（在库且与期望一致 = 本次拥有）/ unknown（响应丢失、
+          是否落库未知）/ pending（未发出）；
+        - 失败 manifest 收录 **dispatched 批次的期望行**——回滚侧 row_matches 保证
+          超集收录安全（未写入 → already_absent；被外域覆盖 → CONFLICT 拒删），
+          杜绝"响应丢失导致漏记已写入键"；
+        - 完整运行上下文 + 账本随 manifest 落盘。
+        """
+        confirmed: List[str] = []
+        unknown: List[str] = list(dispatched)
+        if live_map is None:
+            try:
+                live_map = query_live_rows(mv, args.collection, dispatched)
+            except Exception:  # noqa: BLE001
+                live_map = None
+        if live_map is not None:
+            matching = {r["chunk_id"] for r in to_write
+                        if r["chunk_id"] in live_map
+                        and row_matches(r, live_map[r["chunk_id"]], dim)}
+            confirmed = [k for k in dispatched if k in matching]
+            unknown = [k for k in dispatched if k not in matching]
+        ledger = {"confirmed": confirmed, "unknown": unknown,
+                  "pending": [k for k in planned_keys if k not in set(dispatched)]}
+        manifest_rows = [_manifest_row(r, dim) for r in to_write
+                         if r["chunk_id"] in set(dispatched)]
+        _fail_record(out_dir, mode="seed", kb=kb, step=step, detail=detail, executed=True,
+                     rows=manifest_rows, ctx=ctx, extra={"write_ledger": ledger})
+        print(f"✗ fail-closed @ {step}: {json.dumps(detail, ensure_ascii=False)[:300]} "
+              f"ledger confirmed={len(confirmed)} unknown={len(unknown)} "
+              f"pending={len(ledger['pending'])}", file=sys.stderr)
+        return EXIT_FAIL_CLOSED
+
     try:
         for part in batched([r["chunk_id"] for r in to_write], BATCH):
             if not part:
@@ -699,25 +776,17 @@ def run_execute(args: argparse.Namespace) -> int:
             data = [dict({f: r[f] for f in ROW_FIELDS},
                          vector=deterministic_vector(r["text"], dim))
                     for r in to_write if r["chunk_id"] in set(part)]
+            dispatched.extend(part)  # 发出即入账：响应丢失也可能已部分/全部落库
             mv.upsert(args.collection, data)
             written_keys.extend(r["chunk_id"] for r in data)
-        live_map = query_live_rows(mv, args.collection, [r["chunk_id"] for r in rows])
+        live_map = query_live_rows(mv, args.collection, planned_keys)
     except Exception as exc:  # noqa: BLE001
-        # 半截数据风险：manifest 带已写入键，供回滚；exit 2。
-        manifest_rows = [_manifest_row(r, dim) for r in rows if r["chunk_id"] in set(written_keys)]
-        _fail_record(out_dir, mode="seed", kb=kb, step="milvus_write_or_readback",
-                     detail=f"{type(exc).__name__}: {exc}"[:300], executed=True,
-                     rows=manifest_rows)
-        print(f"✗ fail-closed @ milvus_write_or_readback: {exc}", file=sys.stderr)
-        return EXIT_FAIL_CLOSED
+        return write_fail("milvus_write_or_readback",
+                          f"{type(exc).__name__}: {exc}"[:300], None)
 
     bad = verify_readback(live_map, rows, dim)
     if bad:
-        manifest_rows = [_manifest_row(r, dim) for r in rows if r["chunk_id"] in set(written_keys)]
-        _fail_record(out_dir, mode="seed", kb=kb, step="verify_readback",
-                     detail={"mismatch": bad[:20]}, executed=True, rows=manifest_rows)
-        print(f"✗ fail-closed @ verify_readback: {bad[:5]}", file=sys.stderr)
-        return EXIT_FAIL_CLOSED
+        return write_fail("verify_readback", {"mismatch": bad[:20]}, live_map)
 
     record: Dict[str, Any] = {
         "schema": RUN_SCHEMA,
@@ -729,13 +798,20 @@ def run_execute(args: argparse.Namespace) -> int:
         "milvus_uri": args.milvus_uri,
         "collection": args.collection,
         "dim": dim,
-        "rows": [_manifest_row(r, dim) for r in rows],
+        # P1-C 写入所有权：rows 只含**本次运行实际写入**的 owned rows；
+        # already_seeded（本次运行前已在库、内容一致的行）不属于本次运行，
+        # 绝不进入回滚删除集合。
+        "rows": [_manifest_row(r, dim) for r in to_write],
+        "already_seeded_keys": list(decision["skipped"]),
+        "ownership_note": ("rows 仅含本次运行实际写入的 owned rows；"
+                           "already_seeded 行不属于本次运行，不入回滚删除集合"),
         "counts": {"planned": len(rows), "written": len(written_keys),
                    "already_seeded": len(decision["skipped"])},
         "write_scope_proposal": _write_scope_proposal(kb, tenant, project),
         "rollback": {
             "file_note": "用 --rollback <本文件> --authorize SEED-SHARED-AUTHORIZED 执行",
-            "criteria": ["全有或全无", "仅删与 manifest 完全一致的行", "已不存在视为已回滚"],
+            "criteria": ["全有或全无", "仅删与 manifest 完全一致且属于本次运行的 owned rows",
+                         "已不存在视为已回滚", "already_seeded 行不在本 manifest 中"],
         },
         "executed": True,
         "status": "OK",
@@ -774,9 +850,16 @@ def _load_run_manifest(path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
         return None, f"manifest schema 非法（期望 {RUN_SCHEMA}）"
     if manifest.get("executed") is not True:
         return None, "manifest executed != true（该次运行未发生写入，无需回滚）"
+    # P1-A：manifest 自带的写目标必须严格等于受控 v2 目标——CLI 侧校验不覆盖
+    # manifest 内容，篡改 manifest（v3 / 其它实例）不得把回滚删除引过去。
+    target_err = validate_milvus_target(str(manifest.get("milvus_uri") or ""),
+                                        str(manifest.get("collection") or ""))
+    if target_err:
+        return None, f"manifest 写目标非法: {target_err}"
     rows = manifest.get("rows")
     if not isinstance(rows, list) or not rows:
-        return None, "manifest rows 为空（无可回滚键）"
+        return None, ("manifest rows 为空（本次运行未写入任何 owned row，无可回滚；"
+                      "请使用实际写入运行的 manifest）")
     for r in rows:
         if not isinstance(r, dict) or safe_id(r.get("chunk_id")) is None:
             return None, "manifest rows 含非法 chunk_id"
@@ -843,6 +926,8 @@ def run_rollback(args: argparse.Namespace) -> int:
     def fail(step: str, detail: Any) -> int:
         record = {"schema": ROLLBACK_SCHEMA, "mode": "rollback", "generated_at": _now(),
                   "kb_id": kb, "collection": collection, "executed": False,
+                  "tenant_id": tenant, "project_id": project,
+                  "milvus_uri": args.milvus_uri, "dim": dim,
                   "status": "FAIL_CLOSED", "failed_step": step, "detail": detail}
         where, errors = _write_record(out_dir, "seed-shared-rollback.json", record)
         print(f"✗ fail-closed @ {step}: {json.dumps(detail, ensure_ascii=False)[:400]}",
@@ -856,6 +941,8 @@ def run_rollback(args: argparse.Namespace) -> int:
         绝不谎报 FAIL_CLOSED（零删除）；重跑同一 manifest 可幂等收敛。"""
         record = {"schema": ROLLBACK_SCHEMA, "mode": "rollback", "generated_at": _now(),
                   "kb_id": kb, "collection": collection,
+                  "tenant_id": tenant, "project_id": project,
+                  "milvus_uri": args.milvus_uri, "dim": dim,
                   "executed": True, "status": "PARTIAL", "failed_step": step, "detail": detail,
                   "counts": {"deleted": len(deleted_keys),
                              "already_absent": len(decision["already_absent"]),
@@ -968,15 +1055,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"✗ fail-closed: {target_err}，零写入零删除", file=sys.stderr)
         return EXIT_FAIL_CLOSED
 
+    # P1-A：令牌校验**先于一切模式分发**——回滚执行与写入执行同级受控，错误
+    # 令牌绝不能进入删除流程，也绝不能静默降级为 dry-run / 回滚计划。
+    if args.authorize and args.authorize != AUTHORIZE_TOKEN:
+        print(f"✗ fail-closed: --authorize 令牌不正确（期望 {AUTHORIZE_TOKEN}），"
+              "零写入零删除", file=sys.stderr)
+        return EXIT_FAIL_CLOSED
+
     if args.rollback:
         return run_rollback(args)
     if not args.kb:
         ap.error("--kb 必填（rollback 模式可省略）")
-    if args.authorize and args.authorize != AUTHORIZE_TOKEN:
-        # 错误令牌绝不能静默降级为 dry-run：明确 fail-closed。
-        print(f"✗ fail-closed: --authorize 令牌不正确（期望 {AUTHORIZE_TOKEN}），零写入",
-              file=sys.stderr)
-        return EXIT_FAIL_CLOSED
     if args.authorize:
         return run_execute(args)
     return run_plan(args)

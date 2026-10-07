@@ -41,12 +41,14 @@ class FakeMilvus:
     def __init__(self, collections: dict, fail_upsert: bool = False,
                  fail_query_after_upsert: bool = False,
                  fail_delete_after_n: int = 0,
-                 delete_drops_only_first: bool = False):
+                 delete_drops_only_first: bool = False,
+                 fail_upsert_after_rows: int = 0):
         self.collections = collections          # name -> {"dim": int, "fields": [...], "rows": {pk: row}}
         self.fail_upsert = fail_upsert
         self.fail_query_after_upsert = fail_query_after_upsert
         self.fail_delete_after_n = fail_delete_after_n
         self.delete_drops_only_first = delete_drops_only_first
+        self.fail_upsert_after_rows = fail_upsert_after_rows
         self.deleted_filters: list = []
         self.upserted: list = []
 
@@ -87,9 +89,14 @@ class FakeMilvus:
         if self.fail_upsert:
             raise RuntimeError("injected upsert failure")
         c = self.collections[name]
+        applied = 0
         for r in data:
+            if self.fail_upsert_after_rows and applied >= self.fail_upsert_after_rows:
+                # 模拟"部分行已落库后连接丢失"：响应从未返回，但已应用部分行
+                raise RuntimeError("injected upsert failure after partial application")
             self.upserted.append(r["chunk_id"])
             c["rows"][r["chunk_id"]] = dict(r)
+            applied += 1
         return {"upsert_count": len(data)}
 
     def delete(self, name, filter_expr):
@@ -706,6 +713,181 @@ def test_manifest_emergency_evidence() -> None:
               rc == s.EXIT_FAIL_CLOSED and len(list(out2.glob("seed-shared-plan.emergency.*.json"))) == 1)
 
 
+# ---------------------------------------------------------------- P1-A：令牌 + manifest 目标门禁
+def test_p1a_token_and_manifest_target_gate() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n"]})
+        mv = FakeMilvus(fresh_collection())
+        run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                  "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+        run_manifest = out / "seed-shared-run.json"
+        good = json.loads(run_manifest.read_text(encoding="utf-8"))
+
+        def rows_alive():
+            return "c-1" in mv.collections[COLL]["rows"]
+
+        # 错误令牌 + 回滚执行 → exit 2 零删除（令牌校验先于模式分发）
+        rc = run_seed(["--rollback", str(run_manifest), "--out", str(out),
+                       "--authorize", "WRONG-TOKEN"], milvus=mv)
+        check("P1-A：错误令牌 + 回滚执行 → exit 2 零删除",
+              rc == s.EXIT_FAIL_CLOSED and mv.deleted_filters == [] and rows_alive())
+        # 错误令牌 + 回滚计划 → 同样拒绝（不得降级为计划模式）
+        rc = run_seed(["--rollback", str(run_manifest), "--out", str(out),
+                       "--authorize", "WRONG-TOKEN"], milvus=mv)
+        check("P1-A：错误令牌 + 回滚计划 → exit 2（不降级）",
+              rc == s.EXIT_FAIL_CLOSED and not (out / "seed-shared-rollback-plan.json").exists())
+
+        # manifest 篡改目标 → loader 拒收（纯函数）+ 回滚零删除（e2e）
+        for label, mutate in (
+            ("collection→v3", {"collection": "graphinsight_chunks_v3"}),
+            ("milvus_uri→19530", {"milvus_uri": "http://127.0.0.1:19530"}),
+            ("milvus_uri 缺失", {"milvus_uri": ""}),
+        ):
+            bad = out / f"tampered-{label.replace('→', '-').replace(' ', '')}.json"
+            bad.write_text(json.dumps({**good, **mutate}), encoding="utf-8")
+            m, err = s._load_run_manifest(bad)
+            check(f"P1-A：loader 拒收 {label}", m is None and "写目标非法" in err, str(err))
+            rc = run_seed(["--rollback", str(bad), "--out", str(out),
+                           "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+            check(f"P1-A：篡改 {label} → 回滚 exit 2 零删除",
+                  rc == s.EXIT_FAIL_CLOSED and mv.deleted_filters == [] and rows_alive())
+
+
+# ---------------------------------------------------------------- P1-B：可恢复写入账本
+def test_p1b_write_ledger_and_recoverable_fail_manifest() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [
+            json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n",
+            json.dumps({"chunk_id": "c-2", "doc_id": "d1", "text": "t2"}) + "\n",
+        ]})
+        # 部分应用后丢失响应：c-1 已落库、c-2 未落库、客户端当批全失败
+        mv = FakeMilvus(fresh_collection(), fail_upsert_after_rows=1)
+        rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+        check("P1-B：部分应用丢失响应 → exit 2", rc == s.EXIT_FAIL_CLOSED, str(rc))
+        rec = json.loads((out / "seed-shared-run.json").read_text(encoding="utf-8"))
+        check("P1-B：失败 manifest 带完整运行上下文（tenant/project/collection/dim/uri）",
+              rec.get("tenant_id") == TENANT and rec.get("project_id") == PROJECT
+              and rec.get("collection") == COLL and rec.get("dim") == DIM
+              and rec.get("milvus_uri") == s.ENFORCED_MILVUS_URI,
+              str({k: rec.get(k) for k in ("tenant_id", "project_id", "collection", "dim", "milvus_uri")}))
+        check("P1-B：账本 confirmed=[c-1] unknown=[c-2] pending=[]",
+              rec.get("write_ledger") == {"confirmed": ["c-1"], "unknown": ["c-2"], "pending": []},
+              str(rec.get("write_ledger")))
+        check("P1-B：失败 manifest 收录 dispatched 期望行（c-1、c-2）",
+              sorted(r["chunk_id"] for r in rec.get("rows", [])) == ["c-1", "c-2"],
+              str(rec.get("rows"))[:120])
+        m, err = s._load_run_manifest(out / "seed-shared-run.json")
+        check("P1-B：失败 manifest 可被 loader 接受", m is not None, err)
+
+        # 用失败 manifest 回滚 → 清理实际写入的 c-1；c-2 从未落库 → already_absent
+        rc = run_seed(["--rollback", str(out / "seed-shared-run.json"), "--out", str(out),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+        rec_rb = json.loads((out / "seed-shared-rollback.json").read_text(encoding="utf-8"))
+        check("P1-B：失败 manifest 回滚收敛 exit 0（c-1 删除、c-2 已不存在）",
+              rc == s.EXIT_OK and rec_rb["counts"] == {"deleted": 1, "already_absent": 1}
+              and not mv.collections[COLL]["rows"], str(rec_rb.get("counts")))
+
+
+# ---------------------------------------------------------------- P1-C：写入所有权
+def test_p1c_ownership() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [
+            json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n",
+            json.dumps({"chunk_id": "c-2", "doc_id": "d1", "text": "t2"}) + "\n",
+        ]})
+        # 预存一致行 c-1（内容与 seed 期望完全一致，模拟先前 seed 运行留下）
+        mv = FakeMilvus(fresh_collection())
+        mv.collections[COLL]["rows"]["c-1"] = {
+            "chunk_id": "c-1", "doc_id": "d1", "kb_id": KB, "tenant_id": TENANT,
+            "project_id": PROJECT, "text": "t1", "vector": s.deterministic_vector("t1", DIM)}
+        run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                  "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+        rec = json.loads((out / "seed-shared-run.json").read_text(encoding="utf-8"))
+        check("P1-C：成功 manifest 只收 owned rows（c-2）",
+              [r["chunk_id"] for r in rec["rows"]] == ["c-2"], str(rec["rows"])[:120])
+        check("P1-C：already_seeded 键单独记录且不入回滚集",
+              rec["already_seeded_keys"] == ["c-1"]
+              and rec["counts"] == {"planned": 2, "written": 1, "already_seeded": 1},
+              str(rec.get("counts")))
+
+        rc = run_seed(["--rollback", str(out / "seed-shared-run.json"), "--out", str(out),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+        check("P1-C：回滚只删本次写入的 c-2，预存行 c-1 存活",
+              rc == s.EXIT_OK and "c-2" not in mv.collections[COLL]["rows"]
+              and "c-1" in mv.collections[COLL]["rows"], str(rc))
+
+        # 纯 rerun（无 owned rows）：两键都已预存且与期望一致 → manifest rows=[]
+        mv2 = FakeMilvus(fresh_collection())
+        for cid, txt in (("c-1", "t1"), ("c-2", "t2")):
+            mv2.collections[COLL]["rows"][cid] = {
+                "chunk_id": cid, "doc_id": "d1", "kb_id": KB, "tenant_id": TENANT,
+                "project_id": PROJECT, "text": txt, "vector": s.deterministic_vector(txt, DIM)}
+        out2 = Path(td) / "out2"
+        run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out2),
+                  "--authorize", s.AUTHORIZE_TOKEN], milvus=mv2)
+        rec2 = json.loads((out2 / "seed-shared-run.json").read_text(encoding="utf-8"))
+        check("P1-C：幂等 rerun manifest rows 为空",
+              rec2["result"] == "ALREADY_SEEDED" and rec2["rows"] == [],
+              str(rec2.get("result")))
+        rc = run_seed(["--rollback", str(out2 / "seed-shared-run.json"), "--out", str(out2),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv2)
+        check("P1-C：空 owned rows 的 manifest 回滚 → exit 2 且预存行存活",
+              rc == s.EXIT_FAIL_CLOSED and "c-1" in mv2.collections[COLL]["rows"]
+              and "c-2" in mv2.collections[COLL]["rows"], str(rc))
+
+
+# ---------------------------------------------------------------- P1-D：manifest 落盘读回校验
+def test_p1d_manifest_readback_verify() -> None:
+    import io
+    from contextlib import redirect_stderr
+
+    with tempfile.TemporaryDirectory() as td:
+        root, out = Path(td) / "parsed", Path(td) / "out"
+        make_parsed(root, {"d1": [json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n"]})
+        argv = ["--kb", KB, "--parsed-root", str(root), "--out", str(out),
+                "--authorize", s.AUTHORIZE_TOKEN]
+        orig_write = s._write_text
+
+        # 主路径写后静默损坏（截断 + 非法 JSON）→ 读回校验失败 → emergency 接住
+        def corrupt_primary(path, text):
+            if Path(path).name == "seed-shared-run.json":
+                return orig_write(path, text[: max(1, len(text) // 3)] + "{corrupt")
+            return orig_write(path, text)
+
+        mv = FakeMilvus(fresh_collection())
+        s._write_text = corrupt_primary
+        try:
+            rc = run_seed(argv, milvus=mv)
+        finally:
+            s._write_text = orig_write
+        emergencies = list(out.glob("seed-shared-run.emergency.*.json"))
+        check("P1-D：主路径静默损坏 → exit 2（数据已写入）",
+              rc == s.EXIT_FAIL_CLOSED and sorted(mv.upserted) == ["c-1"], str(rc))
+        check("P1-D：emergency 证据完好且经读回校验",
+              len(emergencies) == 1
+              and json.loads(emergencies[0].read_text(encoding="utf-8"))["executed"] is True)
+
+        # 全部候选写后损坏 → stderr 紧急 dump + exit 2
+        mv2 = FakeMilvus(fresh_collection())
+        err_buf = io.StringIO()
+        s._write_text = lambda path, text: orig_write(path, text[:5] + "{corrupt")
+        try:
+            with redirect_stderr(err_buf):
+                rc = run_seed(argv, milvus=mv2)
+        finally:
+            s._write_text = orig_write
+        err_text = err_buf.getvalue()
+        check("P1-D：全候选损坏 → exit 2", rc == s.EXIT_FAIL_CLOSED and sorted(mv2.upserted) == ["c-1"])
+        check("P1-D：stderr 紧急 dump 含 BEGIN/END 且 JSON 完整可解析",
+              s.EMERGENCY_BEGIN in err_text and s.EMERGENCY_END in err_text
+              and json.loads(err_text.split(s.EMERGENCY_BEGIN, 1)[1]
+                             .split(s.EMERGENCY_END, 1)[0])["executed"] is True)
+
+
 def main() -> int:
     test_safe_id()
     test_deterministic_vector()
@@ -724,6 +906,10 @@ def main() -> int:
     test_tenant_project_safety()
     test_rollback_partial_semantics()
     test_manifest_emergency_evidence()
+    test_p1a_token_and_manifest_target_gate()
+    test_p1b_write_ledger_and_recoverable_fail_manifest()
+    test_p1c_ownership()
+    test_p1d_manifest_readback_verify()
 
     print(f"\n  passed={len(PASSES)} failed={len(FAILURES)}")
     if FAILURES:

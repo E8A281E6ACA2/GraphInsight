@@ -1172,7 +1172,7 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
 CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
 6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
-`check_seed_shared_v2_contract.py`（121 项，假体零真实连接）已注册统一门禁
+`check_seed_shared_v2_contract.py`（144 项，假体零真实连接）已注册统一门禁
 `m5_seed_shared_v2_contract`。
 
 | 模式 | 命令 | 行为 | 退出码 |
@@ -1213,6 +1213,24 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
     系统临时目录 → stderr（`-----BEGIN/END SEED-SHARED EMERGENCY MANIFEST-----` 包裹
     完整 JSON）。主路径失败即 exit 2（即便 emergency 后备接住也算证据降级），绝不允许
     exit 0 假装"有证据"；全路径失败时 stderr 含可解析完整 JSON，须手工保存。
+11. **令牌先于分发**（P1-A）：`--authorize` 令牌校验先于一切模式分发——错误令牌不得
+    进入回滚删除流程，也不得降级为回滚计划/dry-run，一律 exit 2 零写入零删除。
+12. **manifest 写目标强制**（P1-A）：`_load_run_manifest` 校验 manifest 自带的
+    `milvus_uri`/`collection` 必须严格等于受控 v2 目标——篡改 manifest（v3/其它实例）
+    不能把回滚删除引过去（CLI 侧校验不覆盖 manifest 内容）。
+13. **可恢复写入账本**（P1-B）：upsert **发出即入账** dispatched；异常后读回区分
+    `confirmed`（在库且与期望一致 = 本次拥有）/ `unknown`（响应丢失、落库未知）/
+    `pending`（未发出）记入 `write_ledger`；失败 manifest 收录 **dispatched 期望行**
+    （超集收录安全：未写入 → already_absent；被外域覆盖 → CONFLICT 拒删）+ 完整运行
+    上下文（tenant/project/collection/dim/milvus_uri），保证"响应丢失已落库"的键可被
+    回滚清理，且失败 manifest 可直接作为 `--rollback` 输入。
+14. **写入所有权**（P1-C）：成功 manifest 的 `rows` 只含**本次运行实际写入**的 owned
+    rows；`already_seeded`（本次运行前已在库且一致）只记入 `already_seeded_keys`，
+    绝不进入回滚删除集合；无 owned rows 的 manifest（纯幂等 rerun）回滚时被 loader
+    明确拒绝（exit 2），预存行不受影响。
+15. **落盘读回校验**（P1-D）：manifest 每个候选写入后必须重新读取、解析并逐字段
+    比对（`json.loads(...) == record`）；静默损坏（截断/半截写/被覆写）视同写盘失败
+    转入下一后备，全部失败走 stderr 紧急 dump 并 exit 2。
 
 #### 四、执行计划（授权后按序执行）
 
