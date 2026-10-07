@@ -1105,6 +1105,80 @@ rows_new=2）严格通过。
 `gi-nonempty-*` 残留；统一门禁 `24/0`、契约矩阵 `77/0`、契约测试 `48/0`、护栏 `13/0` 不变。
 连接范围：仅独立容器与卷，未触碰共享 dev/v2/v3，未 push，M5-B1 冻结。
 
+---
+
+### 9.24 backfill_versioned 单向回填：前置报告与执行计划（2026-10-07 · 只读取证，未写入）
+
+交付物：`backend/tests/probe_c3_sources.py`（四来源只读统计）+ 本前置报告。
+**本轮未启用 S1、未改共享配置、未建集合、未入队、未播种、未 push。**
+
+#### 一、四来源只读统计（目标 KB `34905f75-38ca-4cfa-bf22-c89c96107fa8`）
+
+| 来源 | 统计结果 | 可读性 |
+|---|---|---|
+| PG `chunk_revisions` | 全局 **0** 行；目标 KB `current` **0** | OK |
+| Neo4j `(:Chunk)` | 全局 **0**；目标 KB **0** | OK |
+| Milvus | collections=`[graphinsight_chunks_v2]`（**无 v3**）；v2 `rowCount=0`；按 kb 查询空 | OK |
+| 解析产物 `parsed_documents` | 目录仅 `README.md`，**无 KB 子目录**，目标 KB chunks **0** | OK |
+
+四来源**全部可读**（无 `UNVERIFIED`），且**全部为 0 / 空**。解析产物已按工单要求单独核对——
+确认为空，故可陈述"目标 KB 四来源均为空"，而非凭前三者推断。
+
+#### 二、回填对象核验（逐 chunk）
+
+- v2（`graphinsight_chunks_v2`）`rowCount=0` → **无任何 chunk**，因此不存在"已有向量"，
+  也不存在 KB / doc / tenant / project 归属可供逐 chunk 核验。
+- 解析产物为空 → 无可恢复证据。
+- **结论：不满足现有单向回填合同**。回填需要可恢复证据（`admin/backfill_chunk_revisions.py`：
+  parsed 产物 **或** v2 已有向量）；且 §16.1 读源不变量要求 **primary(v2) 已持有该 chunk**
+  ——"只有解析产物、没有 v2 向量"同样不满足。当前两者皆空。
+
+#### 三、非空数据准备方案（**不自行播种**，需授权）
+
+| 方案 | 内容 | 影响 |
+|---|---|---|
+| A（推荐前置） | 在 disposable 环境（已跑通：S1 双写 + 单向回填 + 读回 + 幂等 + 回滚）复用同一流程，先确认回填合同在真实引擎上成立 | 仅独立容器，无共享影响 |
+| B（共享） | 目标 KB 走一次**真实解析入库**，产出 parsed 产物 + v2 向量 + Neo4j 节点 + PG current 行，使四来源满足"至少一处非空" | **写共享环境**，需单独授权 |
+
+建议顺序：A 已完成（第十一轮 `checks=41 failed=0`）→ 申请 B → 再申请回填写入。
+
+#### 四、执行计划（授权后按序执行）
+
+1. **vector 能力配置**：`VECTOR_STORE_ENABLED=true`、`MILVUS_URI=http://127.0.0.1:19531`
+   （**严禁 19530**，属其它项目 `data-stellarls-milvus-1`）、`MILVUS_COLLECTION=graphinsight_chunks_v2`、
+   `MILVUS_DUAL_WRITE=true`、`MILVUS_SHADOW_COLLECTION=graphinsight_chunks_v3`、embedding 维度与 provider。
+2. **显式 INT64 v3 schema**：建 `graphinsight_chunks_v3`，含 `content_revision` **显式 INT64**
+   （§8.5：无显式字段禁止写版本，不得落 dynamic metadata）、`chunk_id` 主键、
+   `doc_id/kb_id/tenant_id/project_id/text` + 向量字段（dim 与生产一致）+ **向量索引**
+   （disposable 实测：缺索引时 `load_collection` 报 `index not found`、`query` 报 `not loaded`）。
+3. **目标 KB 写范围**：`MILVUS_WRITE_SCOPE_KB_IDS` 限定目标 KB，并核对 tenant/project；
+   范围非法（已配置但解析为空）必须 fail-closed，不得退化为"无限制"。
+4. **读回对账**：per-chunk 核验 v3 新增显式 `content_revision`；**v2 前后字段与向量完全不变**
+   （`_same_snap`：字段精确、向量逐元素容差）。
+5. **失败重放**：不可达 Neo4j 场景 → 非零退出 + **零新增写入**（无半截数据）。
+6. **幂等**：重跑 `rows_new=0`、总行数不翻倍、两侧内容不变。
+7. **回滚**：`migrate_chunk_revisions.py --action rollback` + `migrate_jobs_targets_hash.py --action rollback`，
+   回滚后结构消失并可再迁移；回滚重建后回填可再跑。
+
+#### 五、授权清单（**分项，不得合并**）
+
+| # | 事项 | 所需授权 | 状态 |
+|---|---|---|---|
+| 1 | 共享配置修改（vector 能力 / v3 目标 / 写范围） | **授权 A：CONFIG-SHARED** | 未授权 |
+| 2 | 建 v3 集合（显式 INT64 schema + 向量索引） | **授权 B：CREATE-V3** | 未授权 |
+| 3 | 非空数据准备（方案 B：解析入库） | **授权 C：SEED-SHARED** | 未授权 |
+| 4 | 回填写入（`backfill_versioned`，只补 v3） | **授权 D：BACKFILL-WRITE** | 未授权 |
+
+#### 六、验收判据
+
+- **v3 数据正确**：目标 chunk 写入 v3 且显式 `content_revision` 读回一致（写后读回，非"写入即算"）。
+- **v2 零写入**：per-chunk 前后快照比对，v2 字段与向量**完全不变**；任何 v2 变更即判失败。
+
+#### 七、当前状态
+
+宿主业务协议路径仍异常（服务健康、宿主裸 TCP 通、宿主业务握手失败，`root_cause=UNDETERMINED`），
+共享 C3 预检与回填写入均需在该路径恢复后执行。Shared Gate **OPEN**，M5-B1 **冻结**。
+
 ## 10. 与既有章节的对应
 
 - 集合 schema 与拒写：§8.5（本文档 §3）。
