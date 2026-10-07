@@ -77,6 +77,25 @@ def test_milvus() -> None:
           p.classify_milvus("not-a-dict")["status"] == "UNVERIFIED")
     check("Milvus 缺失 code → UNVERIFIED",
           p.classify_milvus({"collections": {"data": []}})["status"] == "UNVERIFIED")
+    check("Milvus 缺失 stats/by_kb 子查询 → UNVERIFIED",
+          p.classify_milvus({"collections": {"code": 0, "data": ["c"]},
+                             "stats": {}, "by_kb": {}})["status"] == "UNVERIFIED")
+    check("Milvus 非整数 code → UNVERIFIED",
+          p.classify_milvus({"collections": {"code": 0.5, "data": []},
+                             "stats": {}, "by_kb": {}})["status"] == "UNVERIFIED")
+    for label, payload in (
+        ("缺少响应映射", {"collections": good["collections"]}),
+        ("缺少单个 stats", dict(good, stats={})),
+        ("缺少单个 by_kb", dict(good, by_kb={})),
+        ("缺少 collections data", dict(good, collections={"code": 0})),
+        ("布尔 code", dict(good, collections={"code": False, "data": []})),
+        ("字符串 code", dict(good, collections={"code": "0", "data": []})),
+    ):
+        check(f"Milvus {label} → UNVERIFIED",
+              p.classify_milvus(payload)["status"] == "UNVERIFIED")
+    check("Milvus 明确空集合清单与空响应映射 → OK",
+          p.classify_milvus({"collections": {"code": 0, "data": []},
+                             "stats": {}, "by_kb": {}})["status"] == "OK")
 
 
 def test_parsed() -> None:

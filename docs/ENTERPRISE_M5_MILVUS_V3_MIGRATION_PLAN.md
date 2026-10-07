@@ -1150,15 +1150,18 @@ Milvus v2 0 / Milvus v3 不存在 / 解析产物 2 条**。
 #### 三、`SEED-SHARED` 数据准备方案（**不自行播种**，需单独授权）
 
 目标：为目标 KB 建立**受控**的
-- PG `chunk_revisions` current 行（revision=1，vector_status 待回填）；
-- Neo4j `(:Chunk)` 节点（带 `kb_id` / `doc_id` / `tenant_id` / `project_id` / `text`）；
-- Milvus **v2 primary 向量**（`graphinsight_chunks_v2`，与解析产物 2 条 chunk 一一对应）；
+- 解析产物与 Milvus **v2 primary 向量**（`graphinsight_chunks_v2`，与解析产物 2 条 chunk 一一对应）；
 - 配置**单 KB write scope**（`MILVUS_WRITE_SCOPE_KB_IDS` 仅目标 KB，并核对 tenant/project）。
+
+本阶段**不预创建 PG `chunk_revisions` current 行，也不预创建 Neo4j `(:Chunk)` 节点**。现有
+`backfill_versioned` 对已有 revision 行计入 `rows_skipped_existing`，并只对本轮新插入行执行
+Neo4j/Milvus 投影；预播种 current 会使后续 v3 回填被跳过。由回填阶段在读源归属核验通过后创建
+revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 
 | 方案 | 内容 | 影响 |
 |---|---|---|
 | A（已完成前置） | disposable 环境同流程已跑通（S1 双写 + 单向回填 + 读回 + 幂等 + 回滚，`checks=41 failed=0`） | 仅独立容器，无共享影响 |
-| B（本阶段申请） | 目标 KB 受控数据准备：PG current + Neo4j Chunk + **v2 向量** + 单 KB write scope | **写共享环境**，需 `SEED-SHARED` 授权 |
+| B（本阶段申请） | 目标 KB 受控数据准备：解析产物 + **v2 向量** + 单 KB write scope；PG current/Neo4j 由回填创建 | **写共享环境**，需 `SEED-SHARED` 授权 |
 
 **顺序（严格按序，不得跳步）**：修探测器（已完成）→ `SEED-SHARED`（本阶段；暂不写共享）
 → 数据准备完成后申请 `CREATE-V3` / `CONFIG-SHARED` → 最后申请 `BACKFILL-WRITE`。

@@ -116,10 +116,11 @@ def _resp_code(resp: Any) -> Optional[int]:
     if "error" in resp:
         return None
     code = resp.get("code")
-    try:
-        return int(code)
-    except (TypeError, ValueError):
+    # Milvus 的业务码必须是 JSON 整数 0；例如 0.5、"0"、True 都是
+    # 不可验证的响应，不能通过 int() 强转后误判为成功。
+    if isinstance(code, bool) or not isinstance(code, int):
         return None
+    return code
 
 
 def classify_milvus(data: Any) -> Dict[str, Any]:
@@ -133,14 +134,25 @@ def classify_milvus(data: Any) -> Dict[str, Any]:
     coll_code = _resp_code(collections)
     if coll_code != 0:
         return {"status": "UNVERIFIED", "detail": f"collections code={coll_code} resp={str(collections)[:200]}"}
-    stats = data.get("stats") or {}
-    by_kb = data.get("by_kb") or {}
+    if not isinstance(collections.get("data"), list):
+        return {"status": "UNVERIFIED", "detail": "collections missing list data"}
+    names = list(collections["data"])
+    stats = data.get("stats")
+    by_kb = data.get("by_kb")
+    if not isinstance(stats, dict) or not isinstance(by_kb, dict):
+        return {"status": "UNVERIFIED", "detail": "missing stats/by_kb response maps"}
+    missing_stats = [str(name) for name in names if name not in stats]
+    missing_by_kb = [str(name) for name in names if name not in by_kb]
+    if missing_stats or missing_by_kb:
+        return {
+            "status": "UNVERIFIED",
+            "detail": f"missing sub-queries stats={missing_stats} by_kb={missing_by_kb}",
+        }
     for name, resp in list(stats.items()) + list(by_kb.items()):
         c = _resp_code(resp)
         if c != 0:
             return {"status": "UNVERIFIED",
                     "detail": f"sub-query {name} code={c} resp={str(resp)[:200]}"}
-    names = (collections or {}).get("data") or []
     return {"status": "OK",
             "collections": list(names),
             "stats": stats,
