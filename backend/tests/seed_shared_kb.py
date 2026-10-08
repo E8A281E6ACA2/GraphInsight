@@ -75,6 +75,11 @@ dispatched 期望行（超集收录安全）+ 完整运行上下文，保证"响
 清理失败不阻断但打印残留）；⑮ R6-4——`lexists` 语义对悬空符号链接也返回 True，堵住
 `exists()` 对悬空链接返回 False 而放行新写入的缺口。
 
+六次复核补强（⑯，2026-10-08）：⑯ R6-5——后备 journal 清理失败改为**写前拒绝**：返回
+exit 2、零 upsert，保留已固化的规范 journal，并在结构化失败证据（failed_step=
+`journal_fallback_cleanup`）中记录后备路径与清理异常；不再"只打警告后返回成功"
+（否则过期恢复依据的歧义面被静默带过）。
+
 硬禁止（脚本内无入口）：建 v3 集合、回填写入、入队、修改共享配置、push、删除
 manifest 之外的任何数据。
 
@@ -484,6 +489,11 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _unlink(path: Path) -> None:
+    """实际删除点（journal 后备清理等，测试在此注入故障）。"""
+    Path(path).unlink()
+
+
 def _write_record(out_dir: Path, filename: str,
                   record: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
     """manifest 落盘，带**紧急证据链**：主路径 → 同目录 `.emergency.<ts>.json` →
@@ -868,16 +878,23 @@ def run_execute(args: argparse.Namespace) -> int:
                     "errors": jerr,
                     "retry_error": f"{type(exc).__name__}: {exc}"[:200],
                 })
-            # R6-3：规范路径已固化成功 → 清理本次降级留下的 emergency 后备 journal，
-            # 避免遗留过期恢复依据（可能被后续误认为当前运行的 journal）。只清理
-            # 本次 _write_record 命中的那个后备（jwhere），不碰其它历史文件；清理失败
-            # 不阻断写入（规范路径的权威证据已在），但要在 stderr 明示残留。
+            # R6-3/R6-5：规范路径已固化成功 → 清理本次降级留下的 emergency 后备
+            # journal，避免遗留过期恢复依据（可能被后续误认为当前运行的 journal）。
+            # 只清理本次 _write_record 命中的那个后备（jwhere），不碰其它历史文件。
+            # R6-5：清理失败 = 无法消除过期恢复依据的歧义面 → **写前拒绝**（exit 2、
+            # 零 upsert），保留已固化的规范 journal，并在结构化失败证据中记录后备路径
+            # 与清理异常；绝不再"只打警告后返回成功"。
             if jwhere and Path(jwhere) != canonical_journal:
                 try:
-                    Path(jwhere).unlink()
+                    _unlink(Path(jwhere))
                 except OSError as exc:
-                    print(f"  警告：降级 journal 后备清理失败（残留 {jwhere}）：{exc}",
-                          file=sys.stderr)
+                    return fail("journal_fallback_cleanup", {
+                        "reason": "降级 journal 后备清理失败（遗留过期恢复依据，无法消除歧义），拒绝写入",
+                        "fallback_journal": str(jwhere),
+                        "cleanup_error": f"{type(exc).__name__}: {exc}"[:200],
+                        "canonical_journal": str(canonical_journal),
+                        "note": "规范 journal 已固化并保留；请人工处置后备文件后重跑",
+                    })
 
     def write_fail(step: str, detail: Any,
                    live_map: Optional[Dict[str, Dict[str, Any]]]) -> int:

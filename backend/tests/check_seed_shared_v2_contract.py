@@ -1267,6 +1267,71 @@ def test_r6_journal_evidence_visibility() -> None:
         else:
             check("R6-4：悬空符号链接用例跳过（环境不支持 symlink）", True)
 
+        # R6-5：后备清理 raise OSError → 写前拒绝（exit 2、零 upsert、保留规范 journal、
+        # 结构化证据记录后备路径与清理异常）；不再只打警告后返回成功。
+        out5 = Path(td) / "out5"
+        orig_write5 = s._write_text
+        orig_unlink5 = s._unlink
+        calls5 = {"canon": 0}
+
+        def flaky_canonical5(path, text):
+            if Path(path).name == "seed-shared-journal.json":
+                calls5["canon"] += 1
+                if calls5["canon"] == 1:
+                    raise OSError("injected: first canonical attempt fails")
+            return orig_write5(path, text)
+
+        def fail_unlink(path):
+            raise OSError("injected: fallback journal cleanup fails")
+
+        s._write_text = flaky_canonical5
+        s._unlink = fail_unlink
+        mv5 = FakeMilvus(fresh_collection())
+        try:
+            rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out5),
+                           "--authorize", s.AUTHORIZE_TOKEN], milvus=mv5)
+        finally:
+            s._write_text = orig_write5
+            s._unlink = orig_unlink5
+        rec5 = json.loads((out5 / "seed-shared-run.json").read_text(encoding="utf-8"))
+        fallbacks = list(out5.glob("seed-shared-journal.emergency.*.json"))
+        check("R6-5：后备清理失败 → exit 2（journal_fallback_cleanup）零 upsert",
+              rc == s.EXIT_FAIL_CLOSED
+              and rec5.get("failed_step") == "journal_fallback_cleanup"
+              and mv5.upserted == [], f"rc={rc} step={rec5.get('failed_step')} up={mv5.upserted}")
+        check("R6-5：结构化证据记录后备路径与清理异常",
+              rec5.get("detail", {}).get("fallback_journal")
+              and "fallback_journal" in json.dumps(rec5.get("detail", {}))
+              and "cleanup_error" in rec5.get("detail", {})
+              and fallbacks and rec5["detail"]["fallback_journal"] == str(fallbacks[0]),
+              json.dumps(rec5.get("detail", {}), ensure_ascii=False)[:200])
+        check("R6-5：规范 journal 保留（固化后的权威证据不丢）",
+              (out5 / "seed-shared-journal.json").is_file())
+
+        # R6-5 正常路径对照：不注入 _unlink → 后备清理成功、exit 0、无 orphan
+        out6 = Path(td) / "out6"
+        orig_write6 = s._write_text
+        calls6 = {"canon": 0}
+
+        def flaky_canonical6(path, text):
+            if Path(path).name == "seed-shared-journal.json":
+                calls6["canon"] += 1
+                if calls6["canon"] == 1:
+                    raise OSError("injected: first canonical attempt fails")
+            return orig_write6(path, text)
+
+        s._write_text = flaky_canonical6
+        mv6 = FakeMilvus(fresh_collection())
+        try:
+            rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out6),
+                           "--authorize", s.AUTHORIZE_TOKEN], milvus=mv6)
+        finally:
+            s._write_text = orig_write6
+        check("R6-5 对照：后备清理成功 → exit 0 且无 orphan emergency journal",
+              rc == s.EXIT_OK and mv6.upserted == ["c-1"]
+              and not list(out6.glob("seed-shared-journal.emergency.*.json")),
+              f"rc={rc} up={mv6.upserted}")
+
 
 # ---------------------------------------------------------------- R4：URI 逐字符精确
 def test_r4_strict_uri() -> None:
