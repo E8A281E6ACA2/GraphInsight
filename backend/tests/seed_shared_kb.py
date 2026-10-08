@@ -80,6 +80,12 @@ exit 2、零 upsert，保留已固化的规范 journal，并在结构化失败�
 `journal_fallback_cleanup`）中记录后备路径与清理异常；不再"只打警告后返回成功"
 （否则过期恢复依据的歧义面被静默带过）。
 
+七次复核补强（⑰，2026-10-08）：⑰ R6-6——R6-5 失败遗留的 emergency 后备 journal 必须
+继续阻止同一 `--out` 新写入：`run_execute` 预检除规范名外，还扫描本 `--out` 下
+`seed-shared-journal.emergency.*.json`，任一存在即 `journal_pending`（exit 2、零 upsert、
+证据列出后备路径），直到全部清理后方允许新执行（否则规范 journal 回滚后残留后备会被
+当作过期文件而放行，绕过在途写入对账）。
+
 硬禁止（脚本内无入口）：建 v3 集合、回填写入、入队、修改共享配置、push、删除
 manifest 之外的任何数据。
 
@@ -784,6 +790,32 @@ def run_execute(args: argparse.Namespace) -> int:
             "pending": pending,
             "action": "先 `--rollback <该 journal>` 收敛（收敛后自动清理）；"
                       "或人工核验已无在途写入后删除该文件",
+        })
+
+    # R6-6：R6-5 失败会在规范 journal 之外遗留 `seed-shared-journal.emergency.<ts>.json`
+    # （后备路径写失败时的降级证据），它同样是在途写入的恢复依据。规范 journal 被
+    # 回滚收敛/人工删除后，该后备仍可能被误认为过期文件而放行新写入——因此执行前
+    # 必须一并扫描**同一 --out** 的 emergency 后备，任一存在即按 journal_pending 拒绝，
+    # 直到全部清理。（只扫本 --out，避免把无关运行/其它目录的后备误判为本运行证据；
+    # 系统临时目录后备无法归属到具体 --out，故不纳入本守卫。）
+    emergency_backups = sorted(out_dir.glob("seed-shared-journal.emergency.*.json"))
+    if emergency_backups:
+        all_backups = [str(p) for p in emergency_backups]
+        pending = ""
+        try:
+            j = json.loads(emergency_backups[0].read_text(encoding="utf-8"))
+            if isinstance(j, dict) and j.get("schema") == JOURNAL_SCHEMA:
+                pending = (f"kb={j.get('kb_id')!r} collection={j.get('collection')!r} "
+                           f"keys={j.get('planned_keys')}")
+        except Exception:  # noqa: BLE001
+            pending = "（内容不可解析，需人工检查）"
+        return fail("journal_pending", {
+            "reason": "存在未处置的紧急后备 journal（seed-shared-journal.emergency.*.json，"
+                      "上次运行中断/降级的恢复依据）",
+            "pending": pending,
+            "backups": all_backups,
+            "action": "先对后备 journal `--rollback <该文件>` 收敛，或人工核验已无在途"
+                      "写入后删除全部 emergency 后备，方可开始新写入",
         })
 
     # ① 解析产物逐行归属校验（fail-closed：任何无效行都阻止授权执行）

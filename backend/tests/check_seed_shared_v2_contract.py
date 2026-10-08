@@ -1332,6 +1332,63 @@ def test_r6_journal_evidence_visibility() -> None:
               and not list(out6.glob("seed-shared-journal.emergency.*.json")),
               f"rc={rc} up={mv6.upserted}")
 
+        # R6-6：R6-5 失败 → 规范 journal 回滚 → emergency journal 仍在 → 新执行必须拒绝
+        out7 = Path(td) / "out7"
+        orig_write7, orig_unlink7 = s._write_text, s._unlink
+        calls7 = {"canon": 0}
+
+        def flaky_canonical7(path, text):
+            if Path(path).name == "seed-shared-journal.json":
+                calls7["canon"] += 1
+                if calls7["canon"] == 1:
+                    raise OSError("injected: first canonical attempt fails")
+            return orig_write7(path, text)
+
+        def fail_unlink7(path):
+            raise OSError("injected: fallback cleanup fails")
+
+        # 步骤 1：制造 R6-5 失败（规范 + emergency journal 均保留）
+        s._write_text, s._unlink = flaky_canonical7, fail_unlink7
+        mv7a = FakeMilvus(fresh_collection())
+        try:
+            rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out7),
+                           "--authorize", s.AUTHORIZE_TOKEN], milvus=mv7a)
+        finally:
+            s._write_text, s._unlink = orig_write7, orig_unlink7
+        check("R6-6 前置：R6-5 失败后规范 + emergency journal 均在盘",
+              rc == s.EXIT_FAIL_CLOSED and (out7 / "seed-shared-journal.json").is_file()
+              and list(out7.glob("seed-shared-journal.emergency.*.json")),
+              f"rc={rc}")
+
+        # 步骤 2：用规范 journal 回滚收敛（规范 journal 被删除，emergency 仍在）
+        mv7b = FakeMilvus(fresh_collection())
+        rc = run_seed(["--rollback", str(out7 / "seed-shared-journal.json"), "--out", str(out7),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv7b)
+        check("R6-6 前置：规范 journal 回滚收敛且规范 journal 被清理",
+              rc == s.EXIT_OK and not (out7 / "seed-shared-journal.json").is_file()
+              and list(out7.glob("seed-shared-journal.emergency.*.json")), f"rc={rc}")
+
+        # 步骤 3：残留 emergency journal → 新执行必须拒绝、零 upsert
+        mv7c = FakeMilvus(fresh_collection())
+        rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out7),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv7c)
+        rec7 = json.loads((out7 / "seed-shared-run.json").read_text(encoding="utf-8"))
+        check("R6-6：残留 emergency journal → exit 2（journal_pending）零 upsert",
+              rc == s.EXIT_FAIL_CLOSED and rec7.get("failed_step") == "journal_pending"
+              and mv7c.upserted == [], f"rc={rc} step={rec7.get('failed_step')} up={mv7c.upserted}")
+        check("R6-6：失败证据列出残留后备路径",
+              len(rec7.get("detail", {}).get("backups", [])) >= 1,
+              json.dumps(rec7.get("detail", {}), ensure_ascii=False)[:160])
+
+        # 步骤 4：清理 emergency journal 后新执行放行
+        for p in out7.glob("seed-shared-journal.emergency.*.json"):
+            p.unlink()
+        mv7d = FakeMilvus(fresh_collection())
+        rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out7),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv7d)
+        check("R6-6：清理 emergency journal 后新执行放行",
+              rc == s.EXIT_OK and mv7d.upserted == ["c-1"], f"rc={rc} up={mv7d.upserted}")
+
 
 # ---------------------------------------------------------------- R4：URI 逐字符精确
 def test_r4_strict_uri() -> None:
