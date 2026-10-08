@@ -1172,7 +1172,7 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
 CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
 6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
-`check_seed_shared_v2_contract.py`（180 项，假体零真实连接）已注册统一门禁
+`check_seed_shared_v2_contract.py`（187 项，假体零真实连接）已注册统一门禁
 `m5_seed_shared_v2_contract`。
 
 | 模式 | 命令 | 行为 | 退出码 |
@@ -1261,6 +1261,14 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
 22. **journal 对账清理**（R5）：基于 journal 的回滚收敛（全部键已删除或确认不存在、
     零冲突）后自动删除该 journal；manifest 基回滚不清理 journal（可能覆盖其它
     运行的在途写入），由 journal 基回滚或人工处置闭环。
+23. **journal 证据可见性**（R6，2026-10-08 独立复核）：① 未处置 journal 判定用
+    `os.path.lexists`（不跟随符号链接）而非 `exists()`——规范名 `seed-shared-journal.json`
+    被目录、特殊文件或悬空符号链接占用同样视为"存在未处置证据"，拒绝新写入（否则路径
+    非普通文件时守卫静默放行）；② journal 恢复依据必须固化到规范路径——`_write_record`
+    若降级到 emergency/临时后备（jerr 非空），先重试写规范路径并读回校验，失败则
+    `journal_write` 拒绝写入（否则 R5 守卫按规范名不可见，下次重跑会覆盖崩溃运行的
+    恢复依据）；③ 固化成功后清理本次降级命中的 emergency 后备 journal，不遗留过期
+    恢复依据（只清本次后备；清理失败不阻断写入但打印残留）。
 
 #### 四、执行计划（授权后按序执行）
 
