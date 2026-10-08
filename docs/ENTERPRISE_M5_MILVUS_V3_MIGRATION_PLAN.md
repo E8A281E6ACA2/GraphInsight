@@ -1172,7 +1172,7 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
 CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
 6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
-`check_seed_shared_v2_contract.py`（187 项，假体零真实连接）已注册统一门禁
+`check_seed_shared_v2_contract.py`（191 项，假体零真实连接）已注册统一门禁
 `m5_seed_shared_v2_contract`。
 
 | 模式 | 命令 | 行为 | 退出码 |
@@ -1268,7 +1268,10 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
     若降级到 emergency/临时后备（jerr 非空），先重试写规范路径并读回校验，失败则
     `journal_write` 拒绝写入（否则 R5 守卫按规范名不可见，下次重跑会覆盖崩溃运行的
     恢复依据）；③ 固化成功后清理本次降级命中的 emergency 后备 journal，不遗留过期
-    恢复依据（只清本次后备；清理失败不阻断写入但打印残留）。
+    恢复依据（只清本次后备）；④（R6-5）后备清理失败改为**写前拒绝**——返回 exit 2、
+    零 upsert，保留已固化的规范 journal，并在结构化失败证据（failed_step=
+    `journal_fallback_cleanup`）中记录后备路径与清理异常，不再"只打警告后返回成功"
+    （否则过期恢复依据的歧义面被静默带过）。
 
 #### 四、执行计划（授权后按序执行）
 
