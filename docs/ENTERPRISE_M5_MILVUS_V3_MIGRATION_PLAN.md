@@ -1172,7 +1172,7 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 脚本内**无**建 v3、写 PG/Neo4j、改共享配置、入队的入口（write scope 仅输出提案，应用需
 CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同式（sha256 → [-1,1]，
 6 位小数），dim 取自 collection 实际 schema，**不假设 4**。离线契约回归
-`check_seed_shared_v2_contract.py`（191 项，假体零真实连接）已注册统一门禁
+`check_seed_shared_v2_contract.py`（196 项，假体零真实连接）已注册统一门禁
 `m5_seed_shared_v2_contract`。
 
 | 模式 | 命令 | 行为 | 退出码 |
@@ -1271,7 +1271,10 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
     恢复依据（只清本次后备）；④（R6-5）后备清理失败改为**写前拒绝**——返回 exit 2、
     零 upsert，保留已固化的规范 journal，并在结构化失败证据（failed_step=
     `journal_fallback_cleanup`）中记录后备路径与清理异常，不再"只打警告后返回成功"
-    （否则过期恢复依据的歧义面被静默带过）。
+    （否则过期恢复依据的歧义面被静默带过）；⑤（R6-6）`run_execute` 预检一并扫描本
+    `--out` 下 `seed-shared-journal.emergency.*.json`，任一存在即 `journal_pending`
+    （exit 2、零 upsert、证据列出后备路径）——R6-5 遗留后备必须继续阻止新写入，直到
+    全部清理（否则规范 journal 回滚后残留后备会被当作过期文件而放行，绕过在途写入对账）。
 
 #### 四、执行计划（授权后按序执行）
 
