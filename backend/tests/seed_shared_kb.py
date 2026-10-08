@@ -64,6 +64,17 @@ dispatched 期望行（超集收录安全）+ 完整运行上下文，保证"响
 后自动清理）或人工核验后删除；⑪ superseded 副本写后读回与原内容比较，不一致/读回
 失败 → 拒绝覆盖原 manifest（杜绝"原样留存"静默失效）。
 
+四次复核补强（⑫⑬，2026-10-08）：⑫ 未处置 journal 判定改用 `os.path.lexists`（不跟随
+符号链接）——规范名被目录、特殊文件或悬空符号链接占用同样按"存在未处置证据"拒绝新写入，
+不得因非普通文件而放行；⑬ journal 恢复依据必须固化到规范路径——`_write_record` 若降级
+到 emergency/临时后备（jerr 非空），先重试写规范路径并读回校验，失败则拒绝开始写入
+（否则 R5 守卫按规范名不可见，下次重跑会覆盖崩溃运行的恢复依据）。
+
+五次复核补强（⑭⑮，2026-10-08）：⑭ R6-3——journal 固化到规范路径成功后，清理本次
+降级留下的 emergency 后备 journal，避免遗留过期恢复依据（只清 jwhere 命中的本次后备，
+清理失败不阻断但打印残留）；⑮ R6-4——`lexists` 语义对悬空符号链接也返回 True，堵住
+`exists()` 对悬空链接返回 False 而放行新写入的缺口。
+
 硬禁止（脚本内无入口）：建 v3 集合、回填写入、入队、修改共享配置、push、删除
 manifest 之外的任何数据。
 
@@ -745,8 +756,11 @@ def run_execute(args: argparse.Namespace) -> int:
 
     # R5：同 --out 存在未处置的 journal = 上次运行可能中断于写入阶段、在途写入未对账
     # → 拒绝开始新写入（旧 journal 是其唯一恢复依据，不得覆盖/删除）。
+    # R6：用 lexists（不跟随符号链接）而非 exists()——规范 journal 名被目录、特殊
+    # 文件或**悬空符号链接**占用同样视为"存在未处置证据"，不得因路径不是普通文件
+    # 而静默放行新写入。
     journal_path = out_dir / "seed-shared-journal.json"
-    if journal_path.is_file():
+    if os.path.lexists(str(journal_path)):
         pending = ""
         try:
             j = json.loads(journal_path.read_text(encoding="utf-8"))
@@ -834,9 +848,36 @@ def run_execute(args: argparse.Namespace) -> int:
                      "成功运行的 journal 在 manifest 落盘后删除。"),
         }
         jwhere, jerr = _write_record(out_dir, "seed-shared-journal.json", journal)
+        canonical_journal = out_dir / "seed-shared-journal.json"
         if jwhere is None:
             # journal 落盘失败 = 中断后不可恢复 → 不开始任何写入。
             return fail("journal_write", {"errors": jerr})
+        # R6：journal 恢复依据**必须**落在规范路径。若 _write_record 降级到
+        # emergency/临时后备（jerr 非空），R5 的未处置守卫按规范名找不到它，下次
+        # 同 --out 重跑会放行新写入并可能覆盖崩溃运行的恢复依据。因此：能重试写入
+        # 规范路径则固化；否则拒绝开始写入（宁可不写，也不留不可见证据）。
+        if jerr or not canonical_journal.is_file():
+            try:
+                _write_text(canonical_journal, json.dumps(journal, ensure_ascii=False, indent=1) + "\n")
+                back = json.loads(canonical_journal.read_text(encoding="utf-8"))
+                if back != journal:
+                    raise ValueError("canonical journal 读回内容不一致")
+            except Exception as exc:  # noqa: BLE001
+                return fail("journal_write", {
+                    "reason": "journal 恢复依据无法固化到规范路径（否则 R5 守卫不可见），拒绝写入",
+                    "errors": jerr,
+                    "retry_error": f"{type(exc).__name__}: {exc}"[:200],
+                })
+            # R6-3：规范路径已固化成功 → 清理本次降级留下的 emergency 后备 journal，
+            # 避免遗留过期恢复依据（可能被后续误认为当前运行的 journal）。只清理
+            # 本次 _write_record 命中的那个后备（jwhere），不碰其它历史文件；清理失败
+            # 不阻断写入（规范路径的权威证据已在），但要在 stderr 明示残留。
+            if jwhere and Path(jwhere) != canonical_journal:
+                try:
+                    Path(jwhere).unlink()
+                except OSError as exc:
+                    print(f"  警告：降级 journal 后备清理失败（残留 {jwhere}）：{exc}",
+                          file=sys.stderr)
 
     def write_fail(step: str, detail: Any,
                    live_map: Optional[Dict[str, Dict[str, Any]]]) -> int:

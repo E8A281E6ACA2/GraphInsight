@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -1176,6 +1177,97 @@ def test_r5_uri_whitespace() -> None:
           s.validate_milvus_target("http://127.0.0.1:19531", "graphinsight_chunks_v2") is None)
 
 
+# ---------------------------------------------------------------- R6：journal 证据可见性
+def test_r6_journal_evidence_visibility() -> None:
+    """R6-1 规范 journal 名被非普通文件占用不得放行；R6-2 journal 证据降级须拒绝写入。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "parsed"
+        make_parsed(root, {"d1": [
+            json.dumps({"chunk_id": "c-1", "doc_id": "d1", "text": "t1"}) + "\n"]})
+
+        # R6-1：规范 journal 名被目录占用 → 视为存在未处置证据 → 拒绝新写入、零 upsert
+        out_dir = Path(td) / "out_dir"
+        (out_dir / "seed-shared-journal.json").mkdir(parents=True)
+        mv = FakeMilvus(fresh_collection())
+        rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out_dir),
+                       "--authorize", s.AUTHORIZE_TOKEN], milvus=mv)
+        rec = json.loads((out_dir / "seed-shared-run.json").read_text(encoding="utf-8"))
+        check("R6-1：journal 名被目录占用 → exit 2（journal_pending）零写入",
+              rc == s.EXIT_FAIL_CLOSED and rec.get("failed_step") == "journal_pending"
+              and mv.upserted == [], f"rc={rc} step={rec.get('failed_step')} up={mv.upserted}")
+
+        # R6-2：规范 journal 路径不可写（_write_record 降级到 emergency）→ 拒绝写入
+        out2 = Path(td) / "out2"
+        orig_write = s._write_text
+
+        def fail_canonical_journal(path, text):
+            if Path(path).name == "seed-shared-journal.json":
+                raise OSError("injected: canonical journal path unwritable")
+            return orig_write(path, text)
+
+        s._write_text = fail_canonical_journal
+        mv2 = FakeMilvus(fresh_collection())
+        try:
+            rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out2),
+                           "--authorize", s.AUTHORIZE_TOKEN], milvus=mv2)
+        finally:
+            s._write_text = orig_write
+        rec2 = json.loads((out2 / "seed-shared-run.json").read_text(encoding="utf-8"))
+        check("R6-2：journal 证据降级到后备 → 拒绝写入（journal_write）零 upsert",
+              rc == s.EXIT_FAIL_CLOSED and rec2.get("failed_step") == "journal_write"
+              and mv2.upserted == [], f"rc={rc} step={rec2.get('failed_step')} up={mv2.upserted}")
+        check("R6-2：规范 journal 未落盘（证据不隐身）",
+              not (out2 / "seed-shared-journal.json").is_file())
+
+        # R6-3：首次规范写失败 → 后备成功 → 规范重试成功，须清理 orphan emergency journal
+        out3 = Path(td) / "out3"
+        orig_write3 = s._write_text
+        calls = {"canon": 0}
+
+        def flaky_canonical(path, text):
+            if Path(path).name == "seed-shared-journal.json":
+                calls["canon"] += 1
+                if calls["canon"] == 1:
+                    raise OSError("injected: first canonical attempt fails")
+            return orig_write3(path, text)
+
+        s._write_text = flaky_canonical
+        mv3 = FakeMilvus(fresh_collection())
+        try:
+            rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out3),
+                           "--authorize", s.AUTHORIZE_TOKEN], milvus=mv3)
+        finally:
+            s._write_text = orig_write3
+        check("R6-3：规范写失败→后备→规范重试成功 仍 exit 0",
+              rc == s.EXIT_OK and mv3.upserted == ["c-1"], f"rc={rc} up={mv3.upserted}")
+        check("R6-3：无 orphan emergency journal 遗留",
+              not list(out3.glob("seed-shared-journal.emergency.*.json")),
+              str([p.name for p in out3.glob("*.json")]))
+        check("R6-3：成功运行后 journal 正常清理、run manifest 落盘",
+              not (out3 / "seed-shared-journal.json").is_file()
+              and (out3 / "seed-shared-run.json").is_file())
+
+        # R6-4：悬空符号链接占用规范名 → lexists 语义拒绝新写入
+        out4 = Path(td) / "out4"
+        out4.mkdir(parents=True)
+        link = out4 / "seed-shared-journal.json"
+        try:
+            os.symlink(str(out4 / "nonexistent-target.json"), str(link))
+            dangling_ok = True
+        except (OSError, NotImplementedError):
+            dangling_ok = False
+        if dangling_ok:
+            mv4 = FakeMilvus(fresh_collection())
+            rc = run_seed(["--kb", KB, "--parsed-root", str(root), "--out", str(out4),
+                           "--authorize", s.AUTHORIZE_TOKEN], milvus=mv4)
+            rec4 = json.loads((out4 / "seed-shared-run.json").read_text(encoding="utf-8"))
+            check("R6-4：悬空符号链接占用 journal 名 → exit 2 零写入",
+                  rc == s.EXIT_FAIL_CLOSED and rec4.get("failed_step") == "journal_pending"
+                  and mv4.upserted == [], f"rc={rc} step={rec4.get('failed_step')}")
+        else:
+            check("R6-4：悬空符号链接用例跳过（环境不支持 symlink）", True)
+
+
 # ---------------------------------------------------------------- R4：URI 逐字符精确
 def test_r4_strict_uri() -> None:
     check("R4：精确 URI 通过",
@@ -1225,6 +1317,7 @@ def main() -> int:
     test_r4_strict_uri()
     test_r5_journal_pending_and_superseded_integrity()
     test_r5_uri_whitespace()
+    test_r6_journal_evidence_visibility()
 
     print(f"\n  passed={len(PASSES)} failed={len(FAILURES)}")
     if FAILURES:
