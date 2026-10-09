@@ -425,6 +425,34 @@ console/pageerror按夹具检查；失败注入的HTTP503/API诊断仅为预期�
 
 网络：仅本机Vite回环1234，页面资源可通过，未知业务/外网请求中止且判红；没有连接共享Go/Python/数据库/模型。fixture故障HTTP400/403/409/503仅用于对应异常场景，console分类随测试附件；不得从fixture推导真实权限或生产通过。真实后端/权限/生产闭环均未验证，Shared Gate OPEN，完整M5-B1未解冻，未提交/push，未启动S2-03。
 
+##### S2-03 隔离真机验收（2026-10-09，S2-03a通过/S2-03b通过）
+
+S2-03a 隔离运行器：`backend/tests/s203_isolated_env.py` + `check_s203_isolated_env.py` + `run_s203_isolated_stack.sh`，13项离线自检通过、不进入默认CI门禁，已提交 `7acddb4`。运行器强制钉死隔离DSN、在任何DDL前拒绝共享端口5434/共享库名、拒绝仓库内凭据路径、等待`pg_isready`；子进程须完整继承父环境（白名单裁剪会触发`WinError 10106`）。
+
+S2-03b 一次性隔离栈真机（已 teardown，零残留）：容器`gi-s203-s203brun02`（仅绑`127.0.0.1:5544`）+ Go网关`127.0.0.1:18091`（`authz.connected=true`/`mode=go_db`/`enforce_business_api=true`），9步迁移/seed/token全 exit 0。
+
+| 合同 | 第一轮真机结果 | 修复后 |
+| --- | --- | --- |
+| 缺父作用域 | `KB_SCOPE_REQUIRED` 400 | 通过 |
+| header/query 父作用域不一致 | `KB_CROSS_SCOPE` 400 | 通过 |
+| 创建缺 name / 正常 / 重名 | `INVALID_BODY` 400 / 201 / `KB_DUPLICATE_NAME` 409 | 通过 |
+| 归档 / 归档后普通PATCH | 200 archived / `KB_ARCHIVED` 409 | 通过 |
+| 编辑 `PATCH {kb_id}` | **503，`42P08 could not determine data type of parameter $3`** | **200，三态库内取证通过** |
+
+**阻断根因**：`go-backend/internal/adminstore/knowledge_bases.go:416` 的 `slug = CASE WHEN $3 IS NULL THEN slug WHEN $3 = '' THEN NULL ELSE $3 END`，`$3` 在`THEN slug`（有类型）与`THEN NULL/ELSE $3`（未定型）间混用，PostgreSQL无法推断CASE结果类型。**SQLite不做类型解析，因此SQLite单测与前端fixture全绿却漏过**——同类缺陷只在真实PostgreSQL暴露。
+
+**修复与回归**：`$3` 显式改为 `$3::text`（语义不变：nil不动/空串置NULL/非空更新）。新增真PG集成测试 `go-backend/internal/httpserver/admin_knowledge_bases_pg_integration_test.go`，在一次性隔离PG上执行**13项全通过**，并逐条断言库内真实行状态：06 description更新时 `slug={'original'}` 未被误改、07 `slug={'new-slug'}`、08 空串写入SQL `NULL`（`slug.Valid=false`）。容器内`go vet`无报错；默认`go test ./...`未注入`GI_P6_PG_DSN`时正确跳过。清理复核`containers=0 volumes=0 networks=0`、端口无监听、共享容器`Created`未变。
+
+同类模式全仓扫描：`CASE WHEN $N`仅此一处，`$N IS NULL`、`$N = NULL`、`ANY($N)`、`LIMIT/OFFSET $N`、`COALESCE($n,列)`、Go动态拼占位符、Python `text()`内CASE均无同类风险。
+
+**系统性缺口与决策（2026-10-09，已落地）**：`adminstore`约50条写语句中，KB CRUD在此之前只有SQLite/前端fixture覆盖，无真PG集成测试（全仓唯一真PG集成测试`p6_disposable_pg_integration_test.go`只覆盖reindex/jobs）。已把**KB CRUD全套纳入真PG集成测试**，照抄P6的`GI_P6_PG_DSN`门控（未注入即`t.Skip`，CI永不连库），覆盖列表/创建/重名/编辑三态/归档/归档拒绝/恢复/非法状态/分页。
+
+**任务单笔误说明**：原定"非法 status → 400 `KB_INVALID_STATE`"为期望笔误。真实实现为入口校验返回 `400 INVALID_BODY`（`admin_knowledge_bases_native.go:475`），`KB_INVALID_STATE`(409) 语义是"当前状态不支持该操作"（如deleting态），二者不同。测试已按真实合同修正并加注释，**未改后端行为**。
+
+证据分层：隔离真机已取证（PG+Go，写入对象为一次性库，已删除）；Neo4j/Milvus写路径、真实模型、共享dev、生产闭环**均未验收**；Shared Gate保持OPEN，M5-B1保持冻结。
+
+环境前提（本机）：后端真机验收须Python 3.11（项目CI版本；sqlalchemy 2.0.23在3.13/3.14无法导入），用`uv python install 3.11`获取；Go二进制须`GOOS=linux CGO_ENABLED=0`交叉编译（项目含Linux专属`syscall.Statfs`）。
+
 以下原M6文件名是规划建议，不代表全部已创建；当前已实现scope传输/选择器应复用，不重做。
 
 | 文件 | 动作 | 内容 |
