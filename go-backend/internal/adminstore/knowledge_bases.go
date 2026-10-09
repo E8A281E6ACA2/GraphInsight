@@ -413,7 +413,7 @@ func (c *Client) UpdateKnowledgeBase(ctx context.Context, req KBUpdateRequest) (
 		UPDATE knowledge_bases
 		SET
 			name = COALESCE($2, name),
-			slug = CASE WHEN $3 IS NULL THEN slug WHEN $3 = '' THEN NULL ELSE $3 END,
+			slug = CASE WHEN $3::text IS NULL THEN slug WHEN $3::text = '' THEN NULL ELSE $3::text END,
 			description = COALESCE($4, description),
 			parser_profile = COALESCE($5, parser_profile),
 			retrieval_profile = COALESCE($6, retrieval_profile),
