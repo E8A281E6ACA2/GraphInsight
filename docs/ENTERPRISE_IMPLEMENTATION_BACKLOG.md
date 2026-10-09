@@ -54,7 +54,11 @@
 
 ### 当前阻塞与下一阶段边界
 
-S2-02收尾更新（2026-10-09，基线3a520b2、未提交）：目录/详情前端实现与隔离矩阵已完成；实现状态：已实现（本单前端范围）；验证状态：隔离验证；共享生产：未验收。Node22.22.2/npm10.9.7、Chrome下统一矩阵55通过/0失败/0跳过/0 flaky（目录26、详情9、S2-01回归20），build/lint/diff-check exit0。父作用域独立fixture、详情生命周期、区域失败隔离、工作台授权差异、分页及当前页搜索已取隔离证据；不宣称真实CRUD/权限/数据库验收，不解冻完整B1。详见 [收尾验收矩阵](KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md)。以下第一阶段缺口记录保留为历史，不覆盖本条当前状态。
+S2-02收尾更新（2026-10-09，基线3a520b2、未提交）：目录/详情前端实现与隔离矩阵已完成；实现状态：已实现（本单前端范围）；验证状态：隔离验证；共享生产：未验收。Node22.22.2/npm10.9.7、Chrome下统一矩阵55通过/0失败/0跳过/0 flaky（目录26、详情9、S2-01回归20），build/lint/diff-check exit0。父作用域独立fixture、详情生命周期、区域失败隔离、工作台授权差异、分页及当前页搜索已取隔离证据；不宣称真实CRUD/权限/数据库验收，不解冻完整B1。详见 [收尾验收矩阵](KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md)。
+
+S2-03a（2026-10-09）：隔离运行器及13项离线自检已完成并复核通过，运行器不进入默认CI门禁。已提交 `7acddb4`。
+
+S2-03b（2026-10-09，一次性隔离栈真机验收，未通过）：在一次性 PG `gi_s203_s203brun02` + Go 网关 `127.0.0.1:18091`（`mode=go_db`）上，9步迁移/seed/token 全部 exit 0，隔离库真实数据为4角色/19权限码/1用户/1绑定/1 KB。真机合同命中：缺父作用域 `KB_SCOPE_REQUIRED`、header/query 不一致 `KB_CROSS_SCOPE`、创建201/缺name `INVALID_BODY`/重名 `KB_DUPLICATE_NAME`、归档200/归档后普通PATCH `KB_ARCHIVED`。**阻断1项**：`PATCH /api/v1/admin/knowledge-bases/{kb_id}` 编辑恒返回503，网关日志 `ERROR: could not determine data type of parameter $3 (SQLSTATE 42P08)`，根因 `go-backend/internal/adminstore/knowledge_bases.go:416` 的 `slug = CASE WHEN $3 IS NULL ... ELSE $3 END` 未定型参数；该缺陷仅真实 PostgreSQL 暴露，SQLite 单测与前端 fixture 均会漏过。验收后已 teardown 并复核 `containers=0 volumes=0`、端口无监听、共享容器 `Created` 未变。隔离真机已取证；Neo4j/Milvus 写路径、真实模型、共享 dev、生产闭环均未验收；Shared Gate 保持 OPEN，M5-B1 保持冻结。
 
 - 技术问题：切库上下文与迟到请求、处理状态合同/展示、安全解析预览；M5 共享 primary 前置及 seed 恢复证据合同。
 - 授权问题：`SEED-SHARED`、`CONFIG-SHARED`、`CREATE-V3`、`BACKFILL-WRITE` 分开审批；旧授权不延续到本阶段。真实模型费用/共享运行同样未授权。
