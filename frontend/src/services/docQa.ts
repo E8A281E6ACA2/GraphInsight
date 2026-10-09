@@ -50,10 +50,10 @@ export async function askDocQa(
   question: string,
   topK = 2,
   reasoningProfile: ReasoningProfile = 'balanced',
-  conversationHistory: DocQaConversationTurn[] = []
+  conversationHistory: DocQaConversationTurn[] = [],
+  kbId = requireActiveKbId()
 ) {
   // 问答必须显式携带 kb_id（与 X-KB-ID 头一致）；未选择知识库时本地拦截，不发请求。
-  const kbId = requireActiveKbId();
   const response = await api.post('/api/docqa', {
     question,
     kb_id: kbId,
@@ -61,22 +61,22 @@ export async function askDocQa(
     require_citation: true,
     reasoning_profile: reasoningProfile,
     conversation_history: conversationHistory,
-  });
+  }, { headers: { 'X-KB-ID': kbId } });
   return response.data?.data as DocQaResponse;
 }
 
 export async function askDocDeepResearch(
   question: string,
-  options?: { topK?: number; maxSubQuestions?: number; reasoningProfile?: ReasoningProfile }
+  options?: { topK?: number; maxSubQuestions?: number; reasoningProfile?: ReasoningProfile },
+  kbId = requireActiveKbId()
 ) {
   // 深度研究同样必须显式携带 kb_id；未选择知识库时本地拦截。
-  const kbId = requireActiveKbId();
   const response = await api.post('/api/docqa/deep-research', {
     question,
     kb_id: kbId,
     top_k: options?.topK ?? 8,
     max_sub_questions: options?.maxSubQuestions ?? 4,
     reasoning_profile: options?.reasoningProfile ?? 'deep',
-  });
+  }, { headers: { 'X-KB-ID': kbId } });
   return response.data?.data as DocDeepResearchResponse;
 }

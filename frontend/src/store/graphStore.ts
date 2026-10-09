@@ -85,6 +85,7 @@ export interface GroupingState {
 interface GraphStore {
   // 当前工作区激活的知识库（M4-R1 步骤 3：所有业务调用按此作用域发起）
   activeKbId: string | null;
+  scopeVersion: number;
   setActiveKbId: (id: string | null) => void;
 
   // 图数据
@@ -180,6 +181,7 @@ export const useGraphStore = create<GraphStore>()(
     (set, get) => ({
       // 初始状态
       activeKbId: null,
+      scopeVersion: 0,
       graphData: null,
       selectedNodeId: null,
       queryHistory: [],
@@ -205,14 +207,25 @@ export const useGraphStore = create<GraphStore>()(
       preferredLayout: 'cose',
 
       // Actions
-      // 切换知识库时重置视图：清空图数据/选中节点/选中引用，避免跨库脏数据。
-      setActiveKbId: (id) =>
-        set({
+      setActiveKbId: (id) => {
+        if (get().activeKbId === id) return;
+        set((state) => ({
           activeKbId: id,
+          scopeVersion: state.scopeVersion + 1,
           graphData: null,
           selectedNodeId: null,
           selectedCitation: null,
-        }),
+          queryHistory: [],
+          activeFilters: { nodeTypes: [], relationshipTypes: [], hiddenNodeTypes: [] },
+          groupingState: { ...state.groupingState, groups: [] },
+          autoPaths: [],
+          lastQueryStats: null,
+          recentUploadedDocIds: [],
+          highlightAll: false,
+          activeWorkspaceTab: 'document',
+          documentRefreshKey: state.documentRefreshKey + 1,
+        }));
+      },
 
       setGraphData: (data) => set({ graphData: data }),
 

@@ -14,7 +14,7 @@ export async function triggerGraphBuild(payload?: {
   docIds?: string[];
   complexExtraction?: boolean;
   reasoningProfile?: 'fast' | 'balanced' | 'deep';
-}) {
+}, kbId?: string) {
   const response = await api.post(
     '/api/graph/build',
     {
@@ -25,7 +25,7 @@ export async function triggerGraphBuild(payload?: {
       complex_extraction: payload?.complexExtraction ?? false,
       reasoning_profile: payload?.reasoningProfile,
     },
-    { timeout: 180000 }
+    { timeout: 180000, headers: kbId ? { 'X-KB-ID': kbId } : undefined }
   );
   return response.data?.data as GraphBuildResponse;
 }

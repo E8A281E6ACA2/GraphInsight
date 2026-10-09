@@ -20,6 +20,21 @@ export function getActiveKbId(): string | null {
 }
 
 // 显式携带 kb_id 的调用前置：无 activeKbId 时抛本地错误，不发请求。
+export interface WorkspaceContext {
+  kbId: string;
+  version: number;
+}
+
+export function captureWorkspaceContext(): WorkspaceContext {
+  const state = useGraphStore.getState();
+  return { kbId: requireActiveKbId(), version: state.scopeVersion };
+}
+
+export function isWorkspaceContextCurrent(context: WorkspaceContext): boolean {
+  const state = useGraphStore.getState();
+  return state.activeKbId === context.kbId && state.scopeVersion === context.version;
+}
+
 export function requireActiveKbId(): string {
   const kbId = useGraphStore.getState().activeKbId;
   if (!kbId) {

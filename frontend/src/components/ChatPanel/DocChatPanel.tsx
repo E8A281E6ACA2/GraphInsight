@@ -28,6 +28,7 @@ import { useGraphStore } from '../../store/graphStore';
 import { askDocDeepResearch, askDocQa, type DocQaConversationTurn, type ReasoningProfile } from '../../services/docQa';
 import { loadDocumentOverviewGraph, loadFocusedDocumentGraph } from '../../services/documentGraphSync';
 import { uploadDocuments } from '../../services/documents';
+import { captureWorkspaceContext, isWorkspaceContextCurrent, type WorkspaceContext } from '../../services/kbScope';
 import { getErrorMessage } from '../../utils/errorMessage';
 import LoadingButton from '../Loading/LoadingButton';
 
@@ -145,7 +146,35 @@ export function DocChatPanel() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messageScrollRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
-  const lastSyncRef = useRef<{ citations: Citation[]; question: string; answer: string } | null>(null);
+  const lastSyncRef = useRef<{ citations: Citation[]; question: string; answer: string; context: WorkspaceContext } | null>(null);
+  const mounted = useRef(false);
+  const operationIds = useRef({ qa: 0, upload: 0, build: 0, graph: 0 });
+  const scopeVersion = useGraphStore((state) => state.scopeVersion);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  useEffect(() => {
+    operationIds.current = { qa: 0, upload: 0, build: 0, graph: 0 };
+    lastSyncRef.current = null;
+    setMessages([{ id: 'welcome', role: 'assistant', content: '已连接文档知识库。你可以直接提问，我会给出答案并定位引用证据。' }]);
+    setInput('');
+    setIsTyping(false);
+    setTypingLabel('正在整理答案...');
+    setUploading(false);
+    setUploadError(null);
+    setUploadSummary(null);
+    setBuildStatus('idle');
+    setBuildError(null);
+    setBuildSummary(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  }, [scopeVersion]);
+
+  const beginOperation = (kind: keyof typeof operationIds.current) => {
+    const context = captureWorkspaceContext();
+    const id = ++operationIds.current[kind];
+    return { context, valid: () => mounted.current && operationIds.current[kind] === id && isWorkspaceContextCurrent(context) };
+  };
 
   const extractQuestionKeywords = (question: string) => {
     const tokens = (question || '')
@@ -234,6 +263,7 @@ export function DocChatPanel() {
       role: 'user',
       content: value,
     };
+    const operation = beginOperation('qa');
     const conversationHistory = buildConversationHistory(messages);
 
     setMessages((prev) => [...prev, userMessage]);
@@ -243,7 +273,8 @@ export function DocChatPanel() {
     setTypingLabel('正在整理答案...');
 
     try {
-      const result = await askDocQa(value, CITATION_COUNT, qaReasoningProfile, conversationHistory);
+      const result = await askDocQa(value, CITATION_COUNT, qaReasoningProfile, conversationHistory, operation.context.kbId);
+      if (!operation.valid()) return;
       const citations = result?.citations || [];
       const assistantMessage: ChatMessage = {
         id: `assistant-${Date.now()}`,
@@ -254,8 +285,9 @@ export function DocChatPanel() {
       };
       setMessages((prev) => [...prev, assistantMessage]);
       const answerText = result?.answer || '';
-      await syncGraphWithCitations(citations, value, answerText);
+      await syncGraphWithCitations(citations, value, answerText, operation.context, operation.valid);
     } catch (error) {
+      if (!operation.valid()) return;
       const message = error instanceof Error ? error.message : String(error);
       setMessages((prev) => [
         ...prev,
@@ -274,7 +306,7 @@ export function DocChatPanel() {
         context: { error: message },
       });
     } finally {
-      setIsTyping(false);
+      if (operation.valid()) setIsTyping(false);
     }
   };
 
@@ -301,6 +333,7 @@ export function DocChatPanel() {
       role: 'user',
       content: `[深度调研] ${value}`,
     };
+    const operation = beginOperation('qa');
 
     setMessages((prev) => [...prev, userMessage]);
     setSelectedCitation(null);
@@ -313,7 +346,8 @@ export function DocChatPanel() {
         topK: 8,
         maxSubQuestions: 4,
         reasoningProfile: deepResearchReasoningProfile,
-      });
+      }, operation.context.kbId);
+      if (!operation.valid()) return;
       const citations = result?.citations || [];
       const assistantMessage: ChatMessage = {
         id: `assistant-${Date.now()}`,
@@ -329,8 +363,9 @@ export function DocChatPanel() {
       };
       setMessages((prev) => [...prev, assistantMessage]);
       const answerText = result?.report || result?.summary || '';
-      await syncGraphWithCitations(citations, value, answerText);
+      await syncGraphWithCitations(citations, value, answerText, operation.context, operation.valid);
     } catch (error) {
+      if (!operation.valid()) return;
       const message = error instanceof Error ? error.message : String(error);
       setMessages((prev) => [
         ...prev,
@@ -350,8 +385,10 @@ export function DocChatPanel() {
         context: { error: message },
       });
     } finally {
-      setIsTyping(false);
-      setTypingLabel('正在整理答案...');
+      if (operation.valid()) {
+        setIsTyping(false);
+        setTypingLabel('正在整理答案...');
+      }
     }
   };
 
@@ -361,12 +398,14 @@ export function DocChatPanel() {
 
   const handleUpload = useCallback(
     async (files: File[]) => {
-      if (files.length === 0 || uploading) return;
+      if (files.length === 0 || uploading || !useGraphStore.getState().activeKbId) return;
+      const operation = beginOperation('upload');
       setUploading(true);
       setUploadSummary(null);
       setUploadError(null);
       try {
-        const result = await uploadDocuments(files);
+        const result = await uploadDocuments(files, operation.context.kbId);
+        if (!operation.valid()) return;
         const uploaded = result?.uploaded?.length || 0;
         const skipped = result?.skipped?.length || 0;
         const uploadedDocIds = (result?.uploaded || [])
@@ -377,9 +416,9 @@ export function DocChatPanel() {
         setUploadSummary(`上传成功 ${uploaded} · 跳过 ${skipped}`);
         setWorkspaceTab('document');
       } catch (error) {
-        setUploadError(getErrorMessage(error, '文档上传失败'));
+        if (operation.valid()) setUploadError(getErrorMessage(error, '文档上传失败'));
       } finally {
-        setUploading(false);
+        if (operation.valid()) setUploading(false);
       }
     },
     [requestDocumentRefresh, setRecentUploadedDocIds, setWorkspaceTab, uploading]
@@ -403,15 +442,19 @@ export function DocChatPanel() {
     applyCitationSelection(citation, true);
   };
 
-  const runDocGraphQuery = useCallback(async () => {
+  const runDocGraphQuery = useCallback(async (context: WorkspaceContext, valid: () => boolean) => {
+    if (!valid()) return;
     try {
-      const { graphData, query } = await loadDocumentOverviewGraph();
+      const result = await loadDocumentOverviewGraph(context.kbId, valid);
+      if (!valid() || !result) return;
+      const { graphData, query } = result;
       setGraphData(graphData);
       if (graphData.stats) {
         setLastQueryStats(graphData.stats);
       }
       addQueryToHistory(query, graphData.nodes.length + graphData.edges.length);
     } catch (error) {
+      if (!valid()) return;
       const message = error instanceof Error ? error.message : String(error);
       reportClientLog({
         level: 'warn',
@@ -426,9 +469,14 @@ export function DocChatPanel() {
   const syncGraphWithCitations = useCallback(async (
     citations: Citation[],
     question: string,
-    answerText: string
+    answerText: string,
+    context: WorkspaceContext,
+    parentValid: () => boolean = () => true
   ) => {
-    lastSyncRef.current = { citations, question, answer: answerText };
+    if (!mounted.current || !parentValid() || !isWorkspaceContextCurrent(context)) return;
+    const id = ++operationIds.current.graph;
+    const valid = () => mounted.current && parentValid() && operationIds.current.graph === id && isWorkspaceContextCurrent(context);
+    lastSyncRef.current = { citations, question, answer: answerText, context };
     const rankedCitations = [...citations].sort((a, b) => {
       const aScore = (a.confidence ?? a.retrieval_score ?? 0);
       const bScore = (b.confidence ?? b.retrieval_score ?? 0);
@@ -444,7 +492,8 @@ export function DocChatPanel() {
     try {
       if (graphSyncMode === 'full') {
         setHighlightAll(true);
-        await runDocGraphQuery();
+        await runDocGraphQuery(context, valid);
+        if (!valid()) return;
         if (focusCitations.length > 0) {
           applyCitationSelection(focusCitations[0], true, keywords);
         } else {
@@ -455,11 +504,13 @@ export function DocChatPanel() {
       }
       setHighlightAll(false);
 
-      const { graphData: result, query } = await loadFocusedDocumentGraph({
+      const focused = await loadFocusedDocumentGraph({
         chunkIds,
         entityNames,
         keywords,
-      });
+      }, context.kbId, valid);
+      if (!valid() || !focused) return;
+      const { graphData: result, query } = focused;
 
       setGraphData(result);
       if (result.stats) {
@@ -474,6 +525,7 @@ export function DocChatPanel() {
         setWorkspaceTab('graph');
       }
     } catch (error) {
+      if (!valid()) return;
       const message = error instanceof Error ? error.message : String(error);
       reportClientLog({
         level: 'warn',
@@ -487,7 +539,8 @@ export function DocChatPanel() {
           keywordCount: keywords.length,
         },
       });
-      await runDocGraphQuery();
+      await runDocGraphQuery(context, valid);
+      if (!valid()) return;
       if (focusCitations.length > 0) {
         applyCitationSelection(focusCitations[0], true, keywords);
       } else {
@@ -510,12 +563,13 @@ export function DocChatPanel() {
   useEffect(() => {
     if (!lastSyncRef.current) return;
     if (graphSyncMode !== 'full') return;
-    const { citations, question, answer } = lastSyncRef.current;
-    syncGraphWithCitations(citations, question, answer);
+    const { citations, question, answer, context } = lastSyncRef.current;
+    void syncGraphWithCitations(citations, question, answer, context);
   }, [graphSyncMode, syncGraphWithCitations]);
 
   const handleBuildGraph = () => {
-    if (buildStatus === 'running') return;
+    if (buildStatus === 'running' || !useGraphStore.getState().activeKbId) return;
+    const operation = beginOperation('build');
     setBuildStatus('running');
     setBuildError(null);
     setBuildSummary(null);
@@ -524,8 +578,9 @@ export function DocChatPanel() {
       source: targetDocIds.length > 0 ? 'selected_documents' : 'documents',
       docIds: targetDocIds,
       note: targetDocIds.length > 0 ? 'recent_upload_scope' : 'full_library_scope',
-    })
+    }, operation.context.kbId)
       .then((result) => {
+        if (!operation.valid()) return;
         setBuildStatus('done');
         if (targetDocIds.length > 0) {
           setRecentUploadedDocIds([]);
@@ -535,6 +590,7 @@ export function DocChatPanel() {
         setBuildError(result?.message ?? '建图任务已提交，请在任务中心查看进度。');
       })
       .catch((error) => {
+        if (!operation.valid()) return;
         const message = error instanceof Error ? error.message : String(error);
         setBuildStatus('idle');
         setBuildError('建图失败，请稍后重试。');

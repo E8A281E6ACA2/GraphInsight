@@ -2,11 +2,18 @@ import { api } from './api';
 
 export interface DocumentItem {
   id: string;
+  doc_id?: string;
+  kb_id?: string;
   name: string;
-  path: string;
+  path?: string;
+  relative_path?: string;
   ext: string;
   size: number;
   updated_at: number;
+  status?: string;
+  graph_status?: string;
+  vector_status?: string;
+  version?: number;
 }
 
 export interface UploadedDocumentItem {
@@ -26,17 +33,18 @@ export interface UploadDocumentsResult {
   }>;
 }
 
-export async function listDocuments() {
-  const response = await api.get('/api/documents');
+export async function listDocuments(kbId?: string) {
+  const response = await api.get('/api/documents', kbId ? { headers: { 'X-KB-ID': kbId } } : undefined);
   return (response.data?.data?.items || []) as DocumentItem[];
 }
 
-export async function uploadDocuments(files: File[]) {
+export async function uploadDocuments(files: File[], kbId?: string) {
   const formData = new FormData();
   files.forEach((file) => formData.append('files', file));
   const response = await api.post('/api/documents/upload', formData, {
     headers: {
       'Content-Type': 'multipart/form-data',
+      ...(kbId ? { 'X-KB-ID': kbId } : {}),
     },
     timeout: 180000,
   });
@@ -103,12 +111,13 @@ export interface DeletedDocumentItem {
   operator?: string;
 }
 
-export async function deleteDocument(docId: string, options: DeleteDocumentOptions | boolean = true) {
+export async function deleteDocument(docId: string, options: DeleteDocumentOptions | boolean = true, kbId?: string) {
   const normalized: DeleteDocumentOptions =
     typeof options === 'boolean'
       ? { purgeGraph: options }
       : options;
   const response = await api.delete(`/api/documents/${encodeURIComponent(docId)}`, {
+    headers: kbId ? { 'X-KB-ID': kbId } : undefined,
     params: {
       purge_graph: normalized.purgeGraph ?? true,
       soft_delete: normalized.softDelete ?? true,

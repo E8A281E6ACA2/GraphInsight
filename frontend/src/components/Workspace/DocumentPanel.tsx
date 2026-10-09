@@ -17,6 +17,7 @@ import {
   type DocumentVerificationSnapshot,
 } from '../../services/documents';
 import { getErrorMessage } from '../../utils/errorMessage';
+import { captureWorkspaceContext, isWorkspaceContextCurrent, type WorkspaceContext } from '../../services/kbScope';
 import { AppleSpinner } from '../Loading/AppleSpinner';
 import LoadingButton from '../Loading/LoadingButton';
 
@@ -39,6 +40,7 @@ export function DocumentPanel() {
   const setSelectedCitation = useGraphStore((state) => state.setSelectedCitation);
   const recentUploadedDocIds = useGraphStore((state) => state.recentUploadedDocIds);
   const documentRefreshKey = useGraphStore((state) => state.documentRefreshKey);
+  const activeKbId = useGraphStore((state) => state.activeKbId);
   const citationRef = useRef<HTMLDivElement | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -53,28 +55,50 @@ export function DocumentPanel() {
     }
   }, [selectedCitation]);
 
-  const refreshDocuments = useCallback(async () => {
+  const requestSequence = useRef(0);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; requestSequence.current += 1; };
+  }, []);
+
+  const refreshDocuments = useCallback(async (context: WorkspaceContext) => {
+    if (!mounted.current || !isWorkspaceContextCurrent(context)) return;
+    const sequence = ++requestSequence.current;
+    const valid = () => mounted.current && sequence === requestSequence.current && isWorkspaceContextCurrent(context);
     setLoading(true);
     setError(null);
     try {
-      const items = await listDocuments();
+      const items = await listDocuments(context.kbId);
+      if (!valid()) return;
       setDocuments(items);
       setDocumentsLoaded(true);
     } catch (err) {
+      if (!valid()) return;
       setDocuments([]);
       setDocumentsLoaded(false);
       setError(getErrorMessage(err, '文档列表加载失败'));
     } finally {
-      setLoading(false);
+      if (valid()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    refreshDocuments();
-  }, [documentRefreshKey, refreshDocuments]);
+    setDocuments([]);
+    setDocumentsLoaded(false);
+    setError(null);
+    setUploadSummary(null);
+    setDeletingId(null);
+    setLoading(false);
+    requestSequence.current += 1;
+    if (activeKbId) void refreshDocuments(captureWorkspaceContext());
+  }, [activeKbId, documentRefreshKey, refreshDocuments]);
 
   const handleDeleteOne = useCallback(
     async (item: DocumentItem) => {
+      if (!useGraphStore.getState().activeKbId) return;
+      const context = captureWorkspaceContext();
+      const valid = () => mounted.current && isWorkspaceContextCurrent(context);
       setDeletingId(item.id);
       setError(null);
       try {
@@ -83,20 +107,22 @@ export function DocumentPanel() {
           softDelete: true,
           dryRun: true,
           verifyAfter: false,
-        });
+        }, context.kbId);
+        if (!valid()) return;
         const previewText = preview.candidate_file?.exists
           ? `将软删除文档「${item.name}」并清理图谱。`
           : `文件不存在，将仅清理图谱数据。`;
         const graphText = buildGraphSummary(preview.graph);
         const confirmed = window.confirm([previewText, graphText].filter(Boolean).join('\n'));
-        if (!confirmed) return;
+        if (!confirmed || !valid()) return;
 
         const result = await deleteDocument(item.id, {
           purgeGraph: true,
           softDelete: true,
           dryRun: false,
           verifyAfter: true,
-        });
+        }, context.kbId);
+        if (!valid()) return;
         const graphSummary = buildGraphSummary(result?.graph);
         const verificationSummary = buildVerificationSummary(result?.verification);
         setUploadSummary(
@@ -107,11 +133,11 @@ export function DocumentPanel() {
         if (selectedCitation?.title === item.name) {
           setSelectedCitation(null);
         }
-        await refreshDocuments();
+        await refreshDocuments(context);
       } catch (err) {
-        setError(getErrorMessage(err, '文档删除失败'));
+        if (valid()) setError(getErrorMessage(err, '文档删除失败'));
       } finally {
-        setDeletingId(null);
+        if (valid()) setDeletingId(null);
       }
     },
     [refreshDocuments, selectedCitation?.title, setSelectedCitation]

@@ -25,7 +25,7 @@ api.interceptors.request.use(
     //（图谱 schema/节点、文档列表/上传/删除等）；未选择时不注入，由后端
     // 返回 KB_SCOPE_REQUIRED，不降级为全局查询。
     const activeKbId = useGraphStore.getState().activeKbId;
-    if (activeKbId) {
+    if (activeKbId && !config.headers.has('X-KB-ID')) {
       config.headers['X-KB-ID'] = activeKbId;
     }
     return config;

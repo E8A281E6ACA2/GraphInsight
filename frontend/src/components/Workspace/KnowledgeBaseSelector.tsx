@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Box,
   CircularProgress,
@@ -23,26 +23,26 @@ export function KnowledgeBaseSelector() {
   const [knowledgeBases, setKnowledgeBases] = useState<WorkspaceKnowledgeBase[]>([]);
   const [state, setState] = useState<CatalogState>('loading');
   const [reloadKey, setReloadKey] = useState(0);
+  const catalogRequestSequence = useRef(0);
   const activeKbId = useGraphStore((state) => state.activeKbId);
   const setActiveKbId = useGraphStore((state) => state.setActiveKbId);
 
   useEffect(() => {
+    const requestSequence = ++catalogRequestSequence.current;
     let cancelled = false;
+    const isCurrent = () => !cancelled && requestSequence === catalogRequestSequence.current;
     setState('loading');
     listWorkspaceKnowledgeBases()
       .then((items) => {
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setKnowledgeBases(items);
         setState(items.length === 0 ? 'empty' : 'success');
-        // 持久化的 activeKbId 可能指向已归档/已删除/不在授权集合内的 KB：
-        // 目录里没有就清空重选；仅一个 KB 时自动选中，减少操作成本。
-        const stillValid = items.some((item) => item.kb_id === activeKbId);
-        if (!stillValid) {
-          setActiveKbId(items.length === 1 ? items[0].kb_id : null);
-        }
+        const currentKbId = useGraphStore.getState().activeKbId;
+        const stillValid = items.some((item) => item.kb_id === currentKbId);
+        if (!stillValid) setActiveKbId(null);
       })
       .catch(() => {
-        if (!cancelled) setState('error');
+        if (isCurrent()) setState('error');
       });
     return () => {
       cancelled = true;
@@ -61,6 +61,11 @@ export function KnowledgeBaseSelector() {
         <Typography variant="body2" sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}>
           加载知识库...
         </Typography>
+        <Tooltip title="重新加载">
+          <IconButton size="small" data-testid="kb-selector-refresh" onClick={() => setReloadKey((key) => key + 1)}>
+            <RefreshIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
       </Box>
     );
   }
@@ -142,6 +147,11 @@ export function KnowledgeBaseSelector() {
           </MenuItem>
         ))}
       </Select>
+      <Tooltip title="重新加载">
+        <IconButton size="small" data-testid="kb-selector-refresh" onClick={() => setReloadKey((key) => key + 1)}>
+          <RefreshIcon fontSize="small" />
+        </IconButton>
+      </Tooltip>
     </Box>
   );
 }

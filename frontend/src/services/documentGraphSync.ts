@@ -57,44 +57,54 @@ function isEmptyGraph(graphData: GraphData | null) {
   return !graphData || (!graphData.nodes.length && !graphData.edges.length);
 }
 
-export async function loadDocumentOverviewGraph(): Promise<DocumentGraphQueryResult> {
-  let graphData = await executeQuery(DOCUMENT_GRAPH_QUERIES.entityOverview);
+export async function loadDocumentOverviewGraph(
+  kbId?: string,
+  isCurrent: () => boolean = () => true,
+): Promise<DocumentGraphQueryResult | null> {
+  if (!isCurrent()) return null;
+  let graphData = await executeQuery(DOCUMENT_GRAPH_QUERIES.entityOverview, undefined, kbId);
+  if (!isCurrent()) return null;
   let query = DOCUMENT_GRAPH_QUERIES.entityOverview;
 
   if (!graphData.edges.length) {
-    graphData = await executeQuery(DOCUMENT_GRAPH_QUERIES.fallbackOverview);
+    if (!isCurrent()) return null;
+    graphData = await executeQuery(DOCUMENT_GRAPH_QUERIES.fallbackOverview, undefined, kbId);
+    if (!isCurrent()) return null;
     query = DOCUMENT_GRAPH_QUERIES.fallbackOverview;
   }
 
   return { graphData, query };
 }
 
-export async function loadFocusedDocumentGraph({
-  chunkIds,
-  entityNames,
-  keywords,
-}: FocusGraphInput): Promise<DocumentGraphQueryResult> {
+export async function loadFocusedDocumentGraph(
+  { chunkIds, entityNames, keywords }: FocusGraphInput,
+  kbId?: string,
+  isCurrent: () => boolean = () => true,
+): Promise<DocumentGraphQueryResult | null> {
+  if (!isCurrent()) return null;
   if (chunkIds.length > 0) {
     const graphData = await executeQuery(DOCUMENT_GRAPH_QUERIES.citationFocus, {
       chunkIds,
       entityNames,
       keywords,
-    });
+    }, kbId);
+    if (!isCurrent()) return null;
     if (!isEmptyGraph(graphData)) {
       return { graphData, query: DOCUMENT_GRAPH_QUERIES.citationFocus };
     }
   }
 
   if (entityNames.length > 0) {
+    if (!isCurrent()) return null;
     const graphData = await executeQuery(DOCUMENT_GRAPH_QUERIES.entityFocus, {
       entityNames,
       keywords,
-    });
+    }, kbId);
+    if (!isCurrent()) return null;
     if (!isEmptyGraph(graphData)) {
       return { graphData, query: DOCUMENT_GRAPH_QUERIES.entityFocus };
     }
   }
 
-  const overview = await loadDocumentOverviewGraph();
-  return overview;
+  return loadDocumentOverviewGraph(kbId, isCurrent);
 }

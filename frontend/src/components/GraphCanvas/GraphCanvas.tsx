@@ -13,6 +13,7 @@ import { PerformanceWarningDialog } from './PerformanceWarningDialog';
 import { NavigationPanel } from './NavigationPanel';
 import { reportClientLog } from '../../services/clientLog';
 import { expandNode } from '../../services/graphService';
+import { captureWorkspaceContext, isWorkspaceContextCurrent } from '../../services/kbScope';
 
 interface GraphCanvasProps {
   rendererRef?: React.RefObject<RendererAPI | null>;
@@ -116,6 +117,29 @@ export function GraphCanvas({ rendererRef: externalRendererRef, onGroupingUpdate
   // 过滤隐藏状态
   const [hiddenNodeIds, setHiddenNodeIds] = useState<Set<string>>(new Set());
   const [hiddenEdgeIds, setHiddenEdgeIds] = useState<Set<string>>(new Set());
+  const scopeVersion = useGraphStore((state) => state.scopeVersion);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; pendingExpandFocusRef.current = null; };
+  }, []);
+  useEffect(() => {
+    isExpandingRef.current = false;
+    setIsExpanding(false);
+    pendingExpandFocusRef.current = null;
+    activeElementRef.current = null;
+    setHiddenNodeIds(new Set());
+    setHiddenEdgeIds(new Set());
+    setTooltipVisible(false);
+    setTooltipData(null);
+    setContextMenuPosition(null);
+    setContextMenuTarget(null);
+    setVideoDialogOpen(false);
+    setCurrentVideo(null);
+    setShowPerformanceWarning(false);
+    setPendingGraphData(null);
+    setUserConfirmedLargeGraph(false);
+  }, [scopeVersion]);
   const hiddenTypeNodeIds = useMemo(() => {
     if (!graphData || activeFilters.hiddenNodeTypes.length === 0) {
       return new Set<string>();
@@ -136,10 +160,13 @@ export function GraphCanvas({ rendererRef: externalRendererRef, onGroupingUpdate
   const handleExpandNode = useCallback(async (nodeId: string) => {
     if (isExpandingRef.current) return;
 
+    const context = captureWorkspaceContext();
+    const requestVersion = context.version;
     setIsExpanding(true);
 
     try {
-      const data = await expandNode(nodeId, 'both', undefined, 30);
+      const data = await expandNode(nodeId, 'both', undefined, 30, context.kbId);
+      if (!mounted.current || requestVersion !== useGraphStore.getState().scopeVersion || !isWorkspaceContextCurrent(context)) return;
       const currentData: GraphData = graphDataRef.current || {
         nodes: [],
         edges: [],
@@ -185,10 +212,10 @@ export function GraphCanvas({ rendererRef: externalRendererRef, onGroupingUpdate
         }, delay);
       });
     } catch (error) {
-      console.error('Failed to expand node:', error);
-      pendingExpandFocusRef.current = null;
+      if (mounted.current && isWorkspaceContextCurrent(context)) console.error('Failed to expand node:', error);
+      if (isWorkspaceContextCurrent(context)) pendingExpandFocusRef.current = null;
     } finally {
-      setIsExpanding(false);
+      if (mounted.current && isWorkspaceContextCurrent(context)) setIsExpanding(false);
     }
   }, [rendererRef, setGraphData, setSelectedNodeId]);
 

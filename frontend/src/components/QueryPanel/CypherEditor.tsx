@@ -6,6 +6,7 @@ import type * as Monaco from 'monaco-editor';
 import { useGraphStore } from '../../store/graphStore';
 import { useCypher } from '../../hooks/useCypher';
 import { getGraphSchema } from '../../services/graphService';
+import { captureWorkspaceContext, isWorkspaceContextCurrent } from '../../services/kbScope';
 import type { GraphSchemaSummary } from '../../types/api';
 import { getErrorMessage } from '../../utils/errorMessage';
 import { AppleSpinner } from '../Loading/AppleSpinner';
@@ -15,35 +16,6 @@ const FALLBACK_QUERY = `// 自动发现：当前图数据库暂未返回结构�
 MATCH (n)
 RETURN n
 LIMIT 80`;
-
-const SCHEMA_CACHE_TTL_MS = 5000;
-
-let schemaCache: { value: GraphSchemaSummary; fetchedAt: number } | null = null;
-let schemaPromise: Promise<GraphSchemaSummary> | null = null;
-
-// 切换知识库后结构缓存必须作废（schema 是按 KB 作用域发现的）。
-function invalidateGraphSchemaCache() {
-  schemaCache = null;
-  schemaPromise = null;
-}
-
-function loadGraphSchemaOnce() {
-  const now = Date.now();
-  if (schemaCache && now - schemaCache.fetchedAt < SCHEMA_CACHE_TTL_MS) {
-    return Promise.resolve(schemaCache.value);
-  }
-  if (!schemaPromise) {
-    schemaPromise = getGraphSchema()
-      .then((value) => {
-        schemaCache = { value, fetchedAt: Date.now() };
-        return value;
-      })
-      .finally(() => {
-        schemaPromise = null;
-      });
-  }
-  return schemaPromise;
-}
 
 export interface CypherEditorRef {
   setValue: (value: string) => void;
@@ -62,6 +34,7 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
 
   const isDarkMode = useGraphStore((state) => state.isDarkMode);
   const activeKbId = useGraphStore((state) => state.activeKbId);
+  const scopeVersion = useGraphStore((state) => state.scopeVersion);
   const { execute, isExecuting, error, clearError } = useCypher();
 
   const handleExecute = async () => {
@@ -72,6 +45,8 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
     }
     await execute(query);
   };
+  const handleExecuteRef = useRef(handleExecute);
+  handleExecuteRef.current = handleExecute;
 
   const applyQueryValue = (value: string, options: { markEdited?: boolean } = {}) => {
     const markEdited = options.markEdited ?? true;
@@ -89,23 +64,28 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
   };
 
   useEffect(() => {
-    // 门控：无 activeKbId 时不探测 schema（避发无作用域请求）；切库时作废缓存后重新探测。
+    userEditedRef.current = false;
+    schemaQueryAppliedRef.current = false;
+    applyQueryValue('', { markEdited: false });
+    setSchema(null);
+    setSchemaError(null);
+    // 门控：无 activeKbId 时不探测 schema（避发无作用域请求）。
     if (!activeKbId) {
-      invalidateGraphSchemaCache();
       setSchema(null);
       setSchemaLoading(false);
       setSchemaError(null);
       return;
     }
-    invalidateGraphSchemaCache();
     let cancelled = false;
+    const context = captureWorkspaceContext();
+    const current = () => !cancelled && isWorkspaceContextCurrent(context);
 
     const loadSchema = async () => {
       setSchemaLoading(true);
       setSchemaError(null);
       try {
-        const discovered = await loadGraphSchemaOnce();
-        if (cancelled) {
+        const discovered = await getGraphSchema(context.kbId);
+        if (!current()) {
           return;
         }
         setSchema(discovered);
@@ -115,7 +95,7 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
           applyQueryValue(sampleQuery, { markEdited: false });
         }
       } catch (err: unknown) {
-        if (!cancelled) {
+        if (current()) {
           setSchemaError(formatGraphError(err, '图数据库结构探测失败'));
           if (!userEditedRef.current && !schemaQueryAppliedRef.current) {
             schemaQueryAppliedRef.current = true;
@@ -123,7 +103,7 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
           }
         }
       } finally {
-        if (!cancelled) {
+        if (current()) {
           setSchemaLoading(false);
         }
       }
@@ -134,7 +114,7 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
     return () => {
       cancelled = true;
     };
-  }, [activeKbId]);
+  }, [activeKbId, scopeVersion]);
 
   // 暴露方法给父组件
   useImperativeHandle(ref, () => ({
@@ -153,7 +133,7 @@ export const CypherEditor = forwardRef<CypherEditorRef>((_props, ref) => {
     editor.addCommand(
       monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
       () => {
-        handleExecute();
+        void handleExecuteRef.current();
       }
     );
   };

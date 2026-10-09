@@ -49,9 +49,9 @@ function unwrapApiData<T>(payload: T | ApiEnvelope<T>): T {
 }
 
 // 发现当前图数据库结构，用于生成更贴近真实数据的默认查询
-export async function getGraphSchema(): Promise<GraphSchemaSummary> {
+export async function getGraphSchema(kbId?: string): Promise<GraphSchemaSummary> {
   try {
-    const response = await api.get<GraphSchemaSummary | ApiEnvelope<GraphSchemaSummary>>('/api/graph/schema');
+    const response = await api.get<GraphSchemaSummary | ApiEnvelope<GraphSchemaSummary>>('/api/graph/schema', kbId ? { headers: { 'X-KB-ID': kbId } } : undefined);
     return unwrapApiData(response.data);
   } catch (error: unknown) {
     if (axios.isAxiosError(error) && error.response?.status === 503) {
@@ -70,10 +70,10 @@ export async function getGraphSchema(): Promise<GraphSchemaSummary> {
 }
 
 // 执行 Cypher 查询
-export async function executeQuery(cypher: string, parameters?: Record<string, unknown>): Promise<GraphData> {
+export async function executeQuery(cypher: string, parameters?: Record<string, unknown>, kbId?: string): Promise<GraphData> {
   try {
     const request: QueryRequest = { cypher, parameters };
-    const response = await api.post<QueryResponse | ApiEnvelope<QueryResponse>>('/api/query', request);
+    const response = await api.post<QueryResponse | ApiEnvelope<QueryResponse>>('/api/query', request, kbId ? { headers: { 'X-KB-ID': kbId } } : undefined);
     const data = unwrapApiData(response.data);
 
     return {
@@ -110,9 +110,9 @@ export async function executeQuery(cypher: string, parameters?: Record<string, u
 }
 
 // 获取节点详情
-export async function getNodeDetail(nodeId: string): Promise<NodeDetailResponse> {
+export async function getNodeDetail(nodeId: string, kbId?: string): Promise<NodeDetailResponse> {
   try {
-    const response = await api.get<NodeDetailResponse | ApiEnvelope<NodeDetailResponse>>(`/api/node/${nodeId}`);
+    const response = await api.get<NodeDetailResponse | ApiEnvelope<NodeDetailResponse>>(`/api/node/${nodeId}`, kbId ? { headers: { 'X-KB-ID': kbId } } : undefined);
     return unwrapApiData(response.data);
   } catch (error: unknown) {
     if (axios.isAxiosError(error) && error.response?.status === 404) {
@@ -135,19 +135,20 @@ export async function expandNode(
   nodeId: string,
   direction: 'in' | 'out' | 'both' = 'both',
   relationshipTypes?: string[],
-  limit: number = 20
+  limit: number = 20,
+  kbId?: string
 ): Promise<GraphData> {
   try {
     // 展开在 body 显式携带 kb_id（与拦截器注入的 X-KB-ID 头一致）；未选择知识库时本地拦截。
-    const kbId = requireActiveKbId();
+    const scopedKbId = kbId ?? requireActiveKbId();
     const request: ExpandRequest = {
       nodeId,
       direction,
       relationshipTypes,
       limit,
-      kb_id: kbId,
+      kb_id: scopedKbId,
     };
-    const response = await api.post<QueryResponse | ApiEnvelope<QueryResponse>>('/api/expand', request);
+    const response = await api.post<QueryResponse | ApiEnvelope<QueryResponse>>('/api/expand', request, kbId ? { headers: { 'X-KB-ID': kbId } } : undefined);
     const data = unwrapApiData(response.data);
 
     return {
