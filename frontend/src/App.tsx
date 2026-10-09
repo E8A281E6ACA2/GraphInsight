@@ -27,6 +27,8 @@ const UsersPage = lazy(() => import('./pages/Admin/UsersPage'));
 const JobsPage = lazy(() => import('./pages/Admin/JobsPage'));
 const QATracesPage = lazy(() => import('./pages/Admin/QATracesPage'));
 const KnowledgeBasePage = lazy(() => import('./pages/Admin/KnowledgeBasePage'));
+const KnowledgeBasesPage = lazy(() => import('./pages/Admin/KnowledgeBasesPage'));
+const KnowledgeBaseDetailPage = lazy(() => import('./pages/Admin/KnowledgeBaseDetailPage'));
 
 const PanelLoading = ({ label }: { label: string }) => (
   <LoadingState label={label} minHeight="100%" size={38} sx={{ bgcolor: '#f8fafc' }} />
@@ -256,6 +258,8 @@ function App() {
         <Route path="rbac" element={<RbacPage />} />
         <Route path="users" element={<UsersPage />} />
         <Route path="knowledge-base" element={<KnowledgeBasePage />} />
+        <Route path="knowledge-bases" element={<KnowledgeBasesPage />} />
+        <Route path="knowledge-bases/:kbId" element={<KnowledgeBaseDetailPage />} />
         <Route path="jobs" element={<JobsPage />} />
         <Route path="qa-traces" element={<QATracesPage />} />
       </Route>

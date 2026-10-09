@@ -4,6 +4,48 @@
  */
 
 // ============================================================
+// 知识库管理
+// ============================================================
+export type KnowledgeBaseStatus = 'active' | 'archived' | 'deleting' | string;
+
+export interface AdminKnowledgeBase {
+  id: string;
+  kb_id?: string;
+  tenant_id: string;
+  project_id: string;
+  name: string;
+  slug?: string;
+  description?: string;
+  status: KnowledgeBaseStatus;
+  storage_prefix?: string;
+  parser_profile?: Record<string, unknown> | null;
+  retrieval_profile?: Record<string, unknown> | null;
+  created_at?: string;
+  updated_at?: string;
+  archived_at?: string | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface KnowledgeBasePageData {
+  items: AdminKnowledgeBase[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+export interface KnowledgeBaseWriteRequest {
+  tenant_id?: string;
+  project_id?: string;
+  name: string;
+  slug?: string;
+  description?: string;
+  parser_profile?: Record<string, unknown>;
+  retrieval_profile?: Record<string, unknown>;
+  status?: string;
+}
+
+// ============================================================
 // 标准化响应类型
 // ============================================================
 

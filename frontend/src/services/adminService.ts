@@ -51,6 +51,9 @@ import type {
   QATraceStatus,
   QATraceType,
   RetrievalDiagnosticsResult,
+  AdminKnowledgeBase,
+  KnowledgeBasePageData,
+  KnowledgeBaseWriteRequest,
 } from '../types/admin';
 import { API_BASE_URL } from '../utils/apiBase';
 import { clearAdminSession, setAdminToken, syncPreferredAdminHome } from '../utils/adminAuth';
@@ -896,6 +899,32 @@ export const usersApi = {
     } catch (error) {
       handleApiError(error);
     }
+  },
+};
+
+// ============================================================
+// 知识库 API
+// ============================================================
+export const knowledgeBasesApi = {
+  async list(params: { tenant_id?: string; project_id?: string; status?: string; page?: number; page_size?: number } = {}): Promise<KnowledgeBasePageData> {
+    try { return extractApiData(await apiClient.get<ApiResponse<KnowledgeBasePageData>>('/api/v1/admin/knowledge-bases', { params })); }
+    catch (error) { handleApiError(error); }
+  },
+  async get(kbId: string): Promise<AdminKnowledgeBase> {
+    try { return extractApiData(await apiClient.get<ApiResponse<AdminKnowledgeBase>>(`/api/v1/admin/knowledge-bases/${encodeURIComponent(kbId)}`)); }
+    catch (error) { handleApiError(error); }
+  },
+  async create(payload: KnowledgeBaseWriteRequest): Promise<AdminKnowledgeBase> {
+    try { const response = await apiClient.post<ApiResponse<AdminKnowledgeBase>>('/api/v1/admin/knowledge-bases', payload); clearAdminReadCache(); return extractApiData(response); }
+    catch (error) { handleApiError(error); }
+  },
+  async update(kbId: string, payload: Partial<KnowledgeBaseWriteRequest>): Promise<AdminKnowledgeBase> {
+    try { const response = await apiClient.patch<ApiResponse<AdminKnowledgeBase>>(`/api/v1/admin/knowledge-bases/${encodeURIComponent(kbId)}`, payload); clearAdminReadCache(); return extractApiData(response); }
+    catch (error) { handleApiError(error); }
+  },
+  async archive(kbId: string): Promise<AdminKnowledgeBase> {
+    try { const response = await apiClient.post<ApiResponse<AdminKnowledgeBase>>(`/api/v1/admin/knowledge-bases/${encodeURIComponent(kbId)}/archive`); clearAdminReadCache(); return extractApiData(response); }
+    catch (error) { handleApiError(error); }
   },
 };
 

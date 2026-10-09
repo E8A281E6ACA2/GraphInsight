@@ -112,7 +112,7 @@ const AdminFrame: React.FC<{ children: (controls: AdminFrameControls) => ReactNo
       {
         label: '知识库运营',
         items: [
-          { label: '知识库治理', icon: <Folder />, path: '/admin/knowledge-base' },
+          { label: '知识库目录', icon: <Folder />, path: '/admin/knowledge-bases' },
           { label: '任务中心', icon: <WorkHistory />, path: '/admin/jobs' },
         ],
       },
