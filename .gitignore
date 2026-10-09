@@ -76,6 +76,11 @@ artifacts/
 *.py8001.err
 *.py8001.out
 
+# 知识库前端验收临时产物（本地留档，不入库）
+frontend/s2-*.json
+frontend/s202-*
+frontend/workspace-kb-async-*/
+
 # Temporary files
 *.tmp
 *.temp
