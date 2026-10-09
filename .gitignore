@@ -32,6 +32,12 @@ backend/science/.env
 frontend/.env
 .env.docker
 
+# S2-03 disposable credentials: never commit accidental in-repository copies
+state.json
+isolated.env
+admin-token.txt
+.graphinsight-s203/
+
 # Database files
 *.db
 *.sqlite
