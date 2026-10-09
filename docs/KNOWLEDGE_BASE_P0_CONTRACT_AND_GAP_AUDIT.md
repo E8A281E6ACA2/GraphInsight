@@ -1,12 +1,12 @@
 # 知识库一等公民：Phase 0 作用域契约与代码差距审计
 
-更新时间：2026-09-27
-状态：**决策冻结完成，M1/Phase 0 工程实施待开始**（决策点 D1–D5 已确认，见第 7 节）；本文件不是工程完成证明，差距审计基于当日代码实况（含行号证据）
+初始审计日期：2026-09-27
+当前状态：**M1–M4 已实现并通过 2026-09-29 真实统一活栈验收；本文件保留当日差距审计与后续验收证据，不替代当前状态入口。** 决策点 D1–D5 仍见第 7 节；当前对账见 [ENTERPRISE_IMPLEMENTATION_BACKLOG.md](ENTERPRISE_IMPLEMENTATION_BACKLOG.md)。
 分工约定：实现由工程师 / 其他 AI 按 M1–M6 执行；项目负责人只做分析与审查（审查清单见 §8.1），不直接写代码。
 上游输入：
 
 1. `docs/KNOWLEDGE_BASE_CATALOG_IMPLEMENTATION_PLAN.md`（知识库目录实施规划，本文件的阶段划分与其 Phase 0–4 对齐）
-2. `study/knowledge-base-composition-blueprint.md` 第 17/18 节（腾讯 ADP P0、WeKnora P0 增量）
+2. 历史输入 `study/knowledge-base-composition-blueprint.md` 第 17/18 节本轮未找到，保留出处说明但不作可复核链接；现存实施指南见 [KNOWLEDGE_BASE_ARCHITECTURE_IMPLEMENTATION_GUIDE.md](KNOWLEDGE_BASE_ARCHITECTURE_IMPLEMENTATION_GUIDE.md)，不冒充原研究稿。
 3. 2026-09-27 三端代码审计（Go / Python / 前端，证据见第 3 节）
 
 本文回答两个问题：**契约冻结成什么样**（第 2 节）、**现有代码差在哪里、每个文件要改什么**（第 3、4 节）。实现按第 4 节里程碑 M1–M6 顺序推进。
@@ -15,7 +15,7 @@
 
 ## 1. 审计总结论
 
-`kb_id` 目前只是三处孤立挂点：
+以下 §1 的初始总结与 §2/§3 的“现状”列是 2026-09-27 快照，原行号只用于复核当轮；M1–M4 已由后续验收更新。`kb_id` 当时只是三处孤立挂点：
 
 1. `admin_jobs` 表的 `kb_id` 列（写入但 worker 从不读取，`backend/admin/models.py:165`、`backend/services/job_runtime.py:53`）
 2. RBAC 绑定的 `scope_type=kb` + `kb_id` 列（`backend/admin/models.py:134-137`，Go 侧鉴权已消费，`go-backend/internal/adminstore/client.go:665-747`）
@@ -33,7 +33,7 @@
 | --- | --- | --- |
 | 竞品和架构研究 | 已完成 | 研究稿位于 `study/`，不等于代码交付 |
 | D1-D5 决策冻结 | 已完成 | 仅表示契约口径已确认 |
-| 正式契约文档 | 待纳入 Git 审计链 | 被忽略的本地文件不能作为可复核交付物 |
+| 正式契约文档 | 已在 Git 跟踪（本轮静态核对） | `git ls-files docs/KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md` 命中；不是本轮工程验收 |
 | M1/Phase 0 工程实施 | 已完成 | KB 实体表、迁移、ScopeResolver、scope helper 与隔离测试产物均已落地 |
 | M1 验收 | 已完成 | 真实统一活栈：`check_dual_kb_blackbox.py` passed=15 failed=0、`check_kb_scope_isolation.py` passed=54 failed=0、Playwright E2E 5 passed / 3 skipped / PW_EXIT=0 |
 | `KB_SCOPE_ENFORCE=strict` | 已正式启用 | 代码中不存在 strict/compat 开关或 default KB 兜底，KB 作用域强制无条件；由 `check_migration_cleanup_guards.py` 静态守卫防削弱（契约 §2.11 D4） |
@@ -349,6 +349,83 @@ INDEX_UNAVAILABLE        索引迁移写冻结/降级期间写入口拒绝（M5�
 **验收门**：§6.2 补充——并发编辑一胜一冲突；回滚生成新 revision；编辑后仅 stale 索引重建；QA trace 可答"用的哪个版本"。
 
 ### M6 前端目录与工作台切换（规划 Phase 4，最后做）
+
+#### 2026-10-09 定向缺口与 S2-01 交付记录
+
+S2-01 已完成工作台切库正确性实现与前端隔离验证；S2-02 当前前端范围已完成并取得 Node22 隔离证据，但不代表真实后端CRUD、权限或生产闭环。父作用域、详情区域错误隔离、工作台授权差异和分页/当前页搜索均已单独记录。
+
+| 缺口 | 现状证据（当前HEAD） | 最小改动范围 | 依赖 | 验收场景 |
+| --- | --- | --- | --- | --- |
+| 切库重置不完整 | `frontend/src/store/graphStore.ts:209–215` 只清 graphData/selectedNodeId/selectedCitation；recentUploadedDocIds/queryHistory/autoPaths/lastQueryStats/过滤分组未清；`DocumentPanel.tsx:56–74` 不依赖 activeKbId，仅refreshKey重载 | store切库动作与文档/聊天组件按KB清理、重拉，不改服务端权限 | 统一请求KB快照、任务/对话归属 | A有文档/对话/引用/任务后切B，B不残留A；切null/归档/撤权均安全清空 |
+| 旧请求晚返回 | DocumentPanel请求返回直接setDocuments，未见请求代次校验；图/问答/上传/轮询同样需审计提交状态点，不能只靠X-KB-ID保护UI | 捕获kbId+请求代次；Abort仅是优化，状态提交前仍核验当前KB；任务轮询按job+KB隔离 | 现有axios/service支持可取消或显式scope | 让A列表/问答/图谱/建图结果延迟，先切B再返回，B不得被旧数据/错误/loading覆盖；A→B→A仍拦过期代次 |
+| 管理目录/详情 | `kbService.ts`目前仅业务授权目录；`App.tsx`为旧 `/admin/knowledge-base` 文档治理页；Go KB list/detail/create/patch/archive/restore处理链已有 | 复用adminService/类型扩展目录与详情，不建立平行API；旧页兼容跳转，任务/文档带kb参数 | Go管理KB CRUD、文档列表、jobs现有接口；用户可见汇总字段缺失须先合同确认 | 授权/无授权、loading/empty/error/success、创建/编辑/归档/恢复与详情刷新，KB-A不显示B |
+| 真实处理状态 | `documents_native.go:257–285` 已返回 `status/graph_status/vector_status/version/relative_path`；`documents.ts:3–10` 未映射，`DocumentPanel.tsx:291–297` 统一显示“已入库” | 复用现有列表 API，补类型/分页 total/page_size 与状态 UI，不另造状态 endpoint | `chunk_projection_state.py` 聚合 failed > stale/skipped > pending > indexed；chunk skipped 映射文档 stale，stale 不能直接等同能力关闭；原因须有独立证据 | uploaded/parsing/indexed/failed、graph indexed+vector pending/stale/failed 分开呈现；未知不置绿，恢复后待重建 |
+| 任务 scope 与轮询 | `JobsPage.tsx:122–140,163–202` 自由文本 scope，3秒轮询会清timer但无已发请求代次保护；问答/引用图联动 `DocChatPanel.tsx:215–356,426–508` 同样无完整保护 | scope 捕获+generation/取消；scope 变更清任务详情/logs与会话/lastSync | 后台 `kb:read` 目录授权不同于工作台 `graph:read`，不能直接复用其授权集合 | 旧列表/任务详情/logs/问答/引用图迟到不覆盖新 scope；隐藏/卸载停止轮询 |
+| 安全解析预览 | 产物文件存在不等于可读API；当前带KB/doc授权且安全路径解析的预览读取闭环本轮未找到 | 后续限定只读manifest/content/结构化块API与UI；路径来自服务器登记并校验，不接受任意本地路径 | 已有parsed artifact持久化、doc归属/权限、内容安全渲染；可独立排第二阶段后续 | 未授权/跨KB/路径逃逸拒绝；缺产物明确空态；Markdown/HTML禁脚本与外链危险内容 |
+
+后端当前文档列表已按 KB 注册表过滤并返回相对路径，不含旧审计所述绝对路径；这不代表解析预览读取入口已存在。后台 KB CRUD 需接入 `adminService`；文档复用 `/api/documents`，不能假设已有 `/knowledge-bases/{id}/documents` 子路由。
+
+第一阶段上述缺口来自静态对账，未作浏览器复现。S2-01 后续验证使用本地 Vite + Chrome/Playwright，保留真实组件/store/选择器交互，所有业务请求由夹具明确响应，未知请求中止并判红；没有真实后端/模型连接，没有共享写入或服务端任务取消。
+
+##### S2-01 实现与验证（2026-10-09，未提交）
+
+基线：`codex/m5-seed-v2-only`，HEAD `3a520b21e82b616b991f8a5c9e60c489dd8daab0`。开工保留第一阶段9文档改动及未跟踪 `.codebuddy/`、`output/`、`qodana.yaml`，未清理、未暂存。前端仅限工作台调用链；后台 JobsPage 筛选/轮询、后端/API契约、CI、权限、数据库及共享配置未修改。
+
+- 修改前确定性复现：`workspace-kb-async.spec.ts` A→B 场景控制 A 响应挂起，切 B 后业务断言发现 B 文档请求数量仍为0（未重载），不是服务未启动；首次单场景报告1失败/9未运行，同时夹具误将外部字体中止记违规，随后明确模拟字体资源。仅此问题有修改前运行证据，其余旧响应缺口来自静态链路，不能称全部修改前已复现。
+- 状态清除：store 的 graphData/节点/引用/查询历史/图过滤与分组内容/路径/统计/最近上传/高亮/工作区tab；组件的文档列表/错误/loading/删除摘要、聊天消息/草稿/typing/上传摘要/建图结果/引用同步缓存、schema/query及节点详情、图tooltip/菜单/视频/隐藏节点。主题、布局、节点类型样式、分组显示偏好、面板尺寸、模型档位与图同步偏好保留；同KB重复选择为 no-op。
+- 异步保护：每次有效切库增加 `scopeVersion`，固定 `{kbId,version}`；文档、QA、upload、build、图同步与hook分别有独立代次/归属检查，成功/catch/finally/后续fallback均受保护，mounted/cleanup阻止卸载回调。A→B→A 的旧A即使kbId相同也失效；同库列表乱序由请求序号处理，不以文档请求作废QA。
+- 副作用：`api`保留显式X-KB-ID，service接收发起时KB；QA/deepResearch body/header一致，上传/删除/建图绑定原KB。旧上下文完成只丢弃本地结果，不发服务端取消/回滚；未提交的删除确认/fallback/自动后续动作停止。无KB不发资源请求，目录唯一KB不再隐式选中。
+- 改动分工：`graphStore.ts`、`kbScope.ts`上下文与reset；`DocumentPanel.tsx`列表/删除；`DocChatPanel.tsx`会话/上传/建图/引用图；`GraphCanvas.tsx`展开与图局部状态；`CypherEditor.tsx`、`useCypher.ts`、`useNodeDetail.ts`查询/schema/节点异步出口；`api.ts`、`documents.ts`、`docQa.ts`、`graphBuild.ts`、`graphService.ts`固定scope；`documentGraphSync.ts`阻止旧结果继续fallback；`KnowledgeBaseSelector.tsx`校验当前选择且不默认选库。没有新增状态管理库或通用请求框架。
+
+| 验收矩阵 | 结果/范围 |
+| --- | --- |
+| A→B列表迟到；A→B→A旧A；同库双刷新乱序 | 通过（确定性挂起/释放响应，真实浏览器组件） |
+| QA迟到答案/引用、B无A历史；旧错误与finally不关闭B typing | 通过 |
+| 图请求迟到、空图后续fallback停止、深度调研迟到 | 通过 |
+| 上传/建图提交中切库 | 通过：旧结果不入B、不改投B、不发服务端cancel |
+| 无KB资源请求；同KB重复选择；正常QA/引用/图/上传/建图；当前失败重试 | 通过 |
+| 文档旧失败与finally；卸载QA；删除dry-run切库后不确认执行 | 通过 |
+| 工作台任务轮询、流式问答 | 不适用：`handleBuildGraph`只提交并展示job_id，没有任务轮询；DocQA为普通POST完整响应，无流式消费。本单未新增两种功能，也未改后台独立JobsPage |
+
+实跑环境分栏：
+
+- **Node 24 历史/前次结果**：Windows PowerShell、Node `24.20.0`/npm `11.19.0`，浏览器矩阵18/0/0、build/lint通过；保留为Node24结果。
+- **Node 22 本机补验（本轮）**：未安装/切换nvm；发现工作台随附运行时 `C:\Users\yh\.workbuddy-ai\binaries\node\versions\22.22.2-6\node.exe`，直接以绝对路径运行，Node `22.22.2`、npm `10.9.7`。专用矩阵 `18 passed / 0 failed / 0 skipped / 0 flaky`，exit 0；build exit 0；lint exit 0；diff-check exit 0。报告：`frontend/s2-node22-results.json`，运行器结果：`frontend/workspace-kb-async-node22-results/.last-run.json`。
+
+本轮未修改系统 PATH、未切换/覆盖 `C:\Program Files\nodejs`、未安装或卸载任何 Node；Node 22 仅由本命令进程临时设置 PATH。浏览器使用本机Chrome；模型/后端完全替身，无模型费用。
+
+命令与结果（均上述HEAD+未提交实现）：
+
+1. **Node22.22.2**：临时 PATH 指向 `C:\Users\yh\.workbuddy-ai\binaries\node\versions\22.22.2-6`；`E2E_BASE_URL=http://127.0.0.1:1234`、`E2E_HOST=127.0.0.1`、`E2E_PORT=1234`、`E2E_BROWSER_CHANNEL=chrome`、`VITE_API_BASE_URL=same-origin`；`npm exec -- playwright test workspace-kb-async.spec.ts --output=workspace-kb-async-node22-results --reporter=json`：18 passed、0 failed、0 skipped、0 flaky，exit0，47.5s；报告 `frontend/s2-node22-results.json`。
+2. **Node22 build/lint**：同一绝对路径运行时执行 `npm run build` exit0、`npm run lint` exit0；结果与Node22分栏，不混用Node24历史结果。
+3. `git diff --check`：exit0（只有CRLF→LF提示）；本单最终重新核对。
+4. 网络边界：Vite配置默认回环 `127.0.0.1`，测试显式拦截所有请求；Google字体stylesheet返回空内容、字体请求中止，其余未知业务/外部请求记录 violation并中止；console仅保存并附加，`pageerror`硬失败。Node22报告中0跳过/0 flaky。
+
+console/pageerror按夹具检查；失败注入的HTTP503/API诊断仅为预期项，未知业务流量和未声明异常不得通过。浏览器证据属于前端隔离验证，不是Neo4j/Milvus/Go/Python真机或生产权限验证。真实后端验收未执行；未seed、迁移、部署、提交或push。目录/详情、解析预览、状态体系、Chunk编辑和完整M5-B1仍未开发或解冻。
+
+##### S2-02完整收尾矩阵（2026-10-09）
+
+基线 `codex/m5-seed-v2-only` / `3a520b21e82b616b991f8a5c9e60c489dd8daab0`，所有修改未提交。保留第一阶段/S2-01已有改动和未跟踪产物；不改后端/CI/权限/数据库/共享配置或依赖锁文件。
+
+| 需求 | 测试与结果 | 证据边界 |
+| --- | --- | --- |
+| 父作用域缺失门控、实际GET/POST scope、403、A/B独立数据 | 目录26项矩阵中通过；fixture按父scope存独立对象，创建写对应集合、PATCH/archive按KB ID；A/B独有数据不混显 | 真实前端service+浏览器HTTP fixture，不是后端授权取证 |
+| 创建/编辑/归档/恢复成功失败、输入保留、trace、取消、防重提交 | 目录矩阵通过；保存错误在Dialog内可见，归档不是物理删除 | 无真实PG写入，无权限模型修改 |
+| 写操作迟到、当前scope/filter刷新与旧错误隔离 | 目录矩阵通过；等待写响应释放后核对实际GET参数；原目标不变，不取消已提交操作 | 单元式/HTTP fixture分别标识 |
+| 两页互斥、翻页、筛选重置、旧页迟到 | 目录矩阵通过；使用后端page/page_size/total_pages，关键词明确“搜索当前页” | 没有新增全库搜索合同，统计不可用仍明确暂无 |
+| 详情A→B、旧失败恢复、A→B→A、B等待无可操作A | 详情9项矩阵通过；各effect闭包清理+路由身份保护，进入动作再核代次/成功KB | 浏览器实际组件，旧请求按控制顺序释放，不靠sleep |
+| KB信息/文档/任务独立失败、未知状态、无统计 | 详情矩阵通过；区域各自loading/error/data，不再Promise.all吞基本信息 | 未知仅映射未知，不把stale解释为能力关闭 |
+| kb:read与graph:read差异 | 详情矩阵通过；管理可见但业务active目录无该KB时进入按钮禁用；进入前重新读取业务目录 | 不推导真实鉴权已验收；归档不得进入，恢复也不自授graph权限 |
+| 从目录到详情返回scope、进入workspace后切B | 详情矩阵通过；父scope由URL保留，没有默认tenant/project；setActiveKbId激活且selector仍校验业务目录 | 不复制KB全局store，不通过localStorage绕过业务选择 |
+| S2-01回归 | 已有20项全部通过 | 原有切库、上传/问答/图谱fixture保持隔离 |
+
+统一验证命令：临时PATH使用已有 `C:\Users\yh\.workbuddy-ai\binaries\node\versions\22.22.2-6`（node22.22.2/npm10.9.7），环境 `E2E_BROWSER_CHANNEL=chrome`、`E2E_BASE_URL=http://127.0.0.1:1234`、`E2E_HOST=127.0.0.1`、`E2E_PORT=1234`、`VITE_API_BASE_URL=same-origin`；`node node_modules/@playwright/test/cli.js test knowledge-base-directory.spec.ts knowledge-base-detail.spec.ts workspace-kb-async.spec.ts --output=s202-complete-final1 --reporter=json`，统一55 passed/0 failed/0 skipped/0 flaky，143.3秒，exit0。目录26、详情9、工作台20；原目录四项直接替换list是组件异步逻辑验证，不是HTTP合同，其他HTTP fixture调用真实service。
+
+`npm run build` exit0、`npm run lint` exit0（0新增warning/error）、`git diff --check` exit0。原始报告 `frontend/s202-complete-final1.json`，输出目录 `frontend/s202-complete-final1/`；build/lint日志 `frontend/s202-build-final.log`、`frontend/s202-lint-final.log`，全部未自动删除或暂存，建议人工选择最终报告归档、保留失败轮作诊断，不使用git add .。
+
+网络：仅本机Vite回环1234，页面资源可通过，未知业务/外网请求中止且判红；没有连接共享Go/Python/数据库/模型。fixture故障HTTP400/403/409/503仅用于对应异常场景，console分类随测试附件；不得从fixture推导真实权限或生产通过。真实后端/权限/生产闭环均未验证，Shared Gate OPEN，完整M5-B1未解冻，未提交/push，未启动S2-03。
+
+以下原M6文件名是规划建议，不代表全部已创建；当前已实现scope传输/选择器应复用，不重做。
 
 | 文件 | 动作 | 内容 |
 | --- | --- | --- |

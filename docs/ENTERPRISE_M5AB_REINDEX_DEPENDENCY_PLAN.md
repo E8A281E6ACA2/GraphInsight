@@ -7,8 +7,8 @@
 
 ## 0. TLDR（结论先行）
 
-1. **`reindex_chunks` 已由 Python 侧既有的进程内 job worker 消费**（`backend/admin/services/job_service.py` 的 `admin-job-worker` 线程 + `backend/services/job_runtime.py` 分发），不是新建独立进程，也不是 Go。B0 不新增 Go API。
-2. **关键结论：门收敛不需要 Go API。** 入队方（backfill）与执行方（Python worker）都在 Python，Go 只提供人工触发入口和列表/重试界面。所以存在一个不违反"M5-B Go API 冻结"的最小切片（本文 §5 的 **M5-B0**）。
+1. **`reindex_chunks` 已由 Python 侧既有的进程内 job worker 消费**（`backend/admin/services/job_service.py` 的 `admin-job-worker` 线程 + `backend/services/job_runtime.py` 分发）；Go 当前也已有受冻结范围约束的 `/api/v1/admin/jobs/reindex-chunks` 提交入口（`go-backend/internal/httpserver/admin_jobs_native.go:231`），但不执行 job。B0 不新增 Go API。
+2. **关键结论：收敛执行不需要新增 Go worker API。** 入队方与执行方仍在 Python；现有 Go 入口只做受控入队、列表/重试/取消与唤醒。M5-B1 指完整 chunk 读/PATCH/rollback/reindex-document 用户 API，继续冻结。
 3. 收敛需要两个条件同时成立，缺一不可：**C1 Milvus v3 提供显式 `content_revision` 字段**（解决"新写入"腿）+ **C2 worker 能执行 `reindex_chunks`**（解决"已有 current 行但投影未收敛"腿）。只做 C1 收敛不了任何 `needs_reindex_targets`；只做 C2 在 v2 上无法把向量标成 `indexed`（会被 §8.5 冻结拦成 `revision_field_absent`）。
 4. 即使 C1+C2 全绿，**仍有一类 target 永远不收敛**，必须人工处置而非重跑：`blocked`、孤儿 revision、`unrecoverable`、`scope_*` 冲突。门 CLOSED 的判据里必须把它们显式排除在"reindex 能解决"之外。
 
@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | job 存储 | 单表 `admin_jobs`，含租约列 `claimed_by/claim_expires_at/last_heartbeat_at` 与 `targets_hash` | `backend/admin/models.py:159-182`；`backend/admin/migrate_job_worker_lease.py:36-48` |
 | 唯一执行器 | FastAPI 启动时拉起的进程内线程，轮询间隔默认 2s | `backend/main.py:157`（关闭 :168）；`job_service.py:233-256,289-301` |
-| 可执行类型 | Python 集合已包含 `reindex_chunks`，Go 集合仍冻结未接入 | `job_service.py:38-43`；分发 `job_runtime.py:87-96` |
+| 可执行类型 | Python worker 与 Go 提交链已包含 `reindex_chunks`；完整 B1 仍冻结 | `job_service.py:38-43`；`job_runtime.py:87-96`；`go-backend/internal/httpserver/admin_jobs_native.go:231` |
 | `reindex_chunks` 消费方 | **已存在**。Python worker 领取 backfill 入队的 job，并执行四道 current 复核、Neo4j/Milvus 投影和 CAS 状态回写 | `job_service.py:361-369`；`chunk_projection_reindex.py:450-704` |
 | 入队方 | backfill 按 `doc_id` 分组直连 SQL `INSERT ... ON CONFLICT (job_type,kb_id,targets_hash) DO NOTHING`，旁路 `job_service.create_job` | `backend/admin/backfill_chunk_revisions.py:816-866`（`JOB_TYPE` 定义 :75） |
 | Go 侧 | 只做 INSERT/UPDATE 与列表/重试/取消，**不执行任何 job**；靠 HTTP 唤醒 Python | `go-backend/internal/adminstore/jobs.go:26-30,131-163`；`admin_jobs_native.go:686-697,727-751`（唤醒目标 `backend/admin/api/endpoints/jobs.py:23,46-48`） |
@@ -31,7 +31,7 @@
 | v2 上向量写入的现状 | backfill 检测到 collection 无 `content_revision` 字段即**整批拒写**，投影保持 `pending` 并打 `MILVUS_REVISION_FIELD_ABSENT` | `backfill_chunk_revisions.py:316-327,397-410,1050` |
 | 门判据 | `needs_reindex_targets == []` 且 `blocked == 0` 且无 `unrecoverable/scope_unresolved/scope_mismatches` → CLOSED | `backfill_chunk_revisions.py:869-888`；单投影判定 :582-608 |
 
-**剩余熵增点**：Python 的 `reindex_chunks` 白名单和消费链已验证；Go 侧 `supportedJobTypes` / `adminJobTypeFromPath` 仍冻结，B1 开工前必须增加跨语言 job_type 精确对账守卫，避免后续出现"能入队、能显示、永不执行"的静默状态。
+**剩余熵增点**：Python 消费链和 Go 受控提交链已存在；完整 B1 开工前仍必须增加跨语言 job_type 精确对账守卫，避免出现“能入队、能显示、永不执行”的静默状态。
 
 ---
 
@@ -75,10 +75,10 @@ collection，不代表共享生产迁移。
 
 `KB_SCOPED_JOB_TYPES` 一条尤其重要：`reindex_chunks` 的 `kb_id` 必须真实存在且 active（`job_service.py:40-42` 现语义），否则一个手滑的 payload 会把不存在 KB 的 job 反复重试。
 
-### 3.2 M5-B1（Go API，B0 绿了才开工）
+### 3.2 M5-B1（Go API，保持冻结；共享迁移前置条件完成并获审计授权后开工）
 
-- `adminstore/jobs.go` 的 `supportedJobTypes` 与 `adminJobTypeFromPath` 的映射同步加 `reindex_chunks`；这是**白名单补漏**，不是新设计。
-- 设计书 §7 的 5 个端点（chunk 读 / PATCH / rollback / reindex-chunks / reindex-document）按原方案实现；payload 形态沿用 §15.2/§15.9 的统一 `targets:[{chunk_id,target_revision}]`，不新增第三种形态。
+- `reindex_chunks` 白名单与专用提交链已接入，不再列为“Go完全未实现”；后续应核对跨语言白名单，不重复实现。
+- 设计书 §7 的完整 5 端点中，现有 `reindex-chunks` 仅是部分交付；chunk 读 / PATCH / rollback / reindex-document 与用户闭环仍按原冻结方案推进；payload 沿用 `targets:[{chunk_id,target_revision}]`，不新增第三种形态。
 - Go 建 job 后仍走 `POST /api/internal/jobs/wake`（`admin_jobs_native.go:727-751`）唤醒 Python，不引入新通信方式。
 - backfill 直连 SQL 旁路 `create_job` 的口径差（§1 表格）在 B1 必须收：要么 backfill 改调 `job_service.create_job`，要么把 `create_job` 的作用域校验下沉为共享函数供两条路径复用。**推荐后者**——backfill 的 `ON CONFLICT DO NOTHING` 幂等语义要保留，改调用点会引入行为变化。
 
@@ -90,7 +90,7 @@ collection，不代表共享生产迁移。
 
 ## 4. 问题三：Milvus v3 如何提供 `content_revision`
 
-沿用设计书 §8.5 + §15.4 + §16.1 已冻结的口径，本文只补"实现顺序"和当前代码的缺口：
+以下为 2026-10-02 初始依赖分析（原行号保留用于历史定位），其中 dual_write 待实现、版本硬编码等描述不得直接作为当前缺陷；当前能力与顺序以 §5.5、[能力对账](ENTERPRISE_IMPLEMENTATION_BACKLOG.md) 及 [v3 后续实现记录](ENTERPRISE_M5_MILVUS_V3_MIGRATION_PLAN.md) 为准：
 
 1. **schema**：临时 v3 collection 已按 `vector_store.py` 契约创建，包含显式 `content_revision INT64`；共享 v3 迁移仍未执行。**禁止在 v2 改 schema，禁止自动 drop v2。**
 2. **落点**：`ensure_collection` 增 v3 分支与"缺 `content_revision` 字段则拒写"守卫（现有 `_collection_has_kb_fields` 同模式，`vector_store.py:328-342`）；`upsert_chunks` 写显式 `content_revision`，且不得被 `chunk.metadata` 覆盖（沿用 :190-193"作用域以显式字段为准"的写法）。
@@ -141,9 +141,30 @@ T3→T4 之间必须有一份**逐 kb 不可收敛清单**输出（脚本或 SQL
 
 ### 5.4 与 M5-A / M5-B 冻结令的关系
 
-- **M5-B0（§3.1）不触碰 Go**，不违反"M5-A 未验收前不得开始 M5-B Go API"。它是让 M5-A 唯一断点变得可取证的必要前置，不含任何新 API 面。
-- B0 已在不启动 Go API 的前提下完成；其临时空间证据不等于共享生产验收。
-- B1（Go API）继续保持冻结，直到：P0 聚合异常修复、共享环境只读 C3 清单、隔离/临时 v3 迁移证据和文档同步均由审核确认。
+- **M5-B0（§3.1）不触碰 Go worker**，不违反 M5-B1 冻结；现有 Go `reindex-chunks` 仅是受控提交/唤醒入口，不等于完整 B1 API 已解冻。
+- B0 的隔离与一次性空间证据不等于共享生产验收。
+- B1（Go API）继续保持冻结，直到：P0 聚合异常修复、共享环境只读 C3 清单、隔离/临时 v3 迁移证据和文档同步均由审核确认，并取得相应审计授权。
+
+### 5.5 本轮 M5 阻塞清单（有序、四项授权分开）
+
+| 顺序 | 类别 | 当前事实 | 退出判据 |
+|---|---|---|---|
+| 0 | 技术前置 | 共享状态需重新证明四来源全可读、至少一处非空；2026-10-07 受控路径历史记录为四来源全可读、PG/Neo4j/Milvus 0、解析产物 2（本轮未重测，历史宿主协议已恢复），v2 primary 无向量，不能直接 `backfill_versioned` | 只读 C3/Gate 0 报告 `coverage_verdict=FULL`、四来源可读、目标/归属/范围一致；否则 BLOCKED |
+| 1 | **SEED-SHARED** | 待授权；只准备目标 KB 解析产物对应的 v2 primary 向量，不能建 v3、写 PG/Neo4j 或改配置 | 受控目标/PK/tenant/project 校验通过，逐 chunk 读回，manifest 单 RUN_ID 可解析，幂等重跑 `written=0`，回滚可验证 |
+| 2 | **CONFIG-SHARED** | 待授权；仅应用 vector 能力、v3 shadow 与单 KB write scope，不可借配置授权其他写入 | 配置变更前后快照、scope 严格限定目标 KB、服务读回一致；失败零副作用并可回退 S0 |
+| 3 | **CREATE-V3** | 待授权；仅创建受控目标 v3 collection/index，不改 v2、不切读源 | schema 显式 `content_revision INT64`、索引可 load、写前后读回可解释、零 v2 写入、失败可删除目标并有证据 |
+| 4 | **BACKFILL-WRITE** | 待授权且必须最后；只执行目标 KB 单向回填/投影，不替代 C3 人工治理 | primary v2 前后逐字段/向量不变，v3 逐 chunk revision/hash 对账，失败重放零半写，幂等 `rows_new=0`，共享验收须补目标 KB 真实切读及五步回滚执行证据（本轮未执行）；S1 技术回填允许 exit 0/3，exit 3 表示 Gate OPEN，不是已收敛 |
+| 5 | 技术/验收收口 | 共享 `C1∧C2∧C3∧C4` 尚未取得；B1 仍冻结 | 逐 KB C3 全零或有明确人工处置证据，reindex dry-run `CLOSED`+exit 0，真实读回/回滚/重跑及文档验收齐全；才可申请完整 B1 解冻 |
+
+**seed 安全整改达到本轮收口的条件**：仅以本轮离线合同 `m5_seed_shared_v2_contract` `passed=196 failed=0`、guard child exit 0、零真实服务连接作为隔离证据；这不能代替授权执行。真实 seed 还必须满足上述 manifest/journal/读回/回滚与精确目标约束，任何 `UNVERIFIED/PARTIAL` 均 fail-closed。
+
+计数限定：`196/0` 是脚本汇总，不保证 196 项均执行真实行为；`check_seed_shared_v2_contract.py:1267–1268` 在环境不支持 symlink 时将 R6-4 跳过记为通过。本轮摘要未独立确认该子场景，不能声称悬空 symlink 行为已验证，不修改测试或放宽门禁。
+
+S1 单向回填技术写入验收可为 exit 0/3；exit 3 表示投影 Gate OPEN。技术对账通过、共享迁移验收、B1 开工解冻与 B1 交付验收不得混同，门槛分别如下：
+
+- **共享迁移验收**：授权链完整、共享数据及目标 scope 证据、v3 schema/index、v2 零写入逐项对账、v3 写后读回、真实 worker 收敛、幂等重跑、失败重放、切读及五步回滚、C3 治理和文档验收均须具备。未满足既定条件，Shared Gate 保持 OPEN；不因拆分 B1 门槛而放宽。
+- **B1 开工解冻**：满足上述已约定共享前置条件，完成既有任务类型的跨语言精确对账要求，并取得审计授权；未满足则继续冻结。不得要求尚未获准开发的 Chunk 读/PATCH/rollback/reindex-document API、其并发冲突处理或 E2E 在开工前已完成。
+- **B1 交付验收**：获准开工后，实现约定的 Chunk 读取、乐观锁编辑、内容版本回滚、revision-aware 整文档重建等接口，再验证并发冲突、权限、审计及 E2E。上述要求完整保留；未满足只能记为 B1 未验收，不倒置为开工前置条件。
 
 ---
 

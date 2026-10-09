@@ -116,9 +116,9 @@ backend/.venv/bin/python backend/tests/run_backend_smoke_suite.py --include docq
 
 参考文档：
 
-1. [docs/ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md)
-2. [docs/ENTERPRISE_GO_LIVE_ACCEPTANCE_CHECKLIST.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_GO_LIVE_ACCEPTANCE_CHECKLIST.md)
-3. [docs/ENTERPRISE_RELEASE_TEMPLATE.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_RELEASE_TEMPLATE.md)
+1. [docs/ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md](ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md)
+2. 历史引用 `ENTERPRISE_GO_LIVE_ACCEPTANCE_CHECKLIST.md` 本轮未找到，不能据此验收；现存发布取证见 [M4-R1 验收](ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md)。
+3. 历史引用 `ENTERPRISE_RELEASE_TEMPLATE.md` 本轮未找到；保留文档债务，不凭空补写模板。
 
 ## 6. 常见故障与处理顺序
 
@@ -210,6 +210,13 @@ netstat -ano | findstr :8081
 
 ## 8. 最小回滚思路
 
+### 8.0 适用边界与当前回滚下限（2026-10-09 对账）
+
+- `78b1f28` 是 2026-09-30 scope/RBAC 版本级演练的代码回滚下限，适用条件是该演练范围；不能直接作为当前 M5 schema/v3 或共享迁移回滚目标。
+- M5 迁移的回滚必须遵守 v3 方案五步：写冻结 → v3 增量幂等回放至 v2 → 完整 `(chunk_id, revision, content_hash)` 对账 → 切回 v2 并重启 → 解冻；未执行共享迁移前，本手册不宣称该链路已真机验收。
+- 历史无模型 soak 仅证明隔离栈链路/受理路径；真实 embedding/LLM 容量与 4→8→16 矩阵本轮未执行，不能作为容量上限。
+
+
 当 Go 默认入口出现阻断，而 Python 能力层仍正常时，可按以下思路临时回滚联调路径：
 
 1. 保持 Python `8001` 继续运行。
@@ -247,9 +254,7 @@ backend/tests/run_release_acceptance.sh \
 
 1. Linux 本地已实跑 `backend/tests/run_release_acceptance.sh --fail-fast`，结果为 `ACCEPTANCE_SUMMARY failures=0`。
 2. 当前后续动作应优先是 CI 远端复跑、容量/soak 验证与真实回滚演练，而不是恢复 Python public business/admin routes。
-3. 容量/soak 与回滚演练记录模板已补齐：
-   - [docs/ENTERPRISE_PERF_SOAK_TEMPLATE.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_PERF_SOAK_TEMPLATE.md)
-   - [docs/ENTERPRISE_ROLLBACK_DRILL_TEMPLATE.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_ROLLBACK_DRILL_TEMPLATE.md)
+3. 历史记录称模板已补齐；原 `ENTERPRISE_PERF_SOAK_TEMPLATE.md`、`ENTERPRISE_ROLLBACK_DRILL_TEMPLATE.md` 本轮未找到。后续独立取证见 [无模型 soak](ENTERPRISE_PERF_SOAK_2026_09_30.md) 与 [版本回滚演练](ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md)，不作为原模板存在性的证明。
 
 补充事实（2026-06-13）：
 
@@ -283,9 +288,11 @@ backend/tests/run_release_acceptance.sh \
 
 ## 11. 关联文档
 
-1. [docs/GO_PYTHON_MIGRATION_STATUS.md](/home/yuanhuan/GraphInsight/docs/GO_PYTHON_MIGRATION_STATUS.md)
-2. [docs/GO_PYTHON_HYBRID_BOUNDARY.md](/home/yuanhuan/GraphInsight/docs/GO_PYTHON_HYBRID_BOUNDARY.md)
-3. [docs/GO_DEFAULT_ENTRY_EXECUTION_PLAN.md](/home/yuanhuan/GraphInsight/docs/GO_DEFAULT_ENTRY_EXECUTION_PLAN.md)
-4. [docs/GO_PYTHON_DELIVERY_CLOSURE_CHECKLIST.md](/home/yuanhuan/GraphInsight/docs/GO_PYTHON_DELIVERY_CLOSURE_CHECKLIST.md)
-5. [docs/ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md)
-6. [docs/ENTERPRISE_RELEASE_TEMPLATE.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_RELEASE_TEMPLATE.md)
+1. [GO_PYTHON_MIGRATION_STATUS.md](GO_PYTHON_MIGRATION_STATUS.md)
+2. [BACKEND_BOUNDARY_FINAL.md](BACKEND_BOUNDARY_FINAL.md)（当前职责冻结）
+3. [ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md](ENTERPRISE_PRE_RELEASE_SMOKE_CHECKLIST.md)
+4. [当前能力对账](ENTERPRISE_IMPLEMENTATION_BACKLOG.md)
+5. [代码回滚演练](ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md)
+6. [M5 v3 迁移与回滚条件](ENTERPRISE_M5_MILVUS_V3_MIGRATION_PLAN.md)
+
+历史引用 `GO_PYTHON_HYBRID_BOUNDARY.md`、`GO_DEFAULT_ENTRY_EXECUTION_PLAN.md`、`GO_PYTHON_DELIVERY_CLOSURE_CHECKLIST.md`、`ENTERPRISE_RELEASE_TEMPLATE.md` 本轮未找到；不继续保留失效链接，也不补写不存在的文档。

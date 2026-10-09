@@ -175,7 +175,9 @@ E2E 的 3 个 skip 为需真实密码的 UI 登录用例（登录/登出/偏好�
 另一次失误是腿执行器取错口令文件（`gi_fresh_pw` 而非 `gi_fresh_pw2`），表现为当前版本腿 `401`，
 经直接对常驻网关双口令比对定位为操作侧问题，与代码无关。
 
-### 8.2 项1/项2：CI `workflow_dispatch` 自包含发布验收（阻塞，需用户凭据）
+### 8.2 项1/项2：CI `workflow_dispatch` 自包含发布验收（当轮凭据阻塞，后由 §9.10 run#26 补证）
+
+2026-10-09 对账：以下保留当时记录，不作为当前凭据状态；当前 HEAD 远端整改复验本轮未执行。唯一当前状态见 [能力对账](ENTERPRISE_IMPLEMENTATION_BACKLOG.md)。
 
 - `.github/workflows/ci.yml` 的 `workflow_dispatch` 入参与开工令要求一致
   （`run_release_acceptance`、`frontend_e2e_spec=business-docqa-flow.spec.ts`、`perf_probe_preset=release`、

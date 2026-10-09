@@ -1,7 +1,16 @@
 # GraphInsight 企业级改造执行清单（Step-by-Step）
 
-更新时间：2026-06-13
-执行方式：按阶段推进，阶段内项目全部打勾后再进入下一阶段。
+历史清单起始更新时间：2026-06-13
+当前状态唯一入口：[能力—实现—验收对账](ENTERPRISE_IMPLEMENTATION_BACKLOG.md)（本轮基线 `3a520b2`）。以下按日期保留历史记录，勾选不代表当前 HEAD 重新验收。
+
+## 当前优先级摘要（2026-10-09 对账）
+
+1. 下一阶段候选：切库正确性、知识库目录/详情、真实处理状态；只拆分，尚未开发，详见 [P0 定向缺口](KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md)。
+2. M5：Python revision/投影/恢复与 Go `reindex-chunks` 提交链已有实现；完整 B1（chunk 读/PATCH/rollback、revision-aware 整文档重建与用户闭环）仍冻结。共享迁移未验收，Gate OPEN；分项授权与退出判据见 [M5 收敛清单](ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md)。
+3. CI 代码整改：`.github/workflows/ci.yml:606–633` 已移除无实际注入的 ADMIN_TOKEN 扫描项，改用必填 ADMIN_PASSWORD/ADMIN_SECRET_KEY + 可选 LLM_API_KEY，命中/缺必填值 fail-closed，产物仅 clean=true 上传；本轮不改 CI。远端验证：已有历史 dispatch 证据，不等于上述当前整改在当前 HEAD 远端已通过，本轮未执行。
+4. 回滚下限与容量：旧 scope/RBAC 演练下限为 `78b1f28`，不能覆盖新增 M5 schema/v3；无模型 soak 不证明真实模型容量。当前适用条件已补入 [运维手册](ENTERPRISE_OPERATIONS_RUNBOOK.md)。
+
+执行方式：阶段推进条件以唯一当前入口的三轴状态及验收范围为准，不以旧 `done`/勾选替代。
 
 ## 阶段 0：基线冻结与规范统一
 
@@ -185,7 +194,7 @@
   `SECRET_SCAN_SUMMARY paths=4 files=6 shape_scanned_files=5 shape_excluded_files=1 exclude_rules=8
   credential_env_vars=2 allowed_fixtures=3 findings=0 result=pass`，同 job
   `assertions=43 failed=0`、`SUMMARY total=16 failed=0`。新 SUMMARY 三键的 CI 实跑取值至此闭合。
-- [ ] 遗留（绿态运行新暴露，需授权后动 workflow）：step 16 打印
+- [ ] 历史遗留（2026-10-02 当轮发现；代码整改已由当前 workflow 更新，当前 HEAD 远端验证本轮未执行）：step 16 当时打印
   `SECRET_SCAN_NOTE env_var_unset name=ADMIN_TOKEN`——该 step 请求三个 `--secret-env-var`，
   实际只有 2 个有值参与字面值比对，即"本轮注入 admin token 不得进产物"这条在该 step 上未真正生效。
   属 CI 凭据注入时机 / step 顺序问题，修复会改变 CI 判定面，未擅自改动。
@@ -231,7 +240,7 @@
 
 - [x] CI 后端边界编译清单已同步当前真实 Python internal capability 文件，移除已退役 `documents` / `graph_build` 路由文件引用。
 - [x] Python internal `nl2cypher` 边界守卫已调整为环境无关契约测试，不再要求本机必须配置 AI API Key 才能通过统一边界守卫。
-- [x] 新增 [docs/BACKEND_BOUNDARY_FINAL.md](/home/yuanhuan/GraphInsight/docs/BACKEND_BOUNDARY_FINAL.md)，冻结当前 Go 默认外部入口、Python internal capability、退役 Python public surface、本地 Docker PG 与验收守卫。
+- [x] 新增 [docs/BACKEND_BOUNDARY_FINAL.md](BACKEND_BOUNDARY_FINAL.md)，冻结当前 Go 默认外部入口、Python internal capability、退役 Python public surface、本地 Docker PG 与验收守卫。
 - [x] 运维手册与发布前 smoke 清单已更新到当前运行口径：端口可回退，真实地址读 `logs/dev/runtime.env`，本地管理库默认 Docker PostgreSQL。
 - [x] 本轮复验通过：`backend/tests/run_unified_boundary_guards.py` 输出 `SUMMARY total=12 failed=0`；`go test ./internal/httpserver ./internal/config` 通过；`frontend npm run build` 通过；`frontend/tests/e2e/admin-core.spec.ts` 输出 `4 passed`。
 
@@ -376,7 +385,8 @@
 
 - [x] `RAG-001` 上游解析质量治理已完成阶段 A/B 基础落地：新增文档解析器抽象、原生解析器兼容迁移、MinerU HTTP sidecar adapter、任务级 `parser_provider` 灰度参数、失败回退 native，以及 `Document/Chunk/Milvus` parser metadata 写入。
 - [x] 后台配置中心已新增 `document_parser` 配置分类与“文档解析 / MinerU”表单分区，Go 控制面新增 `POST /api/v1/admin/config/test/document_parser`，支持 native 可用性检查和 MinerU `/health` 探测。
-- [ ] 结构化 chunk、知识库治理解析状态展示、任务解析阶段展示与 QA trace parser metadata 展示尚未完成，不能标记为最终交付闭环。
+- [x] 结构化 chunker 基础接入已完成：标题、段落、HTML table 与结构化产物落盘（详见 [KNOWLEDGE_DISCOVERY_PIPELINE_DESIGN.md](KNOWLEDGE_DISCOVERY_PIPELINE_DESIGN.md)）。
+- [ ] 知识库治理解析状态、任务解析阶段、QA trace parser metadata 展示，以及列表/条款/公式/跨页表格/page-bbox 等结构化切分增强仍需单独验收；不宣称最终交付闭环。
 
 ## 阶段状态快照（2026-04-27）
 
@@ -397,7 +407,7 @@
 - [ ] 共享 KB 的 C3 数据治理（blocked/orphan/unrecoverable/scope 冲突）尚未逐 KB 清单化并处置。
 - [x] 2026-10-03 已生成共享 KB C3 只读 inventory（1 个 KB，五类清单均为 0）；这不是处置完成，且共享读取仍落在无 `content_revision` 的 v2 collection，生产 gate 继续 OPEN。
 - [ ] M5-B1 Go API 保持冻结，必须等待共享迁移前置条件和审计授权。
-- [ ] 当前不宣布共享生产 `CLOSED`；验收记录见 `docs/ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md`。
+- [ ] 当前不宣布共享生产 `CLOSED`；验收记录见 [ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md](ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md)。
 - [x] M5-A/B0 dry-run contract v1 已落地并由 SQLite 验收覆盖；真实共享迁移前仍必须保持 `writes=0` 预览边界。
 - [x] 2026-10-04 Gate 0 全量覆盖证据合同已实现（`report_m5_c3_inventory.py`：六项覆盖计数、
   omitted/failed 逐项原因、active/archived/deleting/soft-deleted/unregistered 纳入策略、

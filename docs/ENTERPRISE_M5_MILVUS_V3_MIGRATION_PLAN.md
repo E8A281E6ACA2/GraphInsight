@@ -1,10 +1,11 @@
-# M5 共享 Milvus v3 迁移方案（仅设计，零执行）
+# M5 共享 Milvus v3 迁移方案（共享迁移未验收）
 
-状态：**DESIGN ONLY / ZERO WRITES**（2026-10-03）
+当前状态（2026-10-09 对账，HEAD `3a520b2`）：**实现与隔离/一次性空间证据已有，真实共享 KB 迁移未完成，Shared Gate OPEN；完整 B1 冻结。** 唯一当前能力入口见 [能力对账](ENTERPRISE_IMPLEMENTATION_BACKLOG.md)，有序阻塞与退出判据见 [M5 收敛清单](ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md)。
+
+历史初始状态：`DESIGN ONLY / ZERO WRITES`（2026-10-03）；后续 §9.9 合成 schema canary 与 §9.23 disposable 已执行，不得再将全文称“零执行”。本轮未连接或写入共享服务。
 适用仓库：`E:\projects\GraphInsight`（与 aistudio 无关）
 上游权威：`docs/ENTERPRISE_M5_CHUNK_REVISION_DESIGN.md` §8.5 / §14 / §15.4 / §16.1 / §16.2
-执行边界：本文件不触发任何 Milvus/Neo4j/DB 写入，不切配置，不建/删 collection，
-不跑 canary。所有写步骤标 `GATED / NOT-EXECUTED`，须逐项显式授权后才可执行。
+本轮执行边界：只对账与修改文档，不触发任何 Milvus/Neo4j/DB 写入，不切配置、不建/删 collection、不跑 canary。历史已执行动作保留原日期/证据，尚未执行的共享步骤仍须逐项显式授权。
 
 ---
 
@@ -14,7 +15,7 @@
 后端实现并带自动化验证（默认关闭）**，S0→S1 不再缺代码；2026-10-05 的两条并行实现线已在
 `integration/m5-phase3-4-p6` 合并且**收敛到审计线语义**（见 §9.5 集成裁决记录）。但**实现 ≠ 迁移**：
 真实 v3 迁移仍禁止在未授权下推进——开启双写是需单独批准的迁移动作，且 §5.1 合成 schema canary
-runner 仍未实现、§7 C3 per-KB 处置清单与 §9 其余门禁尚未满足。在此之前，禁止对任何真实 KB
+runner 与临时验证已在后续 §9.9 落地；真实 KB 前置仍应按 [有序阻塞清单](ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md) 逐项确认，§7 C3 与其余共享门禁不得以合成验证替代。在此之前，禁止对任何真实 KB
 执行 v3 迁移、禁止宣称 canary 闭环。本方案把"现在能做的"（隔离的单目标 schema 建集合验证）与
 "必须授权 + 补齐其余前置才能做的"（双写开启/切换）分开摆明，并给出各自的验收判据与门禁。
 
@@ -101,7 +102,9 @@ S3  稳态：读写皆 v3，v2 只读留存备回滚       —— GATED
 
 ## 5. 两类 canary 的范围与可行性（不得混谈）
 
-### 5.1 §8.5 单目标 schema canary（canary runner 尚未实现，GATED）
+### 5.1 §8.5 单目标 schema canary（初始设计快照；后续已由 §9.9 执行）
+
+以下“runner 尚未实现”是 2026-10-03 原始状态，保留历史设计与边界；2026-10-05 合成 canary 已有 20/20 历史记录，不能再将其视为当前技术阻塞，也不能外推为真实 KB 迁移验收。
 目的：在**隔离的合成 collection**上证明——v3 schema 能被建出、`content_revision` 是显式 INT64、
 upsert→直接读回 revision 正确、幂等重跑不翻倍。
 
@@ -1300,7 +1303,7 @@ CONFIG-SHARED 单独授权）。确定性向量与 disposable 流程 `_det` 同�
 |---|---|---|---|
 | 1 | 共享配置修改（vector 能力 / v3 目标 / 写范围） | **授权 A：CONFIG-SHARED** | 未授权 |
 | 2 | 建 v3 集合（显式 INT64 schema + 向量索引） | **授权 B：CREATE-V3** | 未授权 |
-| 3 | 非空数据准备（方案 B：解析入库） | **授权 C：SEED-SHARED** | 未授权 |
+| 3 | 目标 KB v2-only primary 向量准备（不预建 PG current/Neo4j；write scope 仅提案） | **授权 C：SEED-SHARED** | 未授权 |
 | 4 | 回填写入（`backfill_versioned`，只补 v3） | **授权 D：BACKFILL-WRITE** | 未授权 |
 
 #### 六、验收判据

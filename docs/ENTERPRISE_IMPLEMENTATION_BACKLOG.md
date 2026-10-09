@@ -1,7 +1,77 @@
 # GraphInsight 企业级改造 Backlog（执行看板）
 
-更新时间：2026-06-11
-状态字段：`todo`、`in_progress`、`done`
+本轮对账日期：2026-10-09（基线见下；机器执行时钟另记于验证记录）
+
+## 当前状态唯一入口
+
+本节是当前能力状态的唯一入口；下方原执行看板及各文档的带日期记录是历史证据，不将 `done` 等同于当前 HEAD 已复验或生产闭环。
+
+- 分支：`codex/m5-seed-v2-only`；HEAD：`3a520b21e82b616b991f8a5c9e60c489dd8daab0`，与上一轮 `3a520b2` 基线一致。
+- 开工工作区：仅 `?? output/`、`?? qodana.yaml`；均不清理、不纳入提交。工具执行期间额外出现 `?? .codebuddy/`，保留，不纳入本轮文档交付。
+- 范围：静态源码与已有验收记录对账，只修改现有文档；不执行共享 seed/backfill/迁移/配置修改/服务重启，不修改代码、CI、权限或门禁，不提交、不 push。
+- 验证轴记录已有证据的最高层级和范围，不表示本轮重新验收。未找到证据写“本轮未找到”；`未实现` 仅指本轮检查的明确用户闭环，不外推为全仓库不存在。
+- 三轴分别为：实现 `未实现／部分实现／已实现`；验证 `未验证／隔离验证／真机取证／已验收`；推进 `可推进／技术阻塞／待授权`。技术阻塞与授权并存时主轴列技术阻塞，依赖列另列授权。
+
+### 能力—实现—验收对照表
+
+证据缩写（仅历史引用，未重跑）：H4=[M4-R1 2026-09-29 验收](ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md)，HB=[B0 2026-10-02 验收](ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md)，HM=[迁移方案历史取证](ENTERPRISE_M5_MILVUS_V3_MIGRATION_PLAN.md)，HP=[无模型 soak 2026-09-30](ENTERPRISE_PERF_SOAK_2026_09_30.md)，HR=[代码回滚演练](ENTERPRISE_VERSION_ROLLBACK_DRILL_2026_09_30.md)。所有源码路径均相对仓库根；链路指出实际调用实现，不以接口声明代替完成证据。
+
+| 能力 | 实现 | 验证 | 推进 | 前端入口 → 后端处理链 | 测试/验收证据与范围 | 缺失部分及直接依赖 |
+| --- | --- | --- | --- | --- | --- | --- |
+| KB 目录 | 部分实现 | 已验收 | 可推进 | `KnowledgeBaseSelector` / `kbService.ts` → `knowledge_bases_business.go` → `ListAuthorizedKnowledgeBases`；管理 `admin_knowledge_bases_native.go` → `adminstore/knowledge_bases.go` 已有真实 CRUD 写链 | H4 的授权目录/作用域；CRUD 测试文件存在但本轮未执行、独立计数/验收 HEAD 本轮未找到 | 专用管理目录页、统计与操作闭环；复用真实管理 API |
+| KB 创建 | 部分实现 | 隔离验证 | 可推进 | 专用 UI 本轮未找到 → `admin_knowledge_bases_native.go` → store 创建 | Go KB handler/store 契约；本轮未执行 | 前端表单与错误处理；不是重做后端 CRUD |
+| KB 修改 | 部分实现 | 隔离验证 | 可推进 | 专用 UI 本轮未找到 → 同 KB handler/store 更新 | 同上；当前 HEAD 真机修改验收未执行 | 编辑表单、冲突/权限失败展示 |
+| KB 归档/恢复 | 部分实现 | 隔离验证 | 可推进 | 专用 UI 本轮未找到 → KB action handler → store 状态事务 | 同上；H4 不代替管理 UI 验收 | 归档状态、确认及目录刷新；依赖 active 校验 |
+| 授权选择器 | 已实现 | 已验收 | 可推进 | workspace `KnowledgeBaseSelector` → `kbService.ts` → `/api/knowledge-bases` → 服务端授权集合与 active 目录 | H4，真实统一活栈、KB scope；切库竞态另列 | 后台自由文本 scope 尚需选择器；不能凭目录成功证明所有上下文重置 |
+| KB 详情页 | 未实现 | 未验证 | 可推进 | 专用详情路由/页面本轮未找到；现有 `KnowledgeBasePage.tsx` 是文档治理 → KB detail/documents/jobs API 可复用 | 本轮未找到详情 UI 验收 | 新详情页的文档/任务/状态聚合；无需等待完整 M5 编辑 |
+| 文档上传 | 已实现 | 已验收 | 可推进 | `DocChatPanel` / `documents.ts` → `documents_native.go` → KB 文档登记与文件保存 | H4 upload→build→ask→trace→delete；有写副作用 | 切库期间上传结果提交保护；不把上传完成等同索引完成 |
+| 文档列表 | 已实现 | 已验收 | 可推进 | `DocumentPanel` / `KnowledgeBasePage` → Go 文档列表 → KB 登记表 | H4 列表 scope；当前切库 UI 未复现 | 重载与请求竞态，字段展示不足 |
+| 删除/恢复 | 已实现 | 已验收 | 可推进 | `KnowledgeBasePage` → Go 删除 dry-run/软删除/恢复 → 文件、登记、图谱清理链 | H4 删除；历史 `check_documents_soft_delete_flow.py`（未重跑） | 恢复文件不等于恢复图/向量，需真实状态/重建提示 |
+| 解析预览 | 部分实现 | 未验证 | 可推进 | `DocumentPanel` 现为列表/引用；解析器 → `document_graph_service.py` 产物持久化 | parser 单测验证底座；带权限预览读取验收本轮未找到 | 安全按 KB/doc 读取产物 API 与预览 UI；不能直接暴露磁盘路径 |
+| 处理状态 | 部分实现 | 隔离验证 | 可推进 | Go 文档注册表已有 `status/graph_status/vector_status/version` → Python parser/投影聚合；`documents.ts`/UI 当前未映射这些字段，统一显示“已入库” | parser/worker 隔离合同与历史 HB；本轮未执行真实状态取证 | 映射 `uploaded/parsing/indexed/failed` 及 graph/vector `pending/stale/indexed/failed`；未知不得当完成，见 P0 定向缺口 |
+| 图谱展示 | 已实现 | 已验收 | 可推进 | workspace `GraphCanvas` / `documentGraphSync.ts` → Go scoped graph → Neo4j | H4 图谱与隔离；demo 数据不算证据 | 切库/旧请求保护；真实抽取质量未在本轮验收 |
+| 图谱查询 | 已实现 | 已验收 | 可推进 | `QueryPanel` / `graphService.ts` → Go scoped graph / 管理原始 query / Python NL2Cypher → Neo4j | H4 双 KB/缺 scope 负向 | 原始 Cypher 管理权限不可绕过；普通工作台复用 scoped API |
+| 实体/关系持久化 | 已实现 | 真机取证 | 可推进 | 建图 → `document_graph_service.py` → scope MERGE、evidence 校验、Neo4j | H4；历史结构化抽取记录，不等于评测质量已验收 | 跨文档归一化、评测/质量治理尚未闭环 |
+| 实体/关系人工纠错 | 未实现 | 未验证 | 技术阻塞 | 本轮定向检查未找到纠错 UI 及受控 mutation 执行链；原始 Cypher 查询不是纠错产品 | 本轮未找到持久化纠错验收，不作为全仓绝对不存在的证明 | 权威修订/重抽取/投影一致性与权限审计，完整 M5 依赖 |
+| 问答引用 | 已实现 | 已验收 | 可推进 | `DocChatPanel` / `docQa.ts` → Go DocQA → Python `doc_qa_service.py` / retrieval → citations/trace | H4 问答引用链；不是当前模型质量评测 | 引用版本/双投影治理与切库清理尚缺 |
+| 多轮上下文 | 已实现 | 隔离验证 | 可推进 | `DocChatPanel` conversation_history → `doc_qa_service.py` 改写/指代 | `check_docqa_reasoning_profile_unit.py`，历史记录 | 对话不按 KB 自动隔离，须先修切库正确性 |
+| 问答追踪 | 已实现 | 已验收 | 可推进 | `/admin/qa-traces` → Go traces/diagnostics → admin store + Python retrieval | H4 trace 对账 | 当前轮未重跑；parser/revision 展示与上下文跳转未完整 |
+| 问答反馈 | 未实现 | 未验证 | 可推进 | 用户反馈持久化 UI/API 处理链本轮未找到 | 本轮未找到验收 | 反馈模型、授权/审计、追踪关联；质量指标不是反馈功能 |
+| 问答评测 | 未实现 | 未验证 | 可推进 | 本轮未找到评测集/评分执行及对比 UI 链路；既有质量汇总/检索诊断不等于评测功能 | 检索诊断历史 smoke 不证明评测体系；非全仓绝对否定 | 固定样本、指标、模型/数据版本与阈值 |
+| 建图任务 | 已实现 | 已验收 | 可推进 | 上传/治理/`JobsPage` → Go task store/wake → Python worker → `job_runtime.execute_build_graph` | H4 异步任务真实链 | 本轮未执行；索引完成需独立状态证据 |
+| 重试/取消 | 已实现 | 真机取证 | 可推进 | `/admin/jobs` → `admin_jobs_native.go` → job store retry/cancel → worker 租约/心跳/恢复 | 历史 jobs smoke、HB；未重跑 | 取消是协作取消，不外推为所有外部调用即时中止 |
+| 局部重建 | 部分实现 | 真机取证 | 待授权 | 前端专用 targets 提交未找到 → Go `reindex-chunks` 专用去重提交 → Python `chunk_projection_reindex.py` | HB 临时真实 PG/Neo4j/Milvus；HM 隔离接线 | B0 只重 Chunk 文本/版本与向量，不重实体关系；共享收敛及完整 B1 未验收 |
+| 整文档重建 | 未实现 | 未验证 | 待授权 | 常规 `build_graph` 与 `/reindex` 全文索引均不等价专属 `reindex-document`；专属 route 明确未实现 | `p6_disposable_pg_integration_test.go:412–420` 记录 404 合同；本轮未执行 | 完整 B1 的 reindex-document API、文档级 revision-aware 投影与 UI；不得把常规建图称为专属重建 |
+| M5 revision | 已实现 | 隔离验证 | 待授权 | 前端编辑未找到 → Python `services/chunk_revision_lifecycle.py` + `chunk_revisions` + 建图权威 revision | M5-A/建图生命周期隔离合同与 HM；共享验收未完成 | 权威底座不等于完整用户编辑 API/UI |
+| M5 人工编辑冲突 | 未实现 | 未验证 | 待授权 | 本轮未找到 Chunk PATCH、expected_revision→409 及用户冲突交互；Python 建图生命周期与投影 CAS 不是人工编辑 | 错误常量/设计合同存在不能证明实现；建图竞态隔离证据仅属底座 | 完整 B1 冻结；需人工编辑 API、并发一胜一冲突与 UI 验收 |
+| M5 revision 回滚 | 未实现 | 未验证 | 待授权 | 本轮未找到用户revision回滚生成新revision的可调用闭环；现有事务/迁移rollback不是此能力 | 历史迁移回滚不能证明用户revision回滚 | Go rollback/API/UI仍冻结；revision回滚、结构迁移回滚、切读回滚须分开 |
+| M5 投影 | 部分实现 | 真机取证 | 技术阻塞 | revision → current 复核 → Neo4j/Milvus → CAS/文档聚合/失败 job 转交 | HB 临时空间；HM 非空 disposable 41/0（历史引用，未重跑） | 当前共享 v2 primary 仍需只读重证；v3/能力/授权未就绪，不宣称 CLOSED |
+| M5 v3 迁移 | 部分实现 | 真机取证 | 待授权 | `vector_store.py` S1/单向回填、schema/write scope/readback/manifest → backfill/worker | HM §9.9 合成 canary、§9.23 disposable（历史引用，未重跑）；非真实 KB 迁移 | 分项授权与共享 canary、C3、收敛、回滚证据，见 M5 阻塞清单 |
+| CI | 已实现 | 真机取证 | 可推进 | `.github/workflows/ci.yml` → guards/release/rollback/scanner | H4 历史 run#26、run#36942264746；当前 workflow 新整改未远端复验 | 凭据必填扫描已改代码；当前 HEAD 远端取证本轮未执行 |
+| 发布回滚 | 部分实现 | 真机取证 | 待授权 | `run_rollback_matrix.sh` / `run_rollback_leg.sh` → 版本身份链+双模式 | HR 下限 `78b1f28`（当轮 scope/RBAC） | 当前 M5 schema/v3 不能沿用旧下限宣称安全；需新版本迁移兼容与切读五步证据 |
+| 真实模型容量 | 未实现 | 未验证 | 待授权 | `run_perf_soak.py` / `run_perf_probe.py` 有执行底座 | HP 360 请求、无 embedding/LLM、build提交即取消 | 真实模型同口径 soak/capacity 4→8→16 本轮未找到完成证据；凭据/费用/独立环境授权 |
+| 敏感配置保护 | 部分实现 | 隔离验证 | 可推进 | ConfigPage → Go config 脱敏与 secret artifact scanner；Python 配置保护 | scanner 历史正负自检与 CI 上传门禁 | KMS 未完成；不得以脱敏等同密钥加密治理完成 |
+
+### 当前阻塞与下一阶段边界
+
+S2-02收尾更新（2026-10-09，基线3a520b2、未提交）：目录/详情前端实现与隔离矩阵已完成；实现状态：已实现（本单前端范围）；验证状态：隔离验证；共享生产：未验收。Node22.22.2/npm10.9.7、Chrome下统一矩阵55通过/0失败/0跳过/0 flaky（目录26、详情9、S2-01回归20），build/lint/diff-check exit0。父作用域独立fixture、详情生命周期、区域失败隔离、工作台授权差异、分页及当前页搜索已取隔离证据；不宣称真实CRUD/权限/数据库验收，不解冻完整B1。详见 [收尾验收矩阵](KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md)。以下第一阶段缺口记录保留为历史，不覆盖本条当前状态。
+
+- 技术问题：切库上下文与迟到请求、处理状态合同/展示、安全解析预览；M5 共享 primary 前置及 seed 恢复证据合同。
+- 授权问题：`SEED-SHARED`、`CONFIG-SHARED`、`CREATE-V3`、`BACKFILL-WRITE` 分开审批；旧授权不延续到本阶段。真实模型费用/共享运行同样未授权。
+- 缺证据问题：本轮无浏览器复现、真实 Neo4j/Milvus/Go/Python 取证、共享收敛、完整 B1 与当前 HEAD 远端 CI 结果；均未执行。
+- 下一阶段默认候选仍是“切库正确性＋KB 目录/详情＋真实处理状态”，可以复用现有 API，不以共享 v3 迁移或完整 B1 为开工前提。具体范围/依赖/场景见 [P0 定向缺口](KNOWLEDGE_BASE_P0_CONTRACT_AND_GAP_AUDIT.md) 的本轮更新；本阶段不开发。
+
+### 本轮与历史验证记录
+
+本轮实跑仅 seed 离线合同：Windows PowerShell、Python `3.14.7`，上述 HEAD；临时文件系统+进程内 PG/Milvus 假体，SQLite/真实 PG/Neo4j/Milvus 均未使用。通过现有 `run_unified_boundary_guards._run_case` 注入 Python socket 护栏，检查有效加载留痕与零违规；只覆盖 Python socket 路径，不宣称原生网络栈也被隔离。
+
+命令（运行三次：首次完整输出、第二次摘要过滤漏选统计行、第三次取得精确计数；均等待进程结束，未掐断）：`python -X utf8 -c "import sys; from pathlib import Path; sys.path.insert(0,str(Path('backend/tests').resolve())); import run_unified_boundary_guards as g; c=next(c for c in g.CASES if c.name=='m5_seed_shared_v2_contract'); ok,d,out,rc=g._run_case(Path(sys.executable),c); print('\n'.join(x for x in out.splitlines() if 'passed=' in x)); print(f'child_exit={rc} guard_pass={ok} seconds={d:.1f}'); sys.exit(0 if ok else 1)"`。结果：`passed=196 failed=0`、`child_exit=0`、`guard_pass=True`，命令 exit 0。执行日志机器 UTC 日期为 `2026-10-08`，与用户阶段日期 `2026-10-09` 不同，保留两者，不据此改写历史日期。
+
+历史 H4/HB/HM/HP/HR 只核对仓库内记录与现存代码；仓库外 `gate0-evidence/` 原始证据本轮未读取、未复验。构建、全套 guards、Go 测试、E2E、smoke、seed、backfill、迁移、远端 CI、浏览器及真实模型容量均未执行。文档检查命令与最终结果见 [B0 验收记录的本轮证据索引](ENTERPRISE_SPRINT_M5B0_ACCEPTANCE_2026-10-02.md)。
+
+## 历史执行看板（原更新时间：2026-06-11）
+
+历史状态字段：`todo`、`in_progress`、`done`，不替代以上三轴当前状态。
 
 ## P0（必须）
 
@@ -129,20 +199,20 @@
 9. `max_tokens`、`max_output_tokens`、`context_window` 已从敏感配置识别中排除，不再被误判为 API token。
 10. 已新增管理员检索诊断入口 `POST /api/v1/admin/qa/retrieval-diagnostics`，由 Go 控制面按 `qa:ask` 权限转发到 Python internal capability，可对同一问题并行对比 `keyword/vector/hybrid/graph_hybrid` 的轻量命中、orchestrator trace、skip reason、summary 与检索健康信息。
 11. 检索诊断已补充 `backend/tests/check_admin_retrieval_diagnostics_api.py` 作为 Go 外部管理入口 smoke；脚本读取 `ADMIN_TOKEN`，不写入任何凭证。
-12. 已新增 [docs/DOCUMENT_PARSER_MINERU_INTEGRATION_PLAN.md](/Volumes/HP%20P900/projects/GraphInsight/docs/DOCUMENT_PARSER_MINERU_INTEGRATION_PLAN.md)，将 PDF/Office 解析质量提升、MinerU sidecar 接入、结构化 chunk 与混合检索质量改进列为 RAG 上游增强方向。
+12. 已新增 [docs/DOCUMENT_PARSER_MINERU_INTEGRATION_PLAN.md](DOCUMENT_PARSER_MINERU_INTEGRATION_PLAN.md)，将 PDF/Office 解析质量提升、MinerU sidecar 接入、结构化 chunk 与混合检索质量改进列为 RAG 上游增强方向。
 13. 文档解析器已抽象为 `NativeDocumentParser / MinerUDocumentParser / DocumentParserManager`，默认保持 native；`document_parser` 运行期配置支持 `provider/fallback_provider/base_url/endpoint_path/parse_mode/output_format/timeout_seconds/parser_version`，MinerU 作为 HTTP sidecar 调用并支持失败回退 native。
 14. 建图任务已支持任务级 `parser_provider` 灰度参数；`POST /api/graph/build` 可直接传入，`POST /api/v1/admin/jobs/build-graph` 可放入 `payload`。Python worker 会把该参数传入建图执行层。
 15. 建图阶段已新增解析产物持久化：默认写入 `backend/parsed_documents/{doc_id}/manifest.json|content.md|blocks.json|chunks.jsonl|raw.json`，Neo4j `Document.parsed_artifact_path` 记录目录；删除单文档、清空知识库或全量 force rebuild 时同步清理对应产物。
 16. Neo4j `Document/Chunk` 与 Milvus chunk dynamic metadata 已写入解析元数据：`parser_provider/parser_version/parse_mode/block_type/heading_path/page_start/page_end/source_location`；建图已优先使用结构化 chunk，只有结构化切分为空时才回退旧字符窗口。
 17. 已新增 `backend/tests/check_document_parser_unit.py`，并扩展 job worker、retrieval orchestrator、runtime config boundary 单测，固定解析器回退、任务透传、解析产物落盘和向量元数据传递。
 18. 后台配置中心已新增 `document_parser` 配置分类和“文档解析 / MinerU”表单分区，可维护 `provider/fallback_provider/base_url/endpoint_path/file_field/parse_mode/output_format/timeout_seconds`，并可在界面触发 MinerU 连通性测试。
-19. 已新增 [docs/KNOWLEDGE_DISCOVERY_PIPELINE_DESIGN.md](/Volumes/HP%20P900/projects/GraphInsight/docs/KNOWLEDGE_DISCOVERY_PIPELINE_DESIGN.md)，将下一阶段收敛为通用结构化 chunker、文档画像识别、按文档类型 prompt、schema-aware 抽取、实体/关系归一化与 evidence 校验。
+19. 已新增 [docs/KNOWLEDGE_DISCOVERY_PIPELINE_DESIGN.md](KNOWLEDGE_DISCOVERY_PIPELINE_DESIGN.md)，将下一阶段收敛为通用结构化 chunker、文档画像识别、按文档类型 prompt、schema-aware 抽取、实体/关系归一化与 evidence 校验。
 20. 结构化 chunker 已完成基础接入：建图阶段会从 Markdown/ParsedDocument 识别标题层级、段落和 HTML table，表格独立成 `block_type=table` chunk，并保留 `caption/neighbor_before/neighbor_after/table_columns`；解析产物目录新增 `structured_chunks.jsonl`。
 21. Embedding 写入 Milvus 的批大小已在运行时限制到 10，兼容当前 OpenAI-compatible 网关对 `/embeddings` input batch 的上限；向量 collection 创建时会使用实际 embedding 返回维度，并在发现已有 collection 维度不匹配时自动重建，避免单次建图向量索引整批失败。
 22. 知识发现基础治理已接入：实体归一化会清理 LLM JSON/dict 污染并规范常见药剂名称空格差异；表格 chunk 会按行生成“首列主体 -> 指标值”和“主体 -> 表格主题”关系，并写入 `evidence/relation_type/confidence`。schema-aware LLM 关系抽取已要求输出 `source/target/label/evidence/confidence`，并由 `EvidenceValidator` 过滤无证据或证据无法覆盖 source/target 的关系；旧规则抽取已禁止把任意短语当关系类型，低置信度“同段提及”不进入默认图谱。当前 PDF 在表格 LLM 语义增强后最近复建结果为 `Chunk=14`、`Entity=141`、`RELATION=96`、脏实体 0、无 evidence 关系 0。
 23. 图谱实体/关系抽取器已改为读取配置中心 `ai_service` 运行时配置，避免继续使用启动环境变量里的旧模型名导致“模型不可用，自动切换”；同时新增自适应 `ExtractionPlanner`，基于文档类型、标题路径、block type、重要章节、信息密度和任务档位选择 LLM schema-aware 抽取 chunk，不再固定抽取前 N 个非表格 chunk。`LLM_GRAPH_EXTRACT_MAX_LLM_CHUNKS` 作为 fast 档基础预算保护，balanced/deep 会按结构覆盖动态扩展；表格 chunk 采用结构化表格关系保底，并在 balanced/deep 或 `complex_extraction=true` 时进入 LLM 语义增强。图谱实体/关系抽取已采用 bounded reasoning，`fast/balanced` 均使用 low effort，只有显式 `deep` 才提升到 medium effort。LLM 实体/关系抽取的熔断范围已收窄为 provider 级错误和累计重复 timeout，单个 chunk 超时不再暂停整轮抽取，重复 timeout 会短暂 cooldown 以保护构图时延。
 24. 配置中心模型目录主路径已从历史 `openai` 命名收敛为 `GET /api/v1/admin/config/ai-service/models`；前端和 Go 测试已切换到新路径，Go 旧 `openai` 路由别名和 Python 旧 `get_openai_config/test_openai_connection/get_available_openai_models` 兼容方法已删除，并由 runtime boundary guard 防止回退。
-25. 已新增 [docs/CONFIG_CENTER_RUNTIME_AUDIT.md](/Volumes/HP%20P900/projects/GraphInsight/docs/CONFIG_CENTER_RUNTIME_AUDIT.md)，记录配置中心运行态主模型、已清理的旧 `openai` 命名、空字符串遮蔽默认值问题和剩余兼容别名。
+25. 已新增 [docs/CONFIG_CENTER_RUNTIME_AUDIT.md](CONFIG_CENTER_RUNTIME_AUDIT.md)，记录配置中心运行态主模型、已清理的旧 `openai` 命名、空字符串遮蔽默认值问题和剩余兼容别名。
 26. 本地开发启动脚本默认 Neo4j Bolt 地址已从 `bolt://127.0.0.1:7687` 调整为 `bolt://localhost:7687`，避免 macOS 本机进程抢占 IPv4 端口时 Python/Go 误连非 Neo4j 服务；当前配置库中的 `neo4j.uri` 也已按该策略对齐。
 27. 后端根目录旧调试/演示脚本已清理：移除 `check_node.py`、`debug_node.py`、`create_video_node.py`、`init_admin_quick.py`、`check_logs_table.py` 和旧同名 schema 文件 `admin/schemas.py`，避免硬编码演示数据、默认账号和旧 schema 入口误导运行态开发；迁移清理 guard 已加入防回流检查。
 28. 本地开发启动脚本已改为优先用 `screen` 托管 Python/Go 服务，并在 `stop/restart` 时按服务端口清理残留监听进程，避免 screen session 退出但子进程继续占用 8001/8081 导致新代码未加载。
@@ -203,7 +273,7 @@
 
 验收进展：
 
-1. 已新增 [docs/ENTERPRISE_PERFORMANCE_BASELINE.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_PERFORMANCE_BASELINE.md)，沉淀 2026-06-07 当前统一运行态的性能基线。
+1. 历史条目称 2026-06-07 已形成性能基线；原引用 `ENTERPRISE_PERFORMANCE_BASELINE.md` 本轮未找到，不能补写或据此复核当轮结果。后续独立证据见 [2026-09-30 无模型 soak](ENTERPRISE_PERF_SOAK_2026_09_30.md)，不是原基线的替代证明。
 2. 只读探针已实跑：`backend/tests/run_perf_probe.py --preset readonly --requests 20 --concurrency 4`，`error_rate=0`。
 3. 发布路径探针已实跑：`backend/tests/run_perf_probe.py --preset release --requests 5 --concurrency 2`，覆盖 `query`、`docqa-health`、`nl2cypher-status`、`docqa`、`graph-build`，`error_rate=0`。
 4. 当前文档记录的是发布级性能基线，不等同于容量上限；更高并发和 soak 压测仍可后续扩展。
@@ -217,9 +287,9 @@
 1. `.github/workflows/ci.yml` 已新增默认 `backend-unified-guards`，通过 `backend/tests/run_unified_boundary_guards.py` 持续防止 Python public surface、内部 capability header 与 Go 入口显式注册发生回退。
 2. `.github/workflows/ci.yml` 已新增手动 `backend-release-smoke`，通过 Linux 发布验收入口在准备发布时对外部 Go 网关执行默认 20-case 后端 smoke。
 3. 上述后端 Python 检查均先创建并使用 `backend/.venv`，不依赖系统 Python 作为项目运行环境。
-4. 本地 Linux 完整发布验收已通过，结果记录在 [docs/ENTERPRISE_RELEASE_DRY_RUN_2026_06_07.md](/home/yuanhuan/GraphInsight/docs/ENTERPRISE_RELEASE_DRY_RUN_2026_06_07.md)；CI 手动入口仍应在真实发布前复跑。
+4. 历史条目称本地 Linux 完整发布验收已通过；原引用 `ENTERPRISE_RELEASE_DRY_RUN_2026_06_07.md` 本轮未找到。后续独立发布验收见 [M4-R1 验收记录](ENTERPRISE_M4R1_ACCEPTANCE_REPORT.md)，不回写为 2026-06-07 原证据；当前 HEAD 仍应在真实发布前复跑。
 5. 2026-06-13 已修正 CI 后端边界编译清单，移除已退役 Python `documents` / `graph_build` 路由文件引用，补齐当前 runtime helper 与 admin retired endpoint 模块编译检查。
-6. 2026-06-13 已新增 [docs/BACKEND_BOUNDARY_FINAL.md](/home/yuanhuan/GraphInsight/docs/BACKEND_BOUNDARY_FINAL.md) 作为后续开发与验收的后端职责冻结清单。
+6. 2026-06-13 已新增 [docs/BACKEND_BOUNDARY_FINAL.md](BACKEND_BOUNDARY_FINAL.md) 作为后续开发与验收的后端职责冻结清单。
 7. 2026-06-13 本地复验通过：`run_unified_boundary_guards.py`、`go test ./internal/httpserver ./internal/config`、`frontend npm run build`、`admin-core` E2E。
 
 ## 模块映射建议
