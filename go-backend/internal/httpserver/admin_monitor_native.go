@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"graphinsight/go-backend/internal/adminstore"
@@ -891,16 +890,6 @@ func readDarwinMemInfo() (totalBytes uint64, usedBytes uint64, err error) {
 		usedBytes = totalBytes
 	}
 	return totalBytes, usedBytes, nil
-}
-
-func readDiskUsage(path string) (totalBytes uint64, freeBytes uint64, err error) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0, 0, err
-	}
-	total := stat.Blocks * uint64(stat.Bsize)
-	free := stat.Bavail * uint64(stat.Bsize)
-	return total, free, nil
 }
 
 func bytesToMB(value uint64) float64 {
