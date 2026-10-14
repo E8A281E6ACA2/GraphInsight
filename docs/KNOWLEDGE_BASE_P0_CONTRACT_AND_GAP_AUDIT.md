@@ -425,6 +425,18 @@ console/pageerror按夹具检查；失败注入的HTTP503/API诊断仅为预期�
 
 网络：仅本机Vite回环1234，页面资源可通过，未知业务/外网请求中止且判红；没有连接共享Go/Python/数据库/模型。fixture故障HTTP400/403/409/503仅用于对应异常场景，console分类随测试附件；不得从fixture推导真实权限或生产通过。真实后端/权限/生产闭环均未验证，Shared Gate OPEN，完整M5-B1未解冻，未提交/push，未启动S2-03。
 
+##### S2-04 真PG写路径扩展（2026-10-10）
+
+新增 `go-backend/internal/adminstore/write_paths_pg_integration_test.go`，仅在显式 `GI_P6_PG_DSN` 且DSN为本轮 `gi-s203-*` 容器名、容器内5432、对应 `gi_s203_<run>` 库时运行；导入真实store前核对DSN，连接后 `current_database()` 再断言。未注入即skip，默认CI不连库，不改产品代码/权限/CI。
+
+隔离对象：`gi-s203-s204100426`，`postgres:16-alpine`，Created `2026-10-09T16:55:43.658094808Z`，独立卷`gi-s203-volume-s204100426`，仅127.0.0.1:5544；内部网络`gi-s203-net-s204100426`。Python3.11.15/SQLAlchemy2.0.23通过现有S203运行器up→9步migrate→seed，全exit0。Docker golang:1.24.13-bookworm，源码/Go缓存只读挂载、GOPROXY=off/GOSUMDB=off，容器内DSN仅内存env传递，未输出凭据。
+
+真PG命令：`go test ./internal/adminstore -run '^TestS204' -count=1 -v`，exit0。users7个子用例、configs2个子用例、RBAC1、reindex1顶层合同通过。users返回真实store结果+SQL读回：active初值与bcrypt hash形态（值不输出）、更新保留其他字段、软删inactive行仍存在、硬删行数0、KB binding四scope字段、重复username/email为ErrUserConflict、重复删除为ErrUserNotFound；configs新建version1→同ID更新version2、NULL description保留、sensitive=true/encrypted=false；RBAC可回滚事务首次空集合播种与重跑计数[4,19,40]不增、description漂移被ON CONFLICT UPDATE修复；reindex同hash复用同ID行数1、NULL hash可2行，检查pg_index部分谓词。首次reindex测试夹具缺ID/storage_prefix触发验证失败，仅补测试夹具后全矩阵重跑通过，不改变产品行为。
+
+证据边界：此文件位于adminstore同包，验证store响应/错误与真实PG行，不代表完整HTTP鉴权映射或生产接口验收；configs直接调用现有upsert函数，RBACseed在事务内读取真实PG后rollback。可选jobs/logs/document_registry其它写路径未扩展。默认 `go test ./...` 在Linux无网络工具容器未注入DSN exit0；git diff --check exit0。
+
+清理：S203teardown exit0，删除本轮内部network；随后docker ps-a/volume-ls/network-ls按精确本轮名re-list均空，5544/18091/1235无监听。共享三容器Created/StartedAt/RestartCount与前置记录完全一致（running/0）。PG/Go store隔离真机已取证；Neo4j/Milvus写路径、模型、共享dev、生产未取证，生产闭环未验收、M5 Shared Gate OPEN/B1冻结。未提交/push。
+
 ##### S2-03 隔离真机验收（2026-10-09，S2-03a通过/S2-03b通过）
 
 S2-03a 隔离运行器：`backend/tests/s203_isolated_env.py` + `check_s203_isolated_env.py` + `run_s203_isolated_stack.sh`，13项离线自检通过、不进入默认CI门禁，已提交 `7acddb4`。运行器强制钉死隔离DSN、在任何DDL前拒绝共享端口5434/共享库名、拒绝仓库内凭据路径、等待`pg_isready`；子进程须完整继承父环境（白名单裁剪会触发`WinError 10106`）。

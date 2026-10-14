@@ -58,6 +58,7 @@ S2-02收尾更新（2026-10-09，基线3a520b2、未提交）：目录/详情前
 
 S2-03a（2026-10-09）：隔离运行器及13项离线自检已完成并复核通过，运行器不进入默认CI门禁。已提交 `7acddb4`。
 
+S2-04（2026-10-10）：users/configs/RBAC seed/reindex partial-index 真PG写路径覆盖已完成并通过；顶层用例 users 7、configs 2、RBAC 1、reindex 1。Go默认回归未注入 `GI_P6_PG_DSN` 时全绿且真PG测试skip。隔离容器/卷/内部网络已清理为0，未触碰共享容器、生产或M5迁移；生产闭环未验收。
 S2-03b（2026-10-09，一次性隔离栈真机验收）：
 - 第一轮（未通过）：一次性 PG `gi_s203_s203brun02` + Go 网关 `127.0.0.1:18091`（`mode=go_db`），9步迁移/seed/token 全 exit 0，隔离库真实数据4角色/19权限码/1用户/1绑定/1 KB。真机合同命中：缺父作用域 `KB_SCOPE_REQUIRED`、header/query 不一致 `KB_CROSS_SCOPE`、创建201/缺name `INVALID_BODY`/重名 `KB_DUPLICATE_NAME`、归档200/归档后普通PATCH `KB_ARCHIVED`。**阻断1项**：`PATCH /api/v1/admin/knowledge-bases/{kb_id}` 编辑恒返回503，日志 `ERROR: could not determine data type of parameter $3 (SQLSTATE 42P08)`，根因 `knowledge_bases.go:416` 的 `slug = CASE WHEN $3 IS NULL ... ELSE $3 END` 未定型参数；该缺陷仅真实 PostgreSQL 暴露，SQLite 单测与前端 fixture 均会漏过。
 - 第二轮（**通过**）：修复 `slug` 参数为 `$3::text` 后，在一次性 PG `gi-s203-bug1verify`（隔离网络）上执行新增真 PG 集成测试 `admin_knowledge_bases_pg_integration_test.go`，**13项全通过**，并逐条断言库内真实行状态：06 description 更新时 `slug={'original'}` 未被误改、07 `slug={'new-slug'}`、08 空串写入 SQL `NULL`（`slug.Valid=false`）。容器内 `go vet` 无报错；默认 `go test ./...` 未注入 `GI_P6_PG_DSN` 时正确跳过。清理复核 `containers=0 volumes=0 networks=0`、端口无监听、共享容器 `Created` 未变。隔离真机已取证；Neo4j/Milvus 写路径、真实模型、共享 dev、生产闭环仍**未验收**；Shared Gate 保持 OPEN，M5-B1 保持冻结。
