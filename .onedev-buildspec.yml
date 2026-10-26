@@ -1,0 +1,42 @@
+version: 56
+jobs:
+- name: Pull from GitHub
+  steps:
+  - type: PullRepository
+    name: Pull from GitHub
+    remoteUrl: https://github.com/E8A281E6ACA2/GraphInsight.git
+    refs: refs/heads/* refs/tags/*
+    withLfs: false
+    force: false
+    condition: SUCCESSFUL
+    optional: false
+  triggers:
+  - type: ScheduleTrigger
+    cronExpression: 0 0 1 * * ?
+  retryCondition: never
+  maxAttempts: 3
+  retryDelay: 30
+  includeUpstreamWhenRebuild: false
+  includeDownstreamWhenRebuild: false
+  timeout: 14400
+- name: Push to GitHub
+  steps:
+  - type: PushRepository
+    name: Push to GitHub
+    remoteUrl: https://github.com/E8A281E6ACA2/GraphInsight.git
+    userName: E8A281E6ACA2
+    passwordSecret: github-access-token
+    force: false
+    condition: SUCCESSFUL
+    optional: false
+  triggers:
+  - type: BranchUpdateTrigger
+    branches: "**"
+    userMatch: anyone
+  - type: TagCreateTrigger
+  retryCondition: never
+  maxAttempts: 3
+  retryDelay: 30
+  includeUpstreamWhenRebuild: false
+  includeDownstreamWhenRebuild: false
+  timeout: 14400
