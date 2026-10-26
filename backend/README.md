@@ -71,6 +71,36 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+Windows 的 venv 布局是 `.venv\Scripts\python.exe`（没有 `bin/`）：
+
+```bat
+:: 建议用 3.11，requirements.txt 的 pin（SQLAlchemy 2.0.23 等）在 3.13 上不兼容
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Python 边界门禁 `tests/run_unified_boundary_guards.py` 的解释器探测顺序（2026-10-24 起）：
+
+1. `GUARD_PYTHON` 显式覆盖（路径不存在即报错，不静默降级）；
+2. `.venv/bin/python`（POSIX）→ `.venv/Scripts/python.exe`（Windows），只有存在才使用；
+3. 两者都不存在才回退当前解释器并打警告。
+
+```bat
+:: Windows 推荐运行方式（直接指定 venv 解释器，避免宿主 Python 造成虚假失败）
+.venv\Scripts\python.exe tests\run_unified_boundary_guards.py
+
+:: 或指定仓库外的独立 venv
+set GUARD_PYTHON=C:\path\to\venv\Scripts\python.exe
+python tests\run_unified_boundary_guards.py
+```
+
+探测只判断路径存在性；若 `.venv` 的解释器与已装包不一致（如 3.13 解释器配 cp311 扩展），
+会以该 venv 运行并失败，应重建 venv 而不是升级依赖。探测逻辑的离线契约：
+
+```bat
+python tests\check_guard_python_resolution_unit.py
+```
+
 ### 3. 配置环境变量
 
 ```bash

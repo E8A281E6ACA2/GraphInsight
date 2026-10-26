@@ -16,6 +16,35 @@ def _source(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def _windows_python_literals(source: str) -> list[str]:
+    """返回源码中"硬编码的 Windows 解释器路径"字符串常量（纯路径段除外）。
+
+    仅允许把 `Scripts` / `python.exe` 作为**独立路径段**常量出现（配合
+    `ROOT / ".venv" / ...` 组合）；任何把它们夹在其它内容里的字面量
+    （例如 `"C:/Python313/python.exe"`、`".venv/Scripts/python.exe"`）都视为
+    绕过"只从 backend/.venv 解析"的硬编码，必须报红。文档字符串与注释不计入。
+    """
+    allowed = {"Scripts", "python.exe"}
+    docstrings: set[int] = set()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", [])
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        if id(node) in docstrings or node.value in allowed:
+            continue
+        if "Scripts" in node.value or "python.exe" in node.value:
+            offenders.append(node.value)
+    return offenders
+
+
 def test_nl2cypher_status_uses_current_config_service() -> None:
     source = _source("api/routes/nl2cypher.py")
     if "build_examples_response" in source or "get_nl2cypher_status" in source:
@@ -395,26 +424,55 @@ def test_core_delivery_docs_do_not_regress_to_old_workspace_or_smoke_baseline() 
 
 
 def test_linux_backend_tooling_uses_dot_venv_only() -> None:
+    """门禁 entrypoint 只允许从仓库内 backend/.venv 解析子进程解释器。
+
+    规则沿革（2026-10-24 授权修订）：
+    - 原规则禁止 entrypoint 出现 `Scripts` / `python.exe` / `PYTHON_CANDIDATES` 等标记，
+      等价于"只承认 POSIX bin/python"。结果是 Windows 上 `run_unified_boundary_guards.py`
+      找不到 `backend/.venv/bin/python` 而静默回退宿主 Python，把"环境未就绪"误报成 21 项
+      依赖缺失 / 版本兼容性失败（2026-10-24 实测）。
+    - 修订后仍保持原意图：解释器**必须**来自 `backend/.venv`（先 POSIX `bin/python`，
+      次选 Windows `Scripts/python.exe`），不得指向 `backend/venv`、`ROOT / "venv"`、
+      `env/` 等其它 venv 目录，也不得硬编码系统解释器路径；`Scripts` / `python.exe`
+      这两个平台标记只允许出现在 `ROOT / ".venv" / ...` 之下。
+    """
     linux_entrypoints = (
         "tests/run_unified_boundary_guards.py",
         "tests/run_backend_smoke_suite.py",
         "tests/run_perf_soak.py",
     )
+    # 仍禁止的：其它 venv 目录与系统解释器路径（真正的"跑错环境"来源）。
     forbidden_markers = (
-        "Scripts",
-        "python.exe",
         "backend/venv",
         'ROOT / "venv"',
-        "PYTHON_CANDIDATES",
+        "/usr/bin/python",
+        "/usr/local/bin/python",
+        "C:\\Python",
     )
     required_marker = 'ROOT / ".venv" / "bin" / "python"'
+    # Windows 布局：允许作为次选候选，但必须挂在 backend/.venv 之下（逐字符绑定）。
+    windows_candidate = 'ROOT / ".venv" / "Scripts" / "python.exe"'
+    windows_marker_tokens = ('"Scripts"', '"python.exe"')
     for rel_path in linux_entrypoints:
         source = _source(rel_path)
         if required_marker not in source:
             raise AssertionError(f"{rel_path} must resolve Python from backend/.venv/bin/python")
+        # 每个平台标记 token 的出现次数必须与"合法候选表达式"的出现次数一致：
+        # 任何新增的 `"Scripts"` / `"python.exe"` 路径段都必须写成 ROOT / ".venv" / ...。
+        for token in windows_marker_tokens:
+            if token in source and source.count(token) != source.count(windows_candidate):
+                raise AssertionError(
+                    f"{rel_path} 只允许在 backend/.venv 下使用 Windows venv 布局"
+                    f"（{token} 必须成对出现在 {windows_candidate} 中）"
+                )
         for marker in forbidden_markers:
             if marker in source:
                 raise AssertionError(f"{rel_path} must not fall back to Windows/system Python marker: {marker}")
+        offenders = _windows_python_literals(source)
+        if offenders:
+            raise AssertionError(
+                f"{rel_path} 不得硬编码 Windows 解释器路径（只允许经 ROOT / \".venv\" 组合）: {offenders[:3]}"
+            )
 
 
 def test_unified_dev_defaults_do_not_regress_to_remote_or_python_public() -> None:

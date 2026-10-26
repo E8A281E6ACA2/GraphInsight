@@ -14,8 +14,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
-# 首选 Linux 后端虚拟环境；允许用 GUARD_PYTHON 显式覆盖，便于在容器 / 非默认布局中运行。
+# 后端虚拟环境解释器探测：POSIX 布局 `bin/python` 优先，其次 Windows 布局
+# `Scripts/python.exe`。只探测 POSIX 路径会让 Windows 上的本套件静默回退到宿主
+# Python（未安装 backend/requirements.txt），把"环境未就绪"伪装成大量依赖缺失 /
+# 版本兼容性失败（2026-10-24 实测：21 项伪失败）。
+# 仍允许用 GUARD_PYTHON 显式覆盖，便于容器 / 非默认布局 / 独立 venv 场景。
 PYTHON_EXE = ROOT / ".venv" / "bin" / "python"
+PYTHON_EXE_WINDOWS = ROOT / ".venv" / "Scripts" / "python.exe"
+VENV_PYTHON_CANDIDATES: tuple[Path, ...] = (PYTHON_EXE, PYTHON_EXE_WINDOWS)
 
 # 本文件会把子进程输出原样回显，子进程带 ✓/✗ 与中文；父进程不强制 UTF-8 时，
 # Windows 默认码（cp936）会在 print 处 UnicodeEncodeError 崩掉整条守卫链（2026-10-02 实测）。
@@ -203,24 +209,46 @@ CASES: tuple[GuardCase, ...] = (
         180,
         "M5 证据归档合同负向回归（每步布尔 ok / 三方身份一致 / 重复字段拒绝 / skip-docker 不记 residue_ok / 归档后读回 / 明确清单关联 manifests）",
     ),
-)
+ GuardCase(
+     "m5_seed_shared_v2_contract",
+     "check_seed_shared_v2_contract.py",
+     120,
+     "SEED-SHARED v2-only 数据准备离线契约（归属校验 fail-closed / dry-run 零写入 / 错误令牌不降级 / PK 冲突不覆盖 / 幂等重跑 / 回滚全有或全无 / R6-6 emergency journal 守卫）",
+ ),
+ GuardCase(
+     "guard_python_resolution",
+     "check_guard_python_resolution_unit.py",
+     120,
+     "Windows/POSIX 标准 .venv 解释器探测契约（GUARD_PYTHON 显式覆盖 / POSIX bin 目录 Python / Windows 脚本目录 Python 可执行文件 / 双候选缺失回退当前解释器 / 非法 GUARD_PYTHON fail-closed / migration_cleanup 标准 Windows venv 路径受限放行）",
+ ),
+ )
 
 
-def _resolve_python() -> Path:
-    # 解析顺序：GUARD_PYTHON 环境变量 -> backend/.venv/bin/python（Linux）-> 当前解释器。
-    # 当前解释器兜底是为了让本套件在没有 Linux venv 布局的环境（容器 / Windows）也能执行；
-    # 前提是已安装 requirements.txt 依赖。缺失依赖导致的用例失败属于环境未就绪，不是代码缺陷。
+def _resolve_python(
+    candidates: tuple[Path, ...] = VENV_PYTHON_CANDIDATES,
+    current: Path | None = None,
+) -> Path:
+    """解析子进程解释器：GUARD_PYTHON 覆盖 -> 后端 venv（POSIX 优先）-> 当前解释器。
+
+    顺序与语义：
+    1. `GUARD_PYTHON` 非空：存在则直接用，**不存在报错**（显式指定的路径不静默降级）；
+    2. 逐个探测 venv 候选路径，**只有存在才使用**（`bin/python` 优先于 `Scripts/python.exe`）；
+    3. 候选都不存在：打印警告并回退当前解释器（容器 / 无 venv 布局场景）。
+    回退前提仍是已安装 requirements.txt 依赖；缺失导致的用例失败属环境未就绪，不是代码缺陷。
+    """
     override = os.environ.get("GUARD_PYTHON", "").strip()
     if override:
         override_path = Path(override)
         if override_path.exists():
             return override_path
         raise RuntimeError(f"GUARD_PYTHON 指向的解释器不存在: {override_path}")
-    if PYTHON_EXE.exists():
-        return PYTHON_EXE
-    fallback = Path(sys.executable)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    fallback = Path(current) if current is not None else Path(sys.executable)
+    probed = "、".join(str(p) for p in candidates) or "（无候选）"
     print(
-        f"[warn] 未找到 Linux 后端虚拟环境 Python: {PYTHON_EXE}；"
+        f"[warn] 未找到后端虚拟环境 Python（已探测：{probed}）；"
         f"回退使用当前解释器 {fallback}（需已安装 backend/requirements.txt 依赖）",
         file=sys.stderr,
     )

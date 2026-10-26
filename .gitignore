@@ -124,3 +124,31 @@ drill_state.json
 !docs/ENTERPRISE_AUDIT_REVIEW_PACKAGE_M5A.md
 !docs/ENTERPRISE_M5AB_REINDEX_DEPENDENCY_PLAN.md
 !docs/ENTERPRISE_M5_WAVE4_AUDIT_PACKAGE_2026-10-05.md
+
+# Stakpak session files
+.stakpak/session*
+
+# Local test and build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+frontend/*-results.json
+frontend/*-results/
+frontend/s202-*.json
+frontend/s202-*-results/
+frontend/s202-archive-page-final1/
+frontend/s202-complete-final1/
+frontend/s202-detail-1/
+frontend/s202-scope-final/
+frontend/s202-archive-page-build.log
+frontend/s202-archive-page-lint.log
+frontend/s202-build-final.log
+frontend/s202-lint-final.log
+.workbuddy/*.log
+output/
+qodana.yaml
+unified-r66.log2
+.workbuddy/
+frontend/s2-*.json
+frontend/*-results-*/

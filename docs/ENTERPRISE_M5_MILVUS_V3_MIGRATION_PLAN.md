@@ -1166,6 +1166,24 @@ revision 行并补齐 Neo4j 与 v3，保持 primary(v2) 只读不变。
 **顺序（严格按序，不得跳步）**：修探测器（已完成）→ `SEED-SHARED`（本阶段；暂不写共享）
 → 数据准备完成后申请 `CREATE-V3` / `CONFIG-SHARED` → 最后申请 `BACKFILL-WRITE`。
 
+##### 三·补：`seed_shared_kb.py` v2-only 脚本合同与 R6-6 收口（2026-10-08）
+
+入口 `backend/tests/seed_shared_kb.py`，唯一共享写目标被逐字符限定为
+`http://127.0.0.1:19531 / graphinsight_chunks_v2`；脚本内无建 v3、写 PG/Neo4j、
+改共享配置或入队入口。离线契约 `backend/tests/check_seed_shared_v2_contract.py`
+共 **196 项**，使用临时目录与 `FakeMilvus`，已注册统一门禁
+`m5_seed_shared_v2_contract`。
+
+R6-6 恢复边界：执行前除规范 `seed-shared-journal.json` 外，还扫描同一 `--out`
+下的 `seed-shared-journal.emergency.*.json`。任一 emergency journal 未处置时，
+必须返回 exit2、`failed_step=journal_pending`、零 upsert，保留原证据并在
+`detail.backups` 列出路径。完整反例覆盖“后备清理失败 →规范 journal 回滚 →
+emergency仍在 → 再执行被拒”；仅在明确处置这些 emergency journal 后，新执行
+才可放行。不得批量或模糊清理其它历史证据。
+
+本合同仅由隔离假体测试证成；真实共享 seed 与回滚仍未取证，Shared Gate 保持
+**OPEN**，M5-B1 保持冻结。
+
 #### 四、执行计划（授权后按序执行）
 
 1. **vector 能力配置**：`VECTOR_STORE_ENABLED=true`、`MILVUS_URI=http://127.0.0.1:19531`

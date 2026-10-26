@@ -62,6 +62,32 @@ ADMIN_TOKEN=*** ./frontend/tests/run_admin_e2e.sh
 backend/.venv/bin/python -m py_compile backend/core/observability.py backend/api/routes/doc_qa.py
 ```
 
+Python 边界门禁 `backend/tests/run_unified_boundary_guards.py` 的解释器探测规则（2026-10-24 修复）：
+
+1. 优先 `GUARD_PYTHON` 显式覆盖；该路径不存在时报错，不静默降级。
+2. 未设置时按序探测 `backend/.venv/bin/python`（POSIX）→ `backend/.venv/Scripts/python.exe`（Windows），只有存在才使用。
+3. 两者都不存在才回退当前解释器，并在 stderr 打出已探测路径（回退前提是已安装 `backend/requirements.txt`）。
+
+```bash
+# Linux / macOS
+backend/.venv/bin/python backend/tests/run_unified_boundary_guards.py
+
+# Windows（cmd）
+backend\.venv\Scripts\python.exe backend\tests\run_unified_boundary_guards.py
+
+# 指定独立 venv（不依赖仓库内 backend/.venv）
+set GUARD_PYTHON=C:\path\to\venv\Scripts\python.exe
+python -u backend\tests\run_unified_boundary_guards.py
+```
+
+解释器探测自身的离线契约（纯 stdlib、临时目录，不触碰真实 venv）：
+
+```bash
+python -u backend/tests/check_guard_python_resolution_unit.py
+```
+
+探测只判断候选路径**存在性**。若 `backend/.venv` 的解释器与其已装包不一致（例如 3.13 解释器 + cp311 扩展，会报 `No module named pydantic_core._pydantic_core`；SQLAlchemy 2.0.23 在 3.13 上还会触发 `TypingOnly` 断言），门禁会以该 venv 运行并失败——此时需重建 venv，不要靠升级依赖绕过。
+
 后端接口烟测需要先启动统一后端，并确保 Go 网关可访问。默认入口以 `logs/dev/runtime.env` 中的 `GO_BASE_URL` 为准。
 
 ```bash
