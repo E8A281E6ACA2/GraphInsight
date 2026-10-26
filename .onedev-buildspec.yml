@@ -5,6 +5,8 @@ jobs:
   - type: PullRepository
     name: Pull from GitHub
     remoteUrl: https://github.com/E8A281E6ACA2/GraphInsight.git
+    userName: E8A281E6ACA2
+    passwordSecret: github-access-token
     refs: refs/heads/* refs/tags/*
     withLfs: false
     force: false
@@ -12,7 +14,7 @@ jobs:
     optional: false
   triggers:
   - type: ScheduleTrigger
-    cronExpression: 0 0 1 * * ?
+    cronExpression: 0 0/15 * * * ?
   retryCondition: never
   maxAttempts: 3
   retryDelay: 30
