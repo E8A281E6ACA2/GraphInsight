@@ -1,10 +1,36 @@
 version: 56
+
+# ======================================================================
+# OneDev ⇄ GitHub 双向镜像同步模板（buildspec version 56 / OneDev 16.x）
+#
+# 设计目标：一份配置可复用到多个项目，不写死仓库名。
+#
+# 前提约定（重要）：
+#   OneDev 项目名 必须与 GitHub 仓库名完全一致。
+#   例：OneDev 项目 "GraphInsight" ⇄ GitHub "E8A281E6ACA2/GraphInsight"
+#   若两者不一致，用属性 gh_repo 显式覆盖（见下方 properties 注释）。
+#
+# 变量语法：@变量名@   （OneDev 内插值，不是 @{...}）
+#   可用内置变量：project_name / project_path / branch / tag / commit_hash ...
+#   属性引用：@property:gh_repo@     密钥引用：@secret:...@
+# ======================================================================
+
+# 可选：若 OneDev 项目名与 GitHub 仓库名不一致，取消下面两行注释，
+#       并把 remoteUrl 改成 https://github.com/E8A281E6ACA2/@property:gh_repo@.git
+# properties:
+#   gh_repo: GraphInsight
+
 jobs:
+# ----------------------------------------------------------------------
+# 入向：GitHub → OneDev
+# 每 15 分钟轮询一次。public 仓库可匿名拉取，private 仓库必须带令牌。
+# 这里统一带上认证，public/private 都能工作。
+# ----------------------------------------------------------------------
 - name: Pull from GitHub
   steps:
   - type: PullRepository
     name: Pull from GitHub
-    remoteUrl: https://github.com/E8A281E6ACA2/GraphInsight.git
+    remoteUrl: https://github.com/E8A281E6ACA2/@project_name@.git
     userName: E8A281E6ACA2
     passwordSecret: github-access-token
     refs: refs/heads/* refs/tags/*
@@ -21,11 +47,17 @@ jobs:
   includeUpstreamWhenRebuild: false
   includeDownstreamWhenRebuild: false
   timeout: 14400
+
+# ----------------------------------------------------------------------
+# 出向：OneDev → GitHub
+# 分支或标签一更新立即推送（秒级，不是轮询）。
+# force: false = 冲突时拒绝并留下可见失败，不静默覆盖远端历史。
+# ----------------------------------------------------------------------
 - name: Push to GitHub
   steps:
   - type: PushRepository
     name: Push to GitHub
-    remoteUrl: https://github.com/E8A281E6ACA2/GraphInsight.git
+    remoteUrl: https://github.com/E8A281E6ACA2/@project_name@.git
     userName: E8A281E6ACA2
     passwordSecret: github-access-token
     force: false
